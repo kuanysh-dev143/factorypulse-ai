@@ -1,4 +1,4 @@
-   """
+"""
 FactoryPulse AI - Full Industrial SCADA + AI SaaS Platform
 Single-file Flask application. Backend + embedded HTML/CSS/JS frontend.
 Multi-user auth (JWT + bcrypt), PostgreSQL persistence (SQLAlchemy), a real-time
