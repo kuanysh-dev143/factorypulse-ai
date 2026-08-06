@@ -3870,7 +3870,7 @@ if __name__ == "__main__":
 
     def _run(**kwargs):
         if SOCKETIO_ENABLED:
-            socketio.run(app,  allow_unsafe_werkzeug=True, **kwargs)
+            socketio.run(app, **kwargs)
         else:
             app.run(**kwargs)
 
@@ -3887,4 +3887,3 @@ if __name__ == "__main__":
         print("Visit: http://localhost:5000")
         print("=" * 70)
         _run(host="0.0.0.0", port=5000, debug=True)
-
