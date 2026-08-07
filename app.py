@@ -3870,7 +3870,7 @@ if __name__ == "__main__":
 
     def _run(**kwargs):
         if SOCKETIO_ENABLED:
-            socketio.run(app, **kwargs)
+          socketio.run(app, allow_unsafe_werkzeug=True, **kwargs)
         else:
             app.run(**kwargs)
 
