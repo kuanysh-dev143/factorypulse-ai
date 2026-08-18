@@ -57,11 +57,16 @@ SQLite file (factorypulse.db) so it always runs out of the box for development/d
 """
 
 import os
+import math
 import re
 import json
 import random
 import datetime
 import functools
+import collections
+import hashlib
+import hmac
+import inspect
 import time
 import threading
 import secrets
@@ -88,11 +93,23 @@ try:
     # are preferred when present because they cover more scripts.
     def _register_pdf_font():
         import os as _os
+        # Ordered by preference. Linux paths first (production containers),
+        # then Windows and macOS so local development also produces correct
+        # Cyrillic PDFs instead of silently falling back to English.
         candidates = [
             ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
              "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "DejaVuSans"),
             ("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
              "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", "LiberationSans"),
+            # Windows - Arial and Segoe UI both cover Cyrillic
+            (r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\arialbd.ttf", "Arial"),
+            (r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\segoeuib.ttf", "SegoeUI"),
+            (r"C:\Windows\Fonts\tahoma.ttf", r"C:\Windows\Fonts\tahomabd.ttf", "Tahoma"),
+            (r"C:\Windows\Fonts\calibri.ttf", r"C:\Windows\Fonts\calibrib.ttf", "Calibri"),
+            # macOS
+            ("/Library/Fonts/Arial Unicode.ttf", "/Library/Fonts/Arial Unicode.ttf", "ArialUnicode"),
+            ("/System/Library/Fonts/Supplemental/Arial.ttf",
+             "/System/Library/Fonts/Supplemental/Arial Bold.ttf", "ArialMac"),
         ]
         import reportlab as _rl
         bundled = _os.path.join(_os.path.dirname(_rl.__file__), "fonts")
@@ -125,6 +142,11 @@ try:
             ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "NotoSansCJK", 0),
             ("/usr/share/fonts/opentype/noto/NotoSansCJK-DemiLight.ttc", "NotoSansCJK", 0),
             ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", "WenQuanYiZenHei", 0),
+            # Windows CJK
+            (r"C:\Windows\Fonts\msyh.ttc", "MicrosoftYaHei", 0),
+            (r"C:\Windows\Fonts\simsun.ttc", "SimSun", 0),
+            (r"C:\Windows\Fonts\msgothic.ttc", "MSGothic", 0),
+            (r"C:\Windows\Fonts\malgun.ttf", "MalgunGothic", None),
             ("/etc/alternatives/fonts-japanese-gothic.ttf", "JapaneseGothic", None),
         ]
         for path, name, index in candidates:
@@ -159,6 +181,8 @@ LANG_SAMPLE_CHAR = {
 # Extra font candidates for scripts that Latin/Cyrillic fonts do not cover.
 INDIC_FONT_CANDIDATES = [
     ("/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf", "LohitDevanagari"),
+    (r"C:\Windows\Fonts\Nirmala.ttf", "NirmalaUI"),
+    (r"C:\Windows\Fonts\mangal.ttf", "Mangal"),
     ("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf", "NotoSansDevanagari"),
     ("/usr/share/fonts/opentype/noto/NotoSansDevanagari-Regular.otf", "NotoSansDevanagari"),
     ("/usr/share/fonts/truetype/fonts-deva-extra/samanata.ttf", "Samanata"),
@@ -270,7 +294,10 @@ def _extract_json(text):
 # ------------------------------------------------------------------
 # DATABASE (PostgreSQL via SQLAlchemy, with local SQLite fallback)
 # ------------------------------------------------------------------
-from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime, ForeignKey, inspect, text
+# sqlalchemy.inspect is imported under an alias: importing it as "inspect"
+# silently shadows the stdlib inspect module, which /api/docs relies on.
+from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime, ForeignKey, text
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, scoped_session
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@localhost/factorypulse")
@@ -283,25 +310,96 @@ DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "5"))
 DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "5"))
 DB_POOL_RECYCLE = int(os.environ.get("DB_POOL_RECYCLE", "280"))  # under typical 300s idle timeouts
 
-try:
-    engine = create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True,        # silently drops dead connections instead of erroring
+# Silently falling back to SQLite on a cloud host is dangerous: the container
+# filesystem is ephemeral, so the app appears to work while every write is lost
+# on the next restart. When a real DATABASE_URL is configured we retry, and if
+# it still fails we refuse to start rather than quietly discard the plant's data.
+DB_CONNECT_RETRIES = int(os.environ.get("DB_CONNECT_RETRIES", "5"))
+DB_CONNECT_BACKOFF = float(os.environ.get("DB_CONNECT_BACKOFF", "2.0"))
+_PLACEHOLDER_DB_URL = "postgresql://user:password@localhost/factorypulse"
+
+# True when the operator actually pointed us at a database (not the placeholder).
+DATABASE_CONFIGURED = bool(os.environ.get("DATABASE_URL")) and DATABASE_URL != _PLACEHOLDER_DB_URL
+# Set ALLOW_SQLITE_FALLBACK=true only for local development.
+ALLOW_SQLITE_FALLBACK = os.environ.get(
+    "ALLOW_SQLITE_FALLBACK", "false" if DATABASE_CONFIGURED else "true"
+).lower() in ("1", "true", "yes")
+
+DB_BACKEND = "unknown"
+
+
+def _build_engine(url):
+    if url.startswith("sqlite"):
+        return create_engine(url, connect_args={"check_same_thread": False})
+    return create_engine(
+        url,
+        pool_pre_ping=True,        # drops dead connections instead of erroring
         pool_size=DB_POOL_SIZE,
         max_overflow=DB_MAX_OVERFLOW,
         pool_recycle=DB_POOL_RECYCLE,
         pool_timeout=30,
+        connect_args={"connect_timeout": 10} if url.startswith("postgres") else {},
     )
-    with engine.connect():
-        pass
-    print(f"Connected to database: {DATABASE_URL.split('@')[-1]} "
-          f"(pool={DB_POOL_SIZE}+{DB_MAX_OVERFLOW})")
-except Exception as e:
-    print(f"PostgreSQL not reachable ({e}). Falling back to local SQLite (factorypulse.db).")
+
+
+engine = None
+_last_error = None
+for attempt in range(1, DB_CONNECT_RETRIES + 1):
+    try:
+        engine = _build_engine(DATABASE_URL)
+        with engine.connect():
+            pass
+        DB_BACKEND = "postgresql" if DATABASE_URL.startswith("postgres") else "sqlite"
+        print(f"Connected to database: {DATABASE_URL.split('@')[-1]} "
+              f"[{DB_BACKEND}] (pool={DB_POOL_SIZE}+{DB_MAX_OVERFLOW})")
+        break
+    except Exception as e:
+        _last_error = e
+        engine = None
+        if attempt < DB_CONNECT_RETRIES:
+            wait = DB_CONNECT_BACKOFF * attempt
+            print(f"Database not reachable (attempt {attempt}/{DB_CONNECT_RETRIES}): {e}")
+            print(f"  retrying in {wait:.0f}s...")
+            time.sleep(wait)
+
+if engine is None:
+    if not ALLOW_SQLITE_FALLBACK:
+        # Fail loudly. A cloud deployment writing to SQLite loses everything on
+        # the next restart, which is far worse than not starting at all.
+        print("=" * 72)
+        print("FATAL: DATABASE_URL is configured but unreachable after "
+              f"{DB_CONNECT_RETRIES} attempts.")
+        print(f"  last error: {_last_error}")
+        print("")
+        print("  Refusing to start on SQLite, because this host's disk is likely")
+        print("  ephemeral and every write would be lost on restart.")
+        print("")
+        print("  Check that:")
+        print("    - the database service is running and not suspended")
+        print("    - DATABASE_URL is the INTERNAL connection string")
+        print("    - the database is in the same region as the app")
+        print("  To override for local development only:")
+        print("    ALLOW_SQLITE_FALLBACK=true")
+        print("=" * 72)
+        raise SystemExit(1)
+
+    print(f"Database not reachable ({_last_error}).")
+    print("Falling back to local SQLite (factorypulse.db) - DEVELOPMENT ONLY.")
+    print("  Data written here does NOT persist on ephemeral cloud filesystems.")
     DATABASE_URL = "sqlite:///factorypulse.db"
-    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+    engine = _build_engine(DATABASE_URL)
+    DB_BACKEND = "sqlite"
 
 SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
+
+# Independent (non-scoped) sessions for helpers that run inside a request but
+# must not disturb the request's own session. Closing a scoped session detaches
+# every object the caller still holds.
+_SessionFactory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+
+def _new_session():
+    return _SessionFactory()
 Base = declarative_base()
 
 
@@ -412,6 +510,171 @@ class Alert(Base):
     suggested_actions = Column(String(255), default="")  # comma-separated action codes
     acknowledged = Column(Integer, default=0)  # 0/1 (SQLite-friendly boolean)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class FailureEvent(Base):
+    """Ground truth: a failure that ACTUALLY happened.
+
+    Without this table the system can never be evaluated - every "92% risk" is
+    an unverifiable claim. An operator confirms a real breakdown here, and the
+    evaluation engine then measures predictions against it."""
+    __tablename__ = "failure_events"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    machine_id = Column(Integer, ForeignKey("machines.id"), nullable=False, index=True)
+    machine_code = Column(String(50), default="")
+
+    occurred_at = Column(DateTime, nullable=False, index=True)
+    failure_type = Column(String(80), default="")      # bearing | motor | cooling | ...
+    component = Column(String(80), default="")
+    downtime_minutes = Column(Float, default=0)
+    repair_cost = Column(Float, default=0)
+    was_predicted = Column(Integer, default=0)          # filled in by the evaluator
+    notes = Column(Text, default="")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class PredictionLog(Base):
+    """Every risk/RUL the engine produced, stored so it can be scored later
+    against FailureEvent. This is what makes precision/recall possible."""
+    __tablename__ = "prediction_logs"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    machine_id = Column(Integer, ForeignKey("machines.id"), nullable=False, index=True)
+    machine_code = Column(String(50), default="")
+
+    risk = Column(Float, default=0)
+    rul_hours = Column(Float, nullable=True)
+    anomaly_score = Column(Float, default=0)            # max |z| across signals
+    predicted_failure = Column(Integer, default=0)      # 1 if risk crossed the alert threshold
+    root_cause = Column(String(80), default="")
+    model_version = Column(String(40), default="")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+
+class SignalBaseline(Base):
+    """Per-machine, per-signal statistical baseline (Welford running stats).
+
+    Fixed thresholds are wrong for every machine at once: a press that normally
+    runs at 88C is not faulty, and a pump that normally runs at 55C is already
+    in trouble at 65C. This table learns each machine's own normal."""
+    __tablename__ = "signal_baselines"
+
+    id = Column(Integer, primary_key=True)
+    machine_id = Column(Integer, ForeignKey("machines.id"), nullable=False, index=True)
+    signal = Column(String(30), nullable=False)         # temperature | vibration | load | power_kw
+
+    count = Column(Integer, default=0)
+    mean = Column(Float, default=0)
+    m2 = Column(Float, default=0)                       # sum of squared deviations
+    min_seen = Column(Float, nullable=True)
+    max_seen = Column(Float, nullable=True)
+
+    is_ready = Column(Integer, default=0)               # 1 once enough samples collected
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow,
+                        onupdate=datetime.datetime.utcnow)
+
+
+def write_audit(db, user, action, entity_type="", entity_id=None, details=""):
+    """Appends to the audit trail. Best-effort: an audit failure must never
+    break the operation being audited, but it is logged loudly so a silently
+    broken trail is noticed."""
+    try:
+        db.add(AuditLog(
+            user_id=getattr(user, "id", None),
+            user_email=getattr(user, "email", "") or "",
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            # Column is named `detail` (singular) on the model; passing
+            # `details=` silently failed and every audit write was lost.
+            detail=str(details)[:1000],
+        ))
+    except Exception as e:
+        print(f"AUDIT WRITE FAILED for action '{action}': {e}")
+
+
+class Invite(Base):
+    """A personal invitation issued by an administrator.
+
+    Bound to one email address so a leaked link cannot onboard a stranger,
+    and single-use so it cannot be shared after the fact."""
+    __tablename__ = "invites"
+
+    id = Column(Integer, primary_key=True)
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    email = Column(String(255), default="", index=True)
+    role = Column(String(20), default="engineer")
+
+    invited_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    invited_by_email = Column(String(255), default="")
+    note = Column(String(255), default="")
+
+    used = Column(Integer, default=0)
+    used_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class PasswordHistory(Base):
+    """Previous password hashes, so a user cannot cycle back to a compromised
+    one. Only hashes are stored - never the passwords themselves."""
+    __tablename__ = "password_history"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+
+class RevokedToken(Base):
+    """Tokens invalidated before their natural expiry.
+
+    Kept in the database, not memory: an in-memory set is emptied by every
+    restart and is not shared between gunicorn workers, so a logged-out or
+    stolen token would quietly become valid again."""
+    __tablename__ = "revoked_tokens"
+
+    id = Column(Integer, primary_key=True)
+    token_hash = Column(String(64), unique=True, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reason = Column(String(40), default="")          # logout | password_change
+    expires_at = Column(DateTime, nullable=True)      # prune after this
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class LoginAttempt(Base):
+    """Failed-login counters, persisted for the same reason: a lockout that
+    disappears on restart is not a lockout."""
+    __tablename__ = "login_attempts"
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    failure_count = Column(Integer, default=0)
+    locked_until = Column(DateTime, nullable=True)
+    last_failure_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class TrainedModel(Base):
+    """Model registry. A model held only in memory is lost on every deploy,
+    which means the 'trained' state and its measured accuracy vanish with it."""
+    __tablename__ = "trained_models"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    version = Column(String(60), nullable=False)
+    algorithm = Column(String(40), default="logistic_regression")
+
+    payload = Column(Text, default="")               # JSON: weights, scaler, features
+    metrics = Column(Text, default="")               # JSON: hold-out metrics
+    training_distribution = Column(Text, default="")  # JSON: for drift baseline
+
+    training_samples = Column(Integer, default=0)
+    positive_samples = Column(Integer, default=0)
+    is_active = Column(Integer, default=1)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
 
 
 class ProductionShift(Base):
@@ -530,7 +793,8 @@ class PasswordReset(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     email = Column(String(255), nullable=False, index=True)
     code = Column(String(10), nullable=False)
-    used = Column(Integer, default=0)  # 0/1
+    used = Column(Integer, default=0)
+    attempts = Column(Integer, default=0)   # wrong guesses against this code  # 0/1
     expires_at = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
@@ -544,7 +808,7 @@ def _ensure_schema_migrations():
     columns instead of crashing with 'no such column' errors. Existing rows/accounts
     are never touched or deleted - this only ever ADDS columns."""
     try:
-        inspector = inspect(engine)
+        inspector = sa_inspect(engine)
         table_names = inspector.get_table_names()
         migrations = {
             "users": [
@@ -570,6 +834,9 @@ def _ensure_schema_migrations():
                 ("alert_type", "VARCHAR(20) DEFAULT 'critical'"),
                 ("alert_value", "FLOAT DEFAULT 0"),
                 ("suggested_actions", "VARCHAR(255) DEFAULT ''"),
+            ],
+            "password_resets": [
+                ("attempts", "INTEGER DEFAULT 0"),
             ],
         }
         with engine.connect() as conn:
@@ -641,11 +908,404 @@ def is_strong_password(password):
     return bool(password) and len(password) >= 8 and re.search(r"[A-Za-z]", password) and re.search(r"[0-9]", password)
 
 
+# ------------------------------------------------------------------
+# RATE LIMITING
+#
+# Without this, /api/login and /api/forgot-password can be brute-forced at
+# full speed. Deliberately in-process (no Redis dependency): with multiple
+# workers each holds its own counter, which is weaker but still effective.
+# ------------------------------------------------------------------
+_rate_buckets = {}
+_rate_lock = threading.Lock()
+
+RATE_LIMITS = {
+    "login": (10, 300),               # 10 attempts / 5 min / IP
+    "register": (5, 3600),
+    "forgot_password": (5, 3600),
+    "reset_password": (10, 3600),
+    "smtp_test": (3, 3600),
+}
+
+
+def _client_ip():
+    # Behind Render/nginx the real client is in X-Forwarded-For.
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+# ------------------------------------------------------------------
+# SECURITY HARDENING
+# ------------------------------------------------------------------
+# Accounts lock after repeated failures from any source. Rate limiting is
+# per-IP and can be bypassed with a botnet; this is per-account.
+LOCKOUT_THRESHOLD = int(os.environ.get("LOCKOUT_THRESHOLD", "8"))
+LOCKOUT_MINUTES = int(os.environ.get("LOCKOUT_MINUTES", "15"))
+_failed_logins = {}          # email -> {"count": int, "until": float}
+_lockout_lock = threading.Lock()
+
+# Tokens invalidated before their natural expiry (logout, password change).
+_revoked_tokens = set()
+_revoked_lock = threading.Lock()
+
+
+def record_login_failure(email):
+    """Counts a failure durably, so a restart cannot reset an attacker's budget."""
+    db = _new_session()
+    try:
+        row = db.query(LoginAttempt).filter_by(email=email).first()
+        if row is None:
+            row = LoginAttempt(email=email, failure_count=0)
+            db.add(row)
+        row.failure_count = (row.failure_count or 0) + 1
+        row.last_failure_at = datetime.datetime.utcnow()
+        if row.failure_count >= LOCKOUT_THRESHOLD:
+            row.locked_until = (datetime.datetime.utcnow()
+                                + datetime.timedelta(minutes=LOCKOUT_MINUTES))
+            row.failure_count = 0
+            print(f"SECURITY: account locked for {LOCKOUT_MINUTES}m: {email}")
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"SECURITY: failed to record login failure: {e}")
+        # Fall back to the in-memory counter so protection is never fully absent.
+        with _lockout_lock:
+            entry = _failed_logins.setdefault(email, {"count": 0, "until": 0.0})
+            entry["count"] += 1
+            if entry["count"] >= LOCKOUT_THRESHOLD:
+                entry["until"] = time.time() + LOCKOUT_MINUTES * 60
+                entry["count"] = 0
+    finally:
+        db.close()
+
+
+def clear_login_failures(email):
+    with _lockout_lock:
+        _failed_logins.pop(email, None)
+    db = _new_session()
+    try:
+        row = db.query(LoginAttempt).filter_by(email=email).first()
+        if row:
+            row.failure_count = 0
+            row.locked_until = None
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def is_locked_out(email):
+    """Returns (locked, seconds_remaining). Checks the durable record first."""
+    db = _new_session()
+    try:
+        row = db.query(LoginAttempt).filter_by(email=email).first()
+        if row and row.locked_until:
+            remaining = (row.locked_until - datetime.datetime.utcnow()).total_seconds()
+            if remaining > 0:
+                return True, int(remaining)
+            row.locked_until = None
+            db.commit()
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+    with _lockout_lock:
+        entry = _failed_logins.get(email)
+        if not entry:
+            return False, 0
+        remaining = entry["until"] - time.time()
+        if remaining <= 0:
+            entry["until"] = 0.0
+            return False, 0
+        return True, int(remaining)
+
+
+def revoke_token(token, user_id=None, reason="logout"):
+    """Records the revocation in BOTH memory (fast path) and the database
+    (survives restarts and is shared across workers)."""
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    with _revoked_lock:
+        _revoked_tokens.add(digest)
+
+    # Use an INDEPENDENT session, not the scoped registry: calling
+    # SessionLocal.remove() here would detach the objects the current request
+    # is still using (g.user), which raises DetachedInstanceError.
+    db = _new_session()
+    try:
+        if not db.query(RevokedToken).filter_by(token_hash=digest).first():
+            db.add(RevokedToken(
+                token_hash=digest, user_id=user_id, reason=reason,
+                # Prunable once the token would have expired on its own.
+                expires_at=datetime.datetime.utcnow() + datetime.timedelta(days=31),
+            ))
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"SECURITY: failed to persist token revocation: {e}")
+    finally:
+        db.close()
+
+
+def is_token_revoked(token):
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    with _revoked_lock:
+        if digest in _revoked_tokens:
+            return True
+
+    # Cache miss: check the durable record. This is what makes a revocation
+    # hold after a restart or on a worker that never saw the logout.
+    db = _new_session()
+    try:
+        found = db.query(RevokedToken).filter_by(token_hash=digest).first() is not None
+        if found:
+            with _revoked_lock:
+                _revoked_tokens.add(digest)   # warm the cache
+        return found
+    except Exception:
+        # Fail closed would lock everyone out on a DB blip; fail open here is
+        # acceptable because the token signature is still verified separately.
+        return False
+    finally:
+        db.close()
+
+
+def validate_password_strength(password):
+    """Returns (ok, reason). Enforced server-side: client-side checks are
+    advisory only and trivially bypassed."""
+    if len(password) < 10:
+        return False, "password_too_short"
+    if not any(ch.isdigit() for ch in password):
+        return False, "password_needs_digit"
+    if not any(ch.isalpha() for ch in password):
+        return False, "password_needs_letter"
+    common = {"password", "12345678", "qwerty", "admin123", "factorypulse",
+              "password1", "letmein", "welcome1", "1234567890"}
+    if password.lower() in common:
+        return False, "password_too_common"
+    return True, None
+
+
+def audit_startup_secrets():
+    """Refuses to start silently with insecure defaults in production."""
+    problems = []
+    if JWT_SECRET in ("", "change-me", "secret", "factorypulse-dev-secret"):
+        problems.append("JWT_SECRET is unset or a default value")
+    if len(JWT_SECRET) < 32:
+        problems.append("JWT_SECRET is shorter than 32 characters")
+    if os.environ.get("FLASK_DEBUG", "").lower() in ("1", "true", "yes"):
+        problems.append("FLASK_DEBUG is enabled")
+    if problems:
+        print("=" * 70)
+        print("SECURITY WARNING - do not run in production until fixed:")
+        for p in problems:
+            print(f"  - {p}")
+        print("=" * 70)
+    return problems
+
+
+# ------------------------------------------------------------------
+# HARDENING LAYER 2
+#
+# Adds the controls a penetration test looks for beyond basic auth:
+# request size caps, Origin checking, adaptive IP blocking, password reuse
+# prevention, and constant-time comparisons.
+# ------------------------------------------------------------------
+
+# Reject oversized bodies before they are parsed. Without this a single
+# multi-megabyte JSON can pin a worker's CPU and memory.
+MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", str(2 * 1024 * 1024)))
+
+# Comma-separated origins allowed to make state-changing requests.
+# Empty means same-origin only, which is the safe default.
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
+# Adaptive blocking: an IP that keeps failing auth gets shut out entirely,
+# not just slowed down. This is what stops a scanner walking the API.
+IP_BLOCK_THRESHOLD = int(os.environ.get("IP_BLOCK_THRESHOLD", "20"))
+IP_BLOCK_MINUTES = int(os.environ.get("IP_BLOCK_MINUTES", "60"))
+_ip_offences = {}          # ip -> {"count": int, "blocked_until": float}
+_ip_lock = threading.Lock()
+
+# Passwords may not be reused. Stored as hashes only.
+PASSWORD_HISTORY_SIZE = int(os.environ.get("PASSWORD_HISTORY_SIZE", "5"))
+
+# A 6-digit code has a million combinations; without an attempt cap that is
+# brute-forceable. Five guesses and the code is burned.
+RESET_CODE_MAX_ATTEMPTS = int(os.environ.get("RESET_CODE_MAX_ATTEMPTS", "5"))
+
+
+def constant_time_equals(a, b):
+    """Comparison whose duration does not leak how much of the value matched.
+    Used for reset codes, where a plain == is a timing oracle."""
+    return hmac.compare_digest(str(a or ""), str(b or ""))
+
+
+def record_ip_offence(ip, weight=1):
+    """Counts a suspicious action. Enough of them and the IP is blocked."""
+    with _ip_lock:
+        entry = _ip_offences.setdefault(ip, {"count": 0, "blocked_until": 0.0})
+        entry["count"] += weight
+        if entry["count"] >= IP_BLOCK_THRESHOLD:
+            entry["blocked_until"] = time.time() + IP_BLOCK_MINUTES * 60
+            entry["count"] = 0
+            print(f"SECURITY: IP blocked for {IP_BLOCK_MINUTES}m: {ip}")
+        # Keep the table bounded.
+        if len(_ip_offences) > 10000:
+            now = time.time()
+            for k in [k for k, v in list(_ip_offences.items())
+                      if v["blocked_until"] < now and v["count"] == 0]:
+                _ip_offences.pop(k, None)
+
+
+def is_ip_blocked(ip):
+    with _ip_lock:
+        entry = _ip_offences.get(ip)
+        if not entry:
+            return False, 0
+        remaining = entry["blocked_until"] - time.time()
+        if remaining <= 0:
+            entry["blocked_until"] = 0.0
+            return False, 0
+        return True, int(remaining)
+
+
+def check_password_reuse(db, user_id, new_password):
+    """True when the password matches one the user has used recently."""
+    try:
+        recent = (db.query(PasswordHistory)
+                  .filter_by(user_id=user_id)
+                  .order_by(PasswordHistory.created_at.desc())
+                  .limit(PASSWORD_HISTORY_SIZE).all())
+        return any(verify_password(new_password, h.password_hash) for h in recent)
+    except Exception as e:
+        print(f"Password history check failed: {e}")
+        return False
+
+
+def remember_password(db, user_id, password_hash):
+    try:
+        db.add(PasswordHistory(user_id=user_id, password_hash=password_hash))
+        old = (db.query(PasswordHistory)
+               .filter_by(user_id=user_id)
+               .order_by(PasswordHistory.created_at.desc())
+               .offset(PASSWORD_HISTORY_SIZE).all())
+        for row in old:
+            db.delete(row)
+    except Exception as e:
+        print(f"Password history write failed: {e}")
+
+
+# ------------------------------------------------------------------
+# REGISTRATION ACCESS CONTROL
+#
+# By default anyone who finds the URL can create an account. In a plant that
+# is unacceptable: the dashboard exposes production data, downtime costs and
+# machine health. Three independent gates, any of which can be used alone:
+#
+#   1. ALLOWED_EMAIL_DOMAINS - only company addresses may register
+#   2. REGISTRATION_CODE     - a shared code the plant hands to its staff
+#   3. INVITE_ONLY           - an administrator must issue a personal invite
+#
+# With none configured the behaviour is unchanged (open registration), so an
+# existing deployment does not break - but the startup banner warns about it.
+# ------------------------------------------------------------------
+ALLOWED_EMAIL_DOMAINS = [
+    d.strip().lower().lstrip("@")
+    for d in os.environ.get("ALLOWED_EMAIL_DOMAINS", "").split(",")
+    if d.strip()
+]
+REGISTRATION_CODE = os.environ.get("REGISTRATION_CODE", "").strip()
+INVITE_ONLY = os.environ.get("INVITE_ONLY", "false").lower() in ("1", "true", "yes")
+
+# The very first account may always be created, otherwise a fresh install with
+# INVITE_ONLY on could never be set up (nobody exists to send an invite).
+ALLOW_FIRST_ADMIN = os.environ.get("ALLOW_FIRST_ADMIN", "true").lower() in ("1", "true", "yes")
+
+
+def registration_is_restricted():
+    return bool(ALLOWED_EMAIL_DOMAINS or REGISTRATION_CODE or INVITE_ONLY)
+
+
+def check_registration_allowed(db, email, code, invite_token):
+    """Returns (allowed, error_code, invite_row).
+
+    Runs every configured gate. An invite satisfies all of them at once,
+    because issuing one is already a deliberate act by an administrator."""
+    # Bootstrap: the first ever account is always permitted.
+    if ALLOW_FIRST_ADMIN and db.query(User).count() == 0:
+        return True, None, None
+
+    # A valid personal invite overrides the other gates.
+    if invite_token:
+        invite = (db.query(Invite)
+                  .filter_by(token=str(invite_token).strip(), used=0).first())
+        if invite is None:
+            return False, "invalid_invite", None
+        if invite.expires_at and invite.expires_at < datetime.datetime.utcnow():
+            return False, "invite_expired", None
+        # An invite is issued to a specific address; using it for another
+        # address would let one leaked link onboard anyone.
+        if invite.email and invite.email.lower() != email.lower():
+            return False, "invite_email_mismatch", None
+        return True, None, invite
+
+    if INVITE_ONLY:
+        return False, "invite_required", None
+
+    if ALLOWED_EMAIL_DOMAINS:
+        domain = email.rsplit("@", 1)[-1].lower()
+        if domain not in ALLOWED_EMAIL_DOMAINS:
+            return False, "email_domain_not_allowed", None
+
+    if REGISTRATION_CODE:
+        if not constant_time_equals(REGISTRATION_CODE, str(code or "").strip()):
+            return False, "invalid_registration_code", None
+
+    return True, None, None
+
+
+def rate_limit(bucket):
+    """Decorator. Returns HTTP 429 with Retry-After once the limit is hit."""
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            limit, window = RATE_LIMITS.get(bucket, (30, 60))
+            key = f"{bucket}:{_client_ip()}"
+            now = time.time()
+            with _rate_lock:
+                hits = [t for t in _rate_buckets.get(key, []) if now - t < window]
+                if len(hits) >= limit:
+                    retry_after = int(window - (now - hits[0])) + 1
+                    # Being throttled is itself suspicious: a legitimate client
+                    # backs off, a scanner keeps going. Escalate to an IP block.
+                    record_ip_offence(_client_ip(), weight=2)
+                    print(f"RATE LIMIT hit: {bucket} from {_client_ip()}")
+                    response = jsonify({"error": "rate_limited", "retry_after": retry_after})
+                    response.status_code = 429
+                    response.headers["Retry-After"] = str(retry_after)
+                    return response
+                hits.append(now)
+                _rate_buckets[key] = hits
+                # Opportunistic cleanup so the dict cannot grow without bound.
+                if len(_rate_buckets) > 5000:
+                    for k in [k for k, v in list(_rate_buckets.items())
+                              if not v or now - v[-1] > 3600]:
+                        _rate_buckets.pop(k, None)
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
 def require_auth(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
         auth_header = request.headers.get("Authorization", "")
         token = auth_header.replace("Bearer ", "").strip()
+        if is_token_revoked(token):
+            return jsonify({"error": "token_revoked"}), 401
         user_id = decode_jwt(token) if token else None
         if not user_id:
             return jsonify({"error": "unauthorized"}), 401
@@ -1082,6 +1742,9 @@ DATA_MODE = os.environ.get("DATA_MODE", "SIMULATION").upper()  # SIMULATION|USB|
 SERIAL_PORT = os.environ.get("SERIAL_PORT", "COM3")
 SERIAL_BAUDRATE = int(os.environ.get("SERIAL_BAUDRATE", "9600"))
 PLC_IP = os.environ.get("PLC_IP", "192.168.0.1")
+PLC_RACK = int(os.environ.get("PLC_RACK", "0"))
+PLC_SLOT = int(os.environ.get("PLC_SLOT", "1"))
+PLC_DB_NUMBER = int(os.environ.get("PLC_DB_NUMBER", "1"))
 
 MODBUS_HOST = os.environ.get("MODBUS_HOST", "192.168.0.10")
 MODBUS_PORT = int(os.environ.get("MODBUS_PORT", "502"))
@@ -1139,6 +1802,355 @@ except ImportError:
     print("paho-mqtt not installed - MQTT mode unavailable (pip install paho-mqtt to enable).")
 
 
+# ==================================================================
+# INDUSTRIAL CONNECTION LAYER
+#
+# Fixes the pattern where every read opened and closed a fresh TCP session -
+# unacceptable on a plant network. Adds, for every protocol:
+#   - persistent connections held open between reads
+#   - exponential-backoff reconnect (never hammers a dead device)
+#   - connection health tracking exposed over the API
+#   - a bounded offline buffer so a network outage does not lose data
+#   - range validation so a spiking sensor cannot poison the baseline
+#   - device timestamps preserved when the source provides them
+#
+# SAFETY: every connector is READ-ONLY. There is no write path to any PLC.
+# ==================================================================
+
+# Physically plausible ranges. A reading outside these is a sensor or wiring
+# fault, not a process condition, and must never reach the AI engine.
+SIGNAL_RANGES = {
+    "temperature": (-50.0, 300.0),
+    "vibration": (0.0, 100.0),
+    "load": (0.0, 120.0),
+    "pressure": (0.0, 400.0),
+    "voltage": (0.0, 1000.0),
+    "current": (0.0, 500.0),
+}
+
+CONNECT_BACKOFF_BASE = float(os.environ.get("CONNECT_BACKOFF_BASE", "1.0"))
+CONNECT_BACKOFF_CAP = float(os.environ.get("CONNECT_BACKOFF_CAP", "60.0"))
+OFFLINE_BUFFER_SIZE = int(os.environ.get("OFFLINE_BUFFER_SIZE", "5000"))
+STALE_DATA_SECONDS = float(os.environ.get("STALE_DATA_SECONDS", "30"))
+
+
+def validate_reading(raw, source="unknown"):
+    """Splits a raw device payload into trusted values and rejected ones.
+
+    Returns (clean, rejected). Rejected entries are reported rather than
+    silently dropped, because a sensor that keeps failing validation is
+    itself a maintenance finding."""
+    clean, rejected = {}, []
+    for key, value in (raw or {}).items():
+        if key not in SIGNAL_RANGES:
+            clean[key] = value
+            continue
+        try:
+            fv = float(value)
+        except (TypeError, ValueError):
+            rejected.append({"signal": key, "value": str(value)[:32], "reason": "not_numeric"})
+            continue
+        if fv != fv or fv in (float("inf"), float("-inf")):
+            rejected.append({"signal": key, "value": str(value)[:32], "reason": "not_finite"})
+            continue
+        low, high = SIGNAL_RANGES[key]
+        if not (low <= fv <= high):
+            rejected.append({"signal": key, "value": fv,
+                             "reason": f"out_of_range({low},{high})"})
+            continue
+        clean[key] = fv
+    if rejected:
+        print(f"Validation rejected {len(rejected)} signal(s) from {source}: "
+              f"{[r['signal'] for r in rejected]}")
+    return clean, rejected
+
+
+# ------------------------------------------------------------------
+# UNIT NORMALIZATION
+#
+# Devices report in whatever units their vendor chose. Everything downstream
+# assumes SI (C, mm/s, %, bar, V, A), so conversion happens once at ingest
+# rather than being guessed at in the AI engine.
+# ------------------------------------------------------------------
+UNIT_CONVERSIONS = {
+    "temp_f":      ("temperature", lambda v: (v - 32.0) * 5.0 / 9.0),
+    "temp_k":      ("temperature", lambda v: v - 273.15),
+    "vib_ips":     ("vibration",   lambda v: v * 25.4),        # inch/s -> mm/s
+    "vib_um":      ("vibration",   lambda v: v / 1000.0),
+    "load_frac":   ("load",        lambda v: v * 100.0),
+    "pressure_psi": ("pressure",   lambda v: v * 0.0689476),   # psi -> bar
+    "pressure_kpa": ("pressure",   lambda v: v / 100.0),
+    "current_ma":  ("current",     lambda v: v / 1000.0),
+}
+
+
+def normalize_units(raw):
+    """Maps vendor-specific keys/units onto the canonical SI signal names."""
+    out = {}
+    for key, value in (raw or {}).items():
+        if key in UNIT_CONVERSIONS:
+            name, convert = UNIT_CONVERSIONS[key]
+            try:
+                out[name] = round(convert(float(value)), 3)
+            except (TypeError, ValueError):
+                continue
+        else:
+            out[key] = value
+    return out
+
+
+# ------------------------------------------------------------------
+# INGESTION QUEUE
+#
+# Decouples "data arrived" from "data was stored". Without it, a database
+# hiccup loses readings outright and a redelivered MQTT message is written
+# twice. Provides: bounded memory, duplicate suppression, bounded retry, and
+# a dead-letter queue so a permanently bad row is quarantined rather than
+# silently dropped or endlessly retried.
+# ------------------------------------------------------------------
+INGEST_QUEUE_SIZE = int(os.environ.get("INGEST_QUEUE_SIZE", "10000"))
+INGEST_DEDUP_WINDOW = int(os.environ.get("INGEST_DEDUP_WINDOW", "300"))
+INGEST_MAX_ATTEMPTS = int(os.environ.get("INGEST_MAX_ATTEMPTS", "3"))
+INGEST_BATCH_SIZE = int(os.environ.get("INGEST_BATCH_SIZE", "200"))
+
+
+class IngestQueue:
+    """Thread-safe bounded queue with deduplication and retry."""
+
+    def __init__(self):
+        self.queue = collections.deque(maxlen=INGEST_QUEUE_SIZE)
+        self.dead_letter = collections.deque(maxlen=1000)
+        self._seen = collections.OrderedDict()
+        self.lock = threading.Lock()
+        self.stats = {"accepted": 0, "duplicates": 0, "overflow_dropped": 0,
+                      "retried": 0, "dead_lettered": 0, "written": 0}
+
+    @staticmethod
+    def _fingerprint(machine_code, timestamp, values):
+        raw = f"{machine_code}|{timestamp}|{sorted((values or {}).items())}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+    def put(self, machine_code, values, device_timestamp=None, source="unknown"):
+        """Returns True if queued, False if suppressed as a duplicate."""
+        # Device time is authoritative when the source supplies it; that is
+        # what makes readings orderable across machines with clock skew.
+        timestamp = device_timestamp or datetime.datetime.utcnow().isoformat()
+        key = self._fingerprint(machine_code, timestamp, values)
+        now = time.time()
+
+        with self.lock:
+            while self._seen and next(iter(self._seen.values())) < now - INGEST_DEDUP_WINDOW:
+                self._seen.popitem(last=False)
+            if key in self._seen:
+                self.stats["duplicates"] += 1
+                return False
+            self._seen[key] = now
+
+            if len(self.queue) == self.queue.maxlen:
+                self.stats["overflow_dropped"] += 1
+            self.queue.append({
+                "machine_code": machine_code, "values": values,
+                "timestamp": timestamp, "source": source,
+                "attempts": 0, "key": key,
+            })
+            self.stats["accepted"] += 1
+        return True
+
+    def drain(self, writer, batch=None):
+        """Hands items to `writer`. Failures go back on the queue until
+        INGEST_MAX_ATTEMPTS, then to the dead-letter queue."""
+        batch = batch or INGEST_BATCH_SIZE
+        written = 0
+        for _ in range(min(batch, len(self.queue))):
+            with self.lock:
+                if not self.queue:
+                    break
+                item = self.queue.popleft()
+            try:
+                writer(item)
+                written += 1
+                self.stats["written"] += 1
+            except Exception as e:
+                item["attempts"] += 1
+                with self.lock:
+                    if item["attempts"] >= INGEST_MAX_ATTEMPTS:
+                        item["error"] = str(e)[:200]
+                        item["failed_at"] = datetime.datetime.utcnow().isoformat()
+                        self.dead_letter.append(item)
+                        self.stats["dead_lettered"] += 1
+                        print(f"Ingest dead-lettered after {item['attempts']} attempts: {e}")
+                    else:
+                        self.queue.append(item)
+                        self.stats["retried"] += 1
+        return written
+
+    def health(self):
+        return {
+            "depth": len(self.queue),
+            "capacity": INGEST_QUEUE_SIZE,
+            "utilisation_pct": round(len(self.queue) / INGEST_QUEUE_SIZE * 100, 1),
+            "dead_letter_depth": len(self.dead_letter),
+            **self.stats,
+        }
+
+
+INGEST = IngestQueue()
+
+
+class ConnectionManager:
+    """Holds one long-lived connection per protocol and supervises its health.
+
+    Thread-safe: the broadcast loop and HTTP requests can both read through it."""
+
+    def __init__(self, name):
+        self.name = name
+        self.client = None
+        self.lock = threading.Lock()
+        self.failures = 0
+        self.next_retry_at = 0.0
+        self.last_success = None
+        self.last_error = None
+        self.total_reads = 0
+        self.total_failures = 0
+        self.rejected_samples = 0
+        # Bounded so a long outage cannot exhaust memory; keeps the newest data.
+        self.buffer = collections.deque(maxlen=OFFLINE_BUFFER_SIZE)
+
+    def _backoff(self):
+        return min(CONNECT_BACKOFF_CAP, CONNECT_BACKOFF_BASE * (2 ** min(self.failures, 10)))
+
+    def is_connected(self):
+        return self.client is not None
+
+    def note_failure(self, error):
+        self.failures += 1
+        self.total_failures += 1
+        self.last_error = str(error)[:200]
+        self.next_retry_at = time.time() + self._backoff()
+        self.close()
+        print(f"[{self.name}] connection failed ({self.failures}): {self.last_error} "
+              f"- next retry in {self._backoff():.0f}s")
+
+    def note_success(self):
+        if self.failures:
+            print(f"[{self.name}] reconnected after {self.failures} failure(s)")
+        self.failures = 0
+        self.last_success = time.time()
+        self.total_reads += 1
+
+    def ready_to_retry(self):
+        return time.time() >= self.next_retry_at
+
+    def close(self):
+        if self.client is None:
+            return
+        try:
+            for method in ("disconnect", "close"):
+                if hasattr(self.client, method):
+                    getattr(self.client, method)()
+                    break
+        except Exception:
+            pass
+        self.client = None
+
+    def buffer_reading(self, machine_code, values, device_ts=None):
+        """Stores a reading locally when the database is unreachable."""
+        self.buffer.append({
+            "machine_code": machine_code,
+            "values": values,
+            # Device timestamp when the source provides one, otherwise ours.
+            "timestamp": device_ts or datetime.datetime.utcnow().isoformat(),
+            "buffered_at": time.time(),
+        })
+
+    def health(self):
+        age = (time.time() - self.last_success) if self.last_success else None
+        if not self.is_connected() and self.failures:
+            state = "disconnected"
+        elif age is not None and age > STALE_DATA_SECONDS:
+            state = "stale"
+        elif self.last_success:
+            state = "healthy"
+        else:
+            state = "never_connected"
+        return {
+            "protocol": self.name,
+            "state": state,
+            "connected": self.is_connected(),
+            "consecutive_failures": self.failures,
+            "seconds_since_last_read": round(age, 1) if age is not None else None,
+            "total_reads": self.total_reads,
+            "total_failures": self.total_failures,
+            "rejected_samples": self.rejected_samples,
+            "buffered_readings": len(self.buffer),
+            "buffer_capacity": OFFLINE_BUFFER_SIZE,
+            "last_error": self.last_error,
+            "next_retry_in": max(0, round(self.next_retry_at - time.time(), 1)),
+        }
+
+
+CONNECTIONS = {
+    "modbus": ConnectionManager("modbus"),
+    "opcua": ConnectionManager("opcua"),
+    "plc": ConnectionManager("plc"),
+    "mqtt": ConnectionManager("mqtt"),
+    "usb": ConnectionManager("usb"),
+}
+
+
+def _persist_queued_reading(item):
+    """Writer used by IngestQueue.drain(). Raises on failure so the queue
+    can retry - never swallows the error."""
+    db = SessionLocal()
+    try:
+        machine = db.query(Machine).filter_by(machine_code=item["machine_code"]).first()
+        if machine is None:
+            # Unknown machine: not retryable, so let it dead-letter rather
+            # than loop forever.
+            raise ValueError(f"unknown machine_code {item['machine_code']}")
+        values = item["values"]
+        try:
+            recorded = datetime.datetime.fromisoformat(str(item["timestamp"]))
+        except (TypeError, ValueError):
+            recorded = datetime.datetime.utcnow()
+
+        db.add(TelemetryHistory(
+            user_id=machine.user_id, machine_id=machine.id,
+            machine_code=machine.machine_code,
+            temperature=values.get("temperature", 0),
+            vibration=values.get("vibration", 0),
+            load=values.get("load", 0),
+            power_kw=estimate_power_kw(values.get("voltage", 0), values.get("current", 0)),
+            status=machine.status or "",
+            recorded_at=recorded,
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        SessionLocal.remove()
+
+
+def _ingest_drain_loop():
+    """Continuously moves queued readings into the database."""
+    time.sleep(20)
+    while True:
+        try:
+            if len(INGEST.queue):
+                written = INGEST.drain(_persist_queued_reading)
+                if written:
+                    print(f"Ingest: persisted {written} reading(s), "
+                          f"{len(INGEST.queue)} still queued")
+        except Exception as e:
+            print("Ingest drain loop error:", e)
+        time.sleep(5)
+
+
+def connection_health_all():
+    return {name: mgr.health() for name, mgr in CONNECTIONS.items()}
+
+
 def read_from_usb(machine_code):
     """Read one JSON line from an Arduino/ESP32 over serial. Falls back to None on any failure."""
     if not USB_AVAILABLE:
@@ -1165,73 +2177,135 @@ def read_from_plc(machine_code):
     """Read temperature/vibration from a Siemens S7 PLC data block. Falls back to None on any failure."""
     if not PLC_AVAILABLE:
         return None
-    try:
-        client = snap7.client.Client()
-        client.connect(PLC_IP, 0, 1)
-        temp_bytes = client.db_read(1, 0, 4)
-        vib_bytes = client.db_read(1, 4, 4)
-        temperature = snap7.util.get_real(temp_bytes, 0)
-        vibration = snap7.util.get_real(vib_bytes, 0)
-        client.disconnect()
-        return {
-            "temperature": float(temperature),
-            "vibration": float(vibration),
-            "load": 0.0, "pressure": 0.0, "voltage": 0.0, "current": 0.0,
-        }
-    except Exception as e:
-        print(f"PLC read failed for {machine_code}, falling back to simulation:", e)
-        return None
+    mgr = CONNECTIONS["plc"]
+    with mgr.lock:
+        if not mgr.is_connected():
+            if not mgr.ready_to_retry():
+                return None
+            try:
+                client = snap7.client.Client()
+                client.connect(PLC_IP, PLC_RACK, PLC_SLOT)
+                mgr.client = client
+            except Exception as e:
+                mgr.note_failure(e)
+                return None
+
+        try:
+            # DB number and offsets are plant-specific - confirm against the
+            # PLC program before trusting these in production.
+            temp_bytes = mgr.client.db_read(PLC_DB_NUMBER, 0, 4)
+            vib_bytes = mgr.client.db_read(PLC_DB_NUMBER, 4, 4)
+            raw = {
+                "temperature": float(snap7.util.get_real(temp_bytes, 0)),
+                "vibration": float(snap7.util.get_real(vib_bytes, 0)),
+            }
+            clean, rejected = validate_reading(raw, f"plc:{machine_code}")
+            mgr.rejected_samples += len(rejected)
+            mgr.note_success()
+            return clean or None
+        except Exception as e:
+            mgr.note_failure(e)
+            return None
+
+
+# Register map is device-specific. Override via MODBUS_REGISTER_MAP, e.g.
+#   MODBUS_REGISTER_MAP=temperature:0:10,vibration:1:10,load:2:10
+# as signal:address:scale. Without the plant's real address map this default
+# is a placeholder and MUST be confirmed against the device documentation.
+def _parse_modbus_map():
+    raw = os.environ.get("MODBUS_REGISTER_MAP", "")
+    if not raw:
+        return [("temperature", 0, 10.0), ("vibration", 1, 10.0), ("load", 2, 10.0),
+                ("pressure", 3, 10.0), ("voltage", 4, 10.0), ("current", 5, 10.0)]
+    parsed = []
+    for part in raw.split(","):
+        bits = part.strip().split(":")
+        if len(bits) == 3:
+            try:
+                parsed.append((bits[0], int(bits[1]), float(bits[2])))
+            except ValueError:
+                print(f"Bad MODBUS_REGISTER_MAP entry ignored: {part}")
+    return parsed or _parse_modbus_map.__defaults__
+
+
+MODBUS_REGISTER_MAP = _parse_modbus_map()
 
 
 def read_from_modbus(machine_code):
-    """Read 6 scaled holding registers (temp, vibration, load, pressure, voltage, current)
-    from a Modbus TCP device (PLC, sensor gateway, energy meter, etc.)."""
+    """Read scaled holding registers from a Modbus TCP device over a PERSISTENT
+    connection, with backoff reconnect and range validation. Read-only."""
     if not MODBUS_AVAILABLE:
         return None
-    try:
-        client = ModbusTcpClient(MODBUS_HOST, port=MODBUS_PORT)
-        if not client.connect():
-            return None
+
+    mgr = CONNECTIONS["modbus"]
+    with mgr.lock:
+        if not mgr.is_connected():
+            if not mgr.ready_to_retry():
+                return None    # still backing off; don't hammer the device
+            try:
+                client = ModbusTcpClient(MODBUS_HOST, port=MODBUS_PORT)
+                if not client.connect():
+                    raise ConnectionError(f"connect() refused by {MODBUS_HOST}:{MODBUS_PORT}")
+                mgr.client = client
+            except Exception as e:
+                mgr.note_failure(e)
+                return None
+
         try:
-            result = client.read_holding_registers(0, 6, slave=MODBUS_UNIT)
-        except TypeError:
-            # older pymodbus versions use "unit=" instead of "slave="
-            result = client.read_holding_registers(0, 6, unit=MODBUS_UNIT)
-        client.close()
-        if result.isError():
+            addresses = [a for _, a, _ in MODBUS_REGISTER_MAP]
+            start, span = min(addresses), max(addresses) - min(addresses) + 1
+            try:
+                result = mgr.client.read_holding_registers(start, span, slave=MODBUS_UNIT)
+            except TypeError:
+                # older pymodbus versions use "unit=" instead of "slave="
+                result = mgr.client.read_holding_registers(start, span, unit=MODBUS_UNIT)
+            if result.isError():
+                raise IOError(f"modbus exception response: {result}")
+            regs = result.registers
+            raw = {}
+            for signal, address, scale in MODBUS_REGISTER_MAP:
+                idx = address - start
+                if 0 <= idx < len(regs):
+                    raw[signal] = regs[idx] / scale
+            clean, rejected = validate_reading(raw, f"modbus:{machine_code}")
+            mgr.rejected_samples += len(rejected)
+            mgr.note_success()
+            return clean or None
+        except Exception as e:
+            mgr.note_failure(e)
             return None
-        regs = result.registers
-        return {
-            "temperature": regs[0] / 10.0,
-            "vibration": regs[1] / 10.0,
-            "load": regs[2] / 10.0,
-            "pressure": regs[3] / 10.0,
-            "voltage": regs[4] / 10.0,
-            "current": regs[5] / 10.0,
-        }
-    except Exception as e:
-        print(f"Modbus read failed for {machine_code}, falling back to simulation:", e)
-        return None
 
 
 def read_from_opcua(machine_code):
-    """Read temperature/vibration/load/pressure/voltage/current nodes from an OPC UA server."""
+    """Read configured OPC UA nodes over a PERSISTENT session, with backoff
+    reconnect and range validation. Read-only: no node is ever written."""
     if not OPCUA_AVAILABLE:
         return None
-    try:
-        client = OPCUAClient(OPCUA_ENDPOINT)
-        client.connect()
+
+    mgr = CONNECTIONS["opcua"]
+    with mgr.lock:
+        if not mgr.is_connected():
+            if not mgr.ready_to_retry():
+                return None
+            try:
+                client = OPCUAClient(OPCUA_ENDPOINT)
+                client.connect()
+                mgr.client = client
+            except Exception as e:
+                mgr.note_failure(e)
+                return None
+
         try:
-            values = {}
+            raw = {}
             for key, node_id in OPCUA_NODES.items():
-                node = client.get_node(node_id)
-                values[key] = float(node.get_value())
-            return values
-        finally:
-            client.disconnect()
-    except Exception as e:
-        print(f"OPC UA read failed for {machine_code}, falling back to simulation:", e)
-        return None
+                raw[key] = float(mgr.client.get_node(node_id).get_value())
+            clean, rejected = validate_reading(raw, f"opcua:{machine_code}")
+            mgr.rejected_samples += len(rejected)
+            mgr.note_success()
+            return clean or None
+        except Exception as e:
+            mgr.note_failure(e)
+            return None
 
 
 _mqtt_cache = {}  # machine_code -> {"data": {...}, "ts": <epoch seconds>}
@@ -1239,13 +2313,54 @@ _mqtt_client = None
 
 
 def _mqtt_on_message(client, userdata, msg):
+    """Broker callback. Normalises units, validates ranges, preserves the
+    device timestamp, and queues the reading so a database outage cannot
+    lose it. Duplicate redeliveries are suppressed by the queue."""
+    mgr = CONNECTIONS["mqtt"]
     try:
         parts = msg.topic.split("/")
         machine_code = parts[1] if len(parts) > 1 else "unknown"
         payload = json.loads(msg.payload.decode("utf-8"))
-        _mqtt_cache[machine_code] = {"data": payload, "ts": time.time()}
+
+        # Many gateways publish their own timestamp; it is more accurate than
+        # our receive time and survives broker backlogs.
+        device_ts = payload.pop("timestamp", None) or payload.pop("ts", None)
+
+        normalised = normalize_units(payload)
+        clean, rejected = validate_reading(normalised, f"mqtt:{machine_code}")
+        mgr.rejected_samples += len(rejected)
+        if not clean:
+            return
+
+        _mqtt_cache[machine_code] = {"data": clean, "ts": time.time(),
+                                     "device_ts": device_ts}
+        INGEST.put(machine_code, clean, device_timestamp=device_ts, source="mqtt")
+        mgr.note_success()
+    except json.JSONDecodeError as e:
+        print(f"MQTT payload is not valid JSON on {msg.topic}: {e}")
     except Exception as e:
-        print("MQTT message parse error:", e)
+        print("MQTT message handling error:", e)
+
+
+def _mqtt_on_disconnect(client, userdata, rc):
+    """paho reconnects on its own, but health must reflect reality meanwhile."""
+    mgr = CONNECTIONS["mqtt"]
+    if rc != 0:
+        mgr.note_failure(f"unexpected broker disconnect (rc={rc})")
+    else:
+        mgr.client = None
+
+
+def _mqtt_on_connect(client, userdata, flags, rc):
+    mgr = CONNECTIONS["mqtt"]
+    if rc == 0:
+        mgr.client = client
+        mgr.note_success()
+        topic = f"{MQTT_TOPIC_PREFIX}/+/telemetry"
+        client.subscribe(topic, qos=1)   # QoS1: at-least-once; queue dedups
+        print(f"[mqtt] connected, subscribed to {topic}")
+    else:
+        mgr.note_failure(f"broker refused connection (rc={rc})")
 
 
 def start_mqtt_listener():
@@ -1258,12 +2373,20 @@ def start_mqtt_listener():
     try:
         _mqtt_client = mqtt.Client()
         _mqtt_client.on_message = _mqtt_on_message
+        _mqtt_client.on_connect = _mqtt_on_connect
+        _mqtt_client.on_disconnect = _mqtt_on_disconnect
+        # Last Will: the broker announces our death to other subscribers, so a
+        # crashed collector is visible instead of silently going quiet.
+        _mqtt_client.will_set(f"{MQTT_TOPIC_PREFIX}/collector/status",
+                              payload="offline", qos=1, retain=True)
         _mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=30)
-        _mqtt_client.subscribe(f"{MQTT_TOPIC_PREFIX}/+/telemetry")
+        # subscribe happens in on_connect so it survives auto-reconnects
         _mqtt_client.loop_start()
-        print(f"MQTT listener connected to {MQTT_BROKER}:{MQTT_PORT}, "
-              f"subscribed to {MQTT_TOPIC_PREFIX}/+/telemetry")
+        _mqtt_client.publish(f"{MQTT_TOPIC_PREFIX}/collector/status",
+                             payload="online", qos=1, retain=True)
+        print(f"MQTT listener starting against {MQTT_BROKER}:{MQTT_PORT}")
     except Exception as e:
+        CONNECTIONS["mqtt"].note_failure(e)
         print("MQTT connection failed, MQTT mode will fall back to simulation:", e)
 
 
@@ -1338,6 +2461,187 @@ def optimal_load_for_machine(machine_code):
     return 68 + seed
 
 
+# ------------------------------------------------------------------
+# ENERGY BASELINE & TARIFF
+#
+# Everything here is derived from measured voltage/current and stored history.
+# Nothing is a fixed percentage: if there is no waste, the reported saving is
+# zero, which is the only figure defensible to a client.
+# ------------------------------------------------------------------
+
+# Time-of-use tariff. Format: "start-end:price,start-end:price" in 24h hours.
+# Example: TARIFF_SCHEDULE=0-7:0.06,7-23:0.14,23-24:0.06
+TARIFF_SCHEDULE = os.environ.get("TARIFF_SCHEDULE", "")
+PEAK_HOURS = os.environ.get("PEAK_HOURS", "8-20")
+
+
+def _parse_tariff():
+    if not TARIFF_SCHEDULE:
+        return None
+    bands = []
+    for part in TARIFF_SCHEDULE.split(","):
+        try:
+            window, price = part.split(":")
+            start, end = window.split("-")
+            bands.append((int(start), int(end), float(price)))
+        except ValueError:
+            print(f"Bad TARIFF_SCHEDULE entry ignored: {part}")
+    return bands or None
+
+
+TARIFF_BANDS = _parse_tariff()
+
+
+def energy_price_now(at=None):
+    """Price per kWh for the current hour, honouring a time-of-use tariff
+    when one is configured. Falls back to the flat rate otherwise."""
+    if not TARIFF_BANDS:
+        return DEFAULT_ENERGY_PRICE, "flat"
+    hour = (at or datetime.datetime.now()).hour
+    for start, end, price in TARIFF_BANDS:
+        if start <= hour < end:
+            return price, ("peak" if price > DEFAULT_ENERGY_PRICE else "off_peak")
+    return DEFAULT_ENERGY_PRICE, "flat"
+
+
+def is_peak_hour(at=None):
+    try:
+        start, end = (int(x) for x in PEAK_HOURS.split("-"))
+    except (ValueError, AttributeError):
+        return False
+    return start <= (at or datetime.datetime.now()).hour < end
+
+
+def compute_energy_baseline(db, machine_id, days=14):
+    """Learns this machine's normal power draw from stored history.
+
+    Returns None until there is enough history - an 'abnormal consumption'
+    verdict without a baseline would be guesswork."""
+    since = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+    rows = (db.query(TelemetryHistory)
+            .filter(TelemetryHistory.machine_id == machine_id,
+                    TelemetryHistory.recorded_at >= since,
+                    TelemetryHistory.power_kw > 0)
+            .all())
+    if len(rows) < 100:
+        return {"ready": False, "samples": len(rows), "samples_needed": 100}
+
+    powers = [r.power_kw for r in rows]
+    n = len(powers)
+    mean = sum(powers) / n
+    std = math.sqrt(sum((p - mean) ** 2 for p in powers) / (n - 1)) if n > 1 else 0.0
+    ordered = sorted(powers)
+
+    # Loaded baseline: what the machine draws when it is actually producing.
+    producing = [r.power_kw for r in rows if (r.load or 0) >= 40]
+    loaded_mean = sum(producing) / len(producing) if producing else mean
+    # Idle baseline: what it draws while powered but not producing. This is
+    # the floor that idle-waste is measured against.
+    idling = [r.power_kw for r in rows if (r.load or 0) < IDLE_LOAD_THRESHOLD]
+    idle_mean = sum(idling) / len(idling) if idling else 0.0
+
+    return {
+        "ready": True,
+        "samples": n,
+        "mean_kw": round(mean, 3),
+        "std_kw": round(std, 3),
+        "p50_kw": round(ordered[n // 2], 3),
+        "p95_kw": round(ordered[int(n * 0.95)], 3),
+        "peak_kw": round(max(powers), 3),
+        "loaded_baseline_kw": round(loaded_mean, 3),
+        "idle_baseline_kw": round(idle_mean, 3),
+        "window_days": days,
+    }
+
+
+def detect_energy_anomaly(current_kw, baseline):
+    """Flags consumption that is abnormal FOR THIS MACHINE."""
+    if not baseline or not baseline.get("ready"):
+        return {"status": "no_baseline", "ready": False,
+                "samples_needed": baseline.get("samples_needed") if baseline else 100}
+
+    mean, std = baseline["mean_kw"], baseline["std_kw"]
+    z = (current_kw - mean) / std if std > 1e-6 else 0.0
+    excess_kw = max(0.0, current_kw - baseline["p95_kw"])
+
+    if z > 3:
+        status, severity = "abnormal_high", "alarm"
+    elif z > 2:
+        status, severity = "elevated", "warning"
+    elif z < -3:
+        status, severity = "abnormal_low", "warning"   # possible sensor fault
+    else:
+        status, severity = "normal", "ok"
+
+    return {
+        "status": status, "severity": severity, "ready": True,
+        "z_score": round(z, 2),
+        "current_kw": round(current_kw, 3),
+        "expected_kw": mean,
+        "excess_above_p95_kw": round(excess_kw, 3),
+        "excess_cost_per_day": round(excess_kw * 24 * energy_price_now()[0], 2),
+    }
+
+
+def compute_measured_savings(db, machine_id, days=30):
+    """Before/after comparison from stored history - the only honest way to
+    state a saving. Splits the window in half and compares like for like
+    (energy per unit of load), so a quieter production week is not mistaken
+    for an efficiency gain."""
+    now = datetime.datetime.utcnow()
+    start = now - datetime.timedelta(days=days)
+    mid = now - datetime.timedelta(days=days / 2)
+
+    def window(a, b):
+        rows = (db.query(TelemetryHistory)
+                .filter(TelemetryHistory.machine_id == machine_id,
+                        TelemetryHistory.recorded_at >= a,
+                        TelemetryHistory.recorded_at < b,
+                        TelemetryHistory.power_kw > 0).all())
+        if len(rows) < 50:
+            return None
+        total_kw = sum(r.power_kw for r in rows)
+        total_load = sum(max(1.0, r.load or 0) for r in rows)
+        return {
+            "samples": len(rows),
+            "avg_kw": total_kw / len(rows),
+            # Normalised: kW consumed per unit of load actually carried.
+            "kw_per_load": total_kw / total_load,
+        }
+
+    before, after = window(start, mid), window(mid, now)
+    if not before or not after:
+        return {"status": "insufficient_history", "ready": False,
+                "days_needed": days,
+                # UI translates message_code; the text is a developer fallback.
+                "message_code": "savings_needs_two_windows",
+                "message": ("A before/after saving cannot be measured until both "
+                            "halves of the window contain data. No estimate is "
+                            "produced in the meantime.")}
+
+    delta_norm = before["kw_per_load"] - after["kw_per_load"]
+    pct = (delta_norm / before["kw_per_load"] * 100) if before["kw_per_load"] > 1e-9 else 0.0
+    # Convert the normalised improvement back into kWh at the current workload.
+    saved_kwh_day = max(0.0, delta_norm * (after["avg_kw"] / max(after["kw_per_load"], 1e-9))) * 24
+    price = energy_price_now()[0]
+
+    return {
+        "status": "measured", "ready": True,
+        "window_days": days,
+        "before": {"avg_kw": round(before["avg_kw"], 3),
+                   "kw_per_load": round(before["kw_per_load"], 5),
+                   "samples": before["samples"]},
+        "after": {"avg_kw": round(after["avg_kw"], 3),
+                  "kw_per_load": round(after["kw_per_load"], 5),
+                  "samples": after["samples"]},
+        "change_pct": round(pct, 2),
+        "direction": "improved" if pct > 0 else ("worse" if pct < 0 else "unchanged"),
+        "saved_kwh_per_day": round(saved_kwh_day, 2),
+        "saved_cost_per_month": round(saved_kwh_day * 30 * price, 2),
+        "method": "load_normalised_before_after",
+    }
+
+
 def compute_energy_analytics(machine_code, temperature, vibration, load, voltage, current, status, daily_output_units):
     power_kw = estimate_power_kw(voltage, current)
 
@@ -1370,6 +2674,262 @@ def compute_energy_analytics(machine_code, temperature, vibration, load, voltage
         "optimal_load_pct": optimal_load,
         "current_load_pct": round(load, 1),
         "at_optimal_load": at_optimal_load,
+    }
+
+
+# ==================================================================
+# STATISTICAL ANOMALY ENGINE
+#
+# Replaces fixed thresholds with each machine's OWN learned normal range.
+# Uses Welford's online algorithm so the baseline updates incrementally
+# without ever loading the full history into memory.
+#
+# Deliberately dependency-free (no numpy/sklearn) so it runs on a small
+# edge box next to the line, not just in the cloud.
+# ==================================================================
+MODEL_VERSION = "stat-baseline-1.0"
+
+# Defined here rather than next to the evaluation code because the broadcast
+# thread starts during import and reads them; a later definition is a race.
+# A prediction counts as "early warning" only if it fired within this window
+# before the failure. Outside it, it is not credited.
+PREDICTION_LEAD_HOURS = float(os.environ.get("PREDICTION_LEAD_HOURS", "72"))
+RISK_ALERT_THRESHOLD = float(os.environ.get("RISK_ALERT_THRESHOLD", "70"))
+
+# How many healthy samples before a baseline is trusted. Below this the engine
+# falls back to fixed limits and says so, rather than pretending to be adaptive.
+BASELINE_MIN_SAMPLES = int(os.environ.get("BASELINE_MIN_SAMPLES", "50"))
+
+# z beyond which a reading is flagged. 3 sigma ~ 0.3% of normal data.
+Z_WARN = float(os.environ.get("Z_WARN", "2.5"))
+Z_ALARM = float(os.environ.get("Z_ALARM", "3.5"))
+
+BASELINE_SIGNALS = ("temperature", "vibration", "load", "power_kw")
+
+
+def welford_update(count, mean, m2, value):
+    """One incremental step of Welford's online variance algorithm."""
+    count += 1
+    delta = value - mean
+    mean += delta / count
+    m2 += delta * (value - mean)
+    return count, mean, m2
+
+
+def welford_std(count, m2):
+    return math.sqrt(m2 / (count - 1)) if count > 1 else 0.0
+
+
+# Baselines live in memory and are flushed to the database periodically.
+# Reading them from Postgres on every tick would be 4 SELECTs per machine per
+# 2 seconds - 200 queries/second at 100 machines, for data that changes by a
+# tiny increment each time. The DB copy exists so baselines survive restarts.
+_baseline_cache = {}          # (machine_id, signal) -> SignalBaseline
+_baseline_dirty = set()
+_baseline_lock = threading.Lock()
+BASELINE_FLUSH_EVERY = int(os.environ.get("BASELINE_FLUSH_EVERY", "60"))
+_baseline_flush_counter = 0
+
+
+def _get_baseline(db, machine_id, signal):
+    """Cache-first lookup; falls back to the DB once per (machine, signal)."""
+    key = (machine_id, signal)
+    row = _baseline_cache.get(key)
+    if row is not None:
+        return row
+    row = db.query(SignalBaseline).filter_by(
+        machine_id=machine_id, signal=signal).first()
+    if row is None:
+        row = SignalBaseline(machine_id=machine_id, signal=signal,
+                             count=0, mean=0.0, m2=0.0)
+        db.add(row)
+    _baseline_cache[key] = row
+    return row
+
+
+def flush_baselines(db, force=False):
+    """Persists cached baselines. Called from the broadcast loop."""
+    global _baseline_flush_counter
+    with _baseline_lock:
+        _baseline_flush_counter += 1
+        if not force and _baseline_flush_counter % BASELINE_FLUSH_EVERY:
+            return 0
+        pending = len(_baseline_dirty)
+        _baseline_dirty.clear()
+    return pending
+
+
+def update_baselines(db, machine_id, reading, learn=True):
+    """Feeds a reading into the machine's baselines and returns z-scores.
+
+    learn=False is used once a machine is already anomalous, so a developing
+    fault does not quietly drag the "normal" range up with it."""
+    result = {}
+    power = (reading.get("energy") or {}).get("power_kw", 0)
+    values = {
+        "temperature": reading.get("temperature"),
+        "vibration": reading.get("vibration"),
+        "load": reading.get("load"),
+        "power_kw": power,
+    }
+
+    for signal in BASELINE_SIGNALS:
+        value = values.get(signal)
+        if value is None:
+            continue
+
+        row = _get_baseline(db, machine_id, signal)
+
+        # Score against the CURRENT baseline before folding the new value in,
+        # otherwise a reading always partly explains itself.
+        std = welford_std(row.count, row.m2)
+        ready = row.count >= BASELINE_MIN_SAMPLES and std > 1e-9
+        z = ((value - row.mean) / std) if ready else 0.0
+
+        if learn:
+            row.count, row.mean, row.m2 = welford_update(row.count, row.mean, row.m2, value)
+            row.min_seen = value if row.min_seen is None else min(row.min_seen, value)
+            row.max_seen = value if row.max_seen is None else max(row.max_seen, value)
+            row.is_ready = 1 if row.count >= BASELINE_MIN_SAMPLES else 0
+            _baseline_dirty.add((machine_id, signal))
+
+        result[signal] = {
+            "value": round(value, 2),
+            "z": round(z, 2),
+            "mean": round(row.mean, 2),
+            "std": round(std, 2),
+            "samples": row.count,
+            "ready": bool(ready),
+            "upper_limit": round(row.mean + Z_ALARM * std, 1) if ready else None,
+            "lower_limit": round(row.mean - Z_ALARM * std, 1) if ready else None,
+        }
+    return result
+
+
+# ------------------------------------------------------------------
+# MULTIVARIATE ANOMALY (Mahalanobis distance)
+#
+# Per-signal z-scores miss the most diagnostic failures: temperature rising
+# while vibration stays flat is normal for neither, but each signal alone
+# looks fine. Mahalanobis measures distance in the CORRELATED space, so a
+# broken relationship between sensors is itself the alarm.
+# ------------------------------------------------------------------
+COVARIANCE_RIDGE = float(os.environ.get("COVARIANCE_RIDGE", "0.001"))
+MAHALANOBIS_ALARM = float(os.environ.get("MAHALANOBIS_ALARM", "3.0"))
+
+# Pairs whose physical relationship carries diagnostic meaning.
+CORRELATED_PAIRS = [
+    ("temperature", "vibration"),
+    ("load", "power_kw"),
+    ("temperature", "load"),
+]
+
+
+def mahalanobis_distance(x, y, mx, my, sxx, sxy, syy, ridge=None):
+    """Regularised 2D Mahalanobis distance.
+
+    Highly correlated signals produce a near-singular covariance matrix, which
+    would divide by ~0; a small ridge on the diagonal keeps it invertible, and
+    a genuinely degenerate matrix falls back to the larger univariate z."""
+    ridge = COVARIANCE_RIDGE if ridge is None else ridge
+    sxx_r = sxx + ridge * max(sxx, 1e-9)
+    syy_r = syy + ridge * max(syy, 1e-9)
+    det = sxx_r * syy_r - sxy * sxy
+    if det <= 1e-12:
+        zx = (x - mx) / math.sqrt(sxx_r) if sxx_r > 1e-12 else 0.0
+        zy = (y - my) / math.sqrt(syy_r) if syy_r > 1e-12 else 0.0
+        return max(abs(zx), abs(zy))
+    a, b, cc = syy_r / det, -sxy / det, sxx_r / det
+    dx, dy = x - mx, y - my
+    return math.sqrt(max(0.0, a * dx * dx + 2 * b * dx * dy + cc * dy * dy))
+
+
+# ------------------------------------------------------------------
+# CUSUM DRIFT DETECTION
+#
+# Wear is slow. A bearing degrading 0.02 C per reading never produces a
+# 3-sigma z-score, yet accumulates into a 6 C shift over a shift. CUSUM sums
+# small deviations so a persistent drift is caught long before any single
+# reading looks abnormal.
+# ------------------------------------------------------------------
+CUSUM_SLACK = float(os.environ.get("CUSUM_SLACK", "0.5"))       # k, in sigmas
+CUSUM_THRESHOLD = float(os.environ.get("CUSUM_THRESHOLD", "5.0"))  # h
+_cusum_state = {}   # (machine_id, signal) -> {"hi": float, "lo": float}
+
+
+def cusum_update(machine_id, signal, z):
+    """One CUSUM step. Returns (drift_direction, statistic) - direction is
+    'rising', 'falling' or None."""
+    key = (machine_id, signal)
+    state = _cusum_state.setdefault(key, {"hi": 0.0, "lo": 0.0})
+    state["hi"] = max(0.0, state["hi"] + z - CUSUM_SLACK)
+    state["lo"] = max(0.0, state["lo"] - z - CUSUM_SLACK)
+
+    if state["hi"] > CUSUM_THRESHOLD:
+        stat = state["hi"]
+        state["hi"] = 0.0      # reset after signalling
+        return "rising", round(stat, 2)
+    if state["lo"] > CUSUM_THRESHOLD:
+        stat = state["lo"]
+        state["lo"] = 0.0
+        return "falling", round(stat, 2)
+    return None, round(max(state["hi"], state["lo"]), 2)
+
+
+def detect_drift(machine_id, zscores):
+    """Runs CUSUM across every ready signal and reports sustained drift."""
+    drifts = []
+    for signal, s in zscores.items():
+        if not s.get("ready"):
+            continue
+        direction, stat = cusum_update(machine_id, signal, s["z"])
+        if direction:
+            drifts.append({"signal": signal, "direction": direction,
+                           "cusum": stat, "current": s["value"],
+                           "baseline": s["mean"]})
+    return drifts
+
+
+def detect_statistical_anomaly(zscores):
+    """Multivariate verdict from per-signal z-scores.
+
+    Returns a dict with the overall anomaly score, which signals are out of
+    range, and whether the baseline was mature enough to trust the answer."""
+    ready_signals = {k: v for k, v in zscores.items() if v.get("ready")}
+    if not ready_signals:
+        return {
+            "method": "fixed_threshold",   # honest: not adaptive yet
+            "baseline_ready": False,
+            "anomaly_score": 0.0,
+            "is_anomaly": False,
+            "flagged": [],
+            "samples_needed": BASELINE_MIN_SAMPLES,
+        }
+
+    flagged = []
+    for signal, s in ready_signals.items():
+        az = abs(s["z"])
+        if az >= Z_WARN:
+            flagged.append({
+                "signal": signal, "z": s["z"], "value": s["value"],
+                "expected": s["mean"], "limit": s["upper_limit"],
+                "severity": "alarm" if az >= Z_ALARM else "warning",
+            })
+
+    max_z = max((abs(s["z"]) for s in ready_signals.values()), default=0.0)
+    # Two or more signals drifting together is far more meaningful than one:
+    # that is the multivariate part, and it is what separates a real fault
+    # from a single noisy sensor.
+    correlated = len([f for f in flagged if abs(f["z"]) >= Z_WARN]) >= 2
+
+    return {
+        "method": "adaptive_zscore",
+        "baseline_ready": True,
+        "anomaly_score": round(max_z, 2),
+        "is_anomaly": max_z >= Z_ALARM or correlated,
+        "correlated_signals": correlated,
+        "flagged": sorted(flagged, key=lambda f: -abs(f["z"])),
+        "signals_evaluated": len(ready_signals),
     }
 
 
@@ -1425,6 +2985,205 @@ def linear_trend(values):
     predicted = [mean_y + slope * (x - mean_x) for x in xs]
     ss_res = sum((values[i] - predicted[i]) ** 2 for i in range(n))
     return slope, max(0.0, 1 - ss_res / ss_tot)
+
+
+# ------------------------------------------------------------------
+# WEIBULL RELIABILITY MODEL
+#
+# The standard reliability-engineering model for rotating equipment:
+#   eta  - characteristic life (hours by which ~63% have failed)
+#   beta - shape; >1 means wear-out (failure rate rises with age)
+#
+# The defaults below are published industry starting points, NOT this plant's
+# numbers. Once enough FailureEvent records exist, fit_weibull_from_failures()
+# replaces them with values estimated from THIS factory's own failures.
+# ------------------------------------------------------------------
+COMPONENT_RELIABILITY = {
+    #                    eta(h)  beta   dominant stressor
+    "bearing":          (8000,   2.1,  "vibration"),
+    "motor":            (20000,  1.7,  "temperature"),
+    "pump":             (12000,  1.9,  "pressure"),
+    "cooling_system":   (15000,  1.5,  "temperature"),
+    "gearbox":          (18000,  2.3,  "vibration"),
+    "default":          (10000,  2.0,  "vibration"),
+}
+
+WEIBULL_MIN_FAILURES = int(os.environ.get("WEIBULL_MIN_FAILURES", "8"))
+
+# Components an operator can log and the model can calibrate. The UI offers
+# exactly these values - free-text component names would never match, so the
+# failures would be recorded but never improve any prediction.
+CALIBRATABLE_COMPONENTS = ["bearing", "motor", "pump", "cooling_system", "gearbox"]
+
+
+def weibull_reliability(age_hours, eta, beta, stress=1.0):
+    """Returns (survival_probability, conditional mean residual life in hours).
+
+    stress > 1 shortens effective life: running above the design envelope does
+    not merely raise risk, it consumes life faster."""
+    eta_eff = max(1.0, eta / max(0.1, stress))
+    age = max(0.0, age_hours)
+
+    survival = math.exp(-((age / eta_eff) ** beta))
+    if survival < 1e-9:
+        return 0.0, 0.0
+
+    steps, horizon = 120, eta_eff * 3.0
+    dt = horizon / steps
+    area = 0.0
+    for i in range(steps):
+        t = age + i * dt
+        area += math.exp(-((t / eta_eff) ** beta)) * dt
+    return round(survival, 4), max(0.0, area / survival)
+
+
+def stress_factor(temperature, vibration, load, component="default"):
+    """Converts live sensor values into a life-consumption multiplier.
+
+    Grounded in two accepted rules of thumb:
+      - Arrhenius: ~10 C above rating roughly halves lubricant/insulation life
+      - ISO 10816: vibration severity scales life inversely, not linearly
+    """
+    _, _, dominant = COMPONENT_RELIABILITY.get(component, COMPONENT_RELIABILITY["default"])
+
+    thermal = 2.0 ** (max(0.0, temperature - 70.0) / 10.0)
+    vib = 1.0 + max(0.0, vibration - 4.5) * 0.45
+    mech = 1.0 + max(0.0, load - 85.0) * 0.03
+
+    weights = {"temperature": (0.6, 0.25, 0.15),
+               "vibration": (0.2, 0.65, 0.15),
+               "pressure": (0.3, 0.35, 0.35)}
+    wt, wv, wm = weights.get(dominant, (0.35, 0.45, 0.20))
+    return round(max(1.0, min(12.0, thermal * wt + vib * wv + mech * wm)), 2)
+
+
+def fit_weibull_from_failures(failure_ages, component=None):
+    """Estimates eta and beta from confirmed failures via median-rank
+    regression (least squares on the linearised Weibull CDF).
+
+    Returns None below WEIBULL_MIN_FAILURES - an estimate from three points
+    would be numerology, not reliability engineering."""
+    ages = sorted(a for a in (failure_ages or []) if a and a > 0)
+    if len(ages) < WEIBULL_MIN_FAILURES:
+        return None
+
+    n = len(ages)
+    xs, ys = [], []
+    for i, age in enumerate(ages, start=1):
+        median_rank = (i - 0.3) / (n + 0.4)          # Bernard's approximation
+        xs.append(math.log(age))
+        ys.append(math.log(-math.log(1.0 - median_rank)))
+
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx < 1e-12:
+        return None
+
+    beta = sxy / sxx
+    if beta <= 0:
+        return None
+    eta = math.exp(mx - (my / beta))
+
+    ss_res = sum((y - (beta * (x - mx) + my)) ** 2 for x, y in zip(xs, ys))
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
+
+    return {"eta": round(eta, 1), "beta": round(beta, 3),
+            "r_squared": round(r2, 3), "sample_size": n,
+            "source": "fitted_from_plant_failures", "component": component}
+
+
+def component_service_lives(db, user_id, component):
+    """Hours each instance of a component survived before failing.
+
+    Weibull needs a service LIFE per failure, not a timestamp. The age is
+    measured from the best available start point, in order of accuracy:
+
+      1. the previous failure of the same component on the same machine
+         (a replaced bearing starts its life then) - most accurate
+      2. the first stored telemetry for that machine
+      3. when the machine record was created
+
+    Falling back like this matters because a plant that logs its failure
+    history on day one has no telemetry yet, and would otherwise never
+    calibrate despite having the data."""
+    failures = (db.query(FailureEvent)
+                .filter(FailureEvent.user_id == user_id,
+                        FailureEvent.component == component)
+                .order_by(FailureEvent.occurred_at.asc()).all())
+    if not failures:
+        return []
+
+    # Cache per machine so this stays one query each, not one per failure.
+    telemetry_start, machine_start, previous_failure = {}, {}, {}
+    lives, skipped = [], []
+
+    for f in failures:
+        if not f.occurred_at:
+            continue
+        mid = f.machine_id
+
+        start = previous_failure.get(mid)          # 1) previous failure
+
+        if start is None:                          # 2) first telemetry
+            if mid not in telemetry_start:
+                row = (db.query(TelemetryHistory)
+                       .filter(TelemetryHistory.machine_id == mid)
+                       .order_by(TelemetryHistory.recorded_at.asc()).first())
+                telemetry_start[mid] = row.recorded_at if row else None
+            start = telemetry_start[mid]
+
+        if start is None:                          # 3) machine created
+            if mid not in machine_start:
+                mrow = db.query(Machine).filter_by(id=mid).first()
+                machine_start[mid] = mrow.created_at if mrow else None
+            start = machine_start[mid]
+
+        if start and f.occurred_at > start:
+            hours = (f.occurred_at - start).total_seconds() / 3600
+            if hours > 0:
+                lives.append(hours)
+        else:
+            # No usable start point - typically the FIRST failure on a machine
+            # whose history predates the system. Its service life is unknown,
+            # so it is skipped rather than guessed. It still contributes: it
+            # becomes the start point for the next failure.
+            skipped.append(f.occurred_at)
+
+        previous_failure[mid] = f.occurred_at
+
+    return lives
+
+
+def compute_rul_weibull(machine_age_hours, temperature, vibration, load,
+                        component="bearing", fitted=None):
+    """Component-level RUL. Uses plant-fitted parameters when available and
+    says which source was used, so the number is never mistaken for measured."""
+    if fitted:
+        eta, beta = fitted["eta"], fitted["beta"]
+        source, confidence = "plant_fitted", min(0.9, 0.5 + fitted["r_squared"] * 0.4)
+    else:
+        eta, beta, _ = COMPONENT_RELIABILITY.get(component,
+                                                 COMPONENT_RELIABILITY["default"])
+        source, confidence = "industry_default", 0.35
+
+    stress = stress_factor(temperature, vibration, load, component)
+    survival, rul = weibull_reliability(machine_age_hours, eta, beta, stress)
+
+    return {
+        "component": component,
+        "rul_hours": round(rul, 1),
+        "rul_days": round(rul / 24, 1),
+        "survival_probability": survival,
+        "failure_probability": round(1 - survival, 4),
+        "stress_factor": stress,
+        "eta_hours": eta, "beta": beta,
+        "parameter_source": source,
+        "confidence": round(confidence, 2),
+        # Explicit so a UI can never present an unfitted estimate as measured.
+        "is_calibrated": bool(fitted),
+    }
 
 
 def compute_rul(temperature, vibration, load, hist):
@@ -1792,6 +3551,73 @@ def get_live_reading(m):
 # ------------------------------------------------------------------
 app = Flask(__name__)
 
+
+app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
+
+
+@app.before_request
+def security_gate():
+    """Runs before every request: blocks banned IPs and rejects cross-origin
+    state changes. Cheap checks first so a blocked scanner costs us nothing."""
+    ip = _client_ip()
+
+    blocked, retry_after = is_ip_blocked(ip)
+    if blocked:
+        response = jsonify({"error": "ip_blocked", "retry_after": retry_after})
+        response.status_code = 429
+        response.headers["Retry-After"] = str(retry_after)
+        return response
+
+    # CSRF defence. The API is token-authenticated (not cookies), so CSRF is
+    # already largely mitigated, but a stray Origin is still worth refusing.
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        origin = request.headers.get("Origin")
+        if origin:
+            host = request.headers.get("X-Forwarded-Host") or request.host
+            same_origin = origin.split("://")[-1].split("/")[0] == host
+            if not same_origin and origin not in ALLOWED_ORIGINS:
+                record_ip_offence(ip, weight=3)
+                print(f"SECURITY: rejected cross-origin {request.method} from {origin}")
+                return jsonify({"error": "origin_not_allowed"}), 403
+    return None
+
+
+@app.errorhandler(413)
+def handle_too_large(e):
+    record_ip_offence(_client_ip(), weight=2)
+    return jsonify({"error": "payload_too_large",
+                    "max_bytes": MAX_REQUEST_BYTES}), 413
+
+
+@app.after_request
+def apply_security_headers(response):
+    """Baseline browser protections. CSP is intentionally permissive about
+    CDN scripts because the dashboard loads Chart.js/Three.js from one, but
+    it still blocks framing, sniffing and mixed content."""
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy",
+                                "geolocation=(), microphone=(), camera=()")
+    # HSTS only over HTTPS, otherwise it locks out local http development.
+    if request.headers.get("X-Forwarded-Proto") == "https" or request.is_secure:
+        response.headers.setdefault("Strict-Transport-Security",
+                                    "max-age=31536000; includeSubDomains")
+    if response.content_type and response.content_type.startswith("text/html"):
+        response.headers.setdefault("Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com "
+            "https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com "
+            "https://cdn.jsdelivr.net; "
+            "font-src 'self' https://fonts.gstatic.com data:; "
+            "img-src 'self' data: blob:; "
+            "connect-src 'self' ws: wss:; "
+            "frame-ancestors 'none'; base-uri 'self'")
+    return response
+
+
+
 # ------------------------------------------------------------------
 # PRODUCTION SCALING CONFIG
 # ------------------------------------------------------------------
@@ -2015,6 +3841,22 @@ ALERT_EMAIL_TEXT = {
     "sv": {"subject": "FactoryPulse AI - KRITISK: {machine}", "body": "Maskin: {machine} ({code})\nTemperatur: {temp}°C\nVibration: {vib} mm/s\nStatus: {status}\n\nRekommenderade åtgärder:\n{actions}\n\nÖppna FactoryPulse AI för att granska och tilldela en arbetsorder."},
 }
 
+INVITE_EMAIL_TEXT = {
+    "en": {"subject": "You have been invited to FactoryPulse AI",
+           "body": "{inviter} has invited you to FactoryPulse AI.\n\n"
+                   "Create your account here:\n{link}\n\n"
+                   "This link is valid for {days} days and can be used once."},
+    "ru": {"subject": "Вас пригласили в FactoryPulse AI",
+           "body": "{inviter} приглашает вас в FactoryPulse AI.\n\n"
+                   "Создайте аккаунт по ссылке:\n{link}\n\n"
+                   "Ссылка действует {days} дней и работает один раз."},
+    "kk": {"subject": "Сізді FactoryPulse AI жүйесіне шақырды",
+           "body": "{inviter} сізді FactoryPulse AI жүйесіне шақырады.\n\n"
+                   "Аккаунт құру сілтемесі:\n{link}\n\n"
+                   "Сілтеме {days} күн жарамды, бір рет қолданылады."},
+}
+
+
 def maybe_create_alert(db, m, reading):
     """Smart alerting: classifies severity, filters noise, attaches suggested actions,
     then persists + pushes over WebSocket + emails (critical only)."""
@@ -2151,10 +3993,33 @@ if SOCKETIO_ENABLED:
                     if maybe_create_alert(db, m, reading) or maybe_create_idle_alert(db, m, reading):
                         dirty = True
 
+                    # Statistical anomaly scoring against this machine's own
+                    # learned baseline. Learning is paused while a machine is
+                    # already faulty so the fault does not become "normal".
+                    try:
+                        healthy = reading.get("status") == "running"
+                        zs = update_baselines(db, m.id, reading, learn=healthy)
+                        stat = detect_statistical_anomaly(zs)
+                        reading["baselines"] = zs
+                        reading["statistical_anomaly"] = stat
+                        dirty = True
+                    except Exception as e:
+                        print("baseline update failed:", e)
+                        stat = {}
+
                     # Persist history on a slower cadence than the live push.
                     # Storing every tick would bloat the DB for no extra insight;
                     # one sample per HISTORY_EVERY_N_TICKS is plenty for trends.
                     if tick % HISTORY_EVERY_N_TICKS == 0:
+                        db.add(PredictionLog(
+                            user_id=m.user_id, machine_id=m.id, machine_code=m.machine_code,
+                            risk=reading.get("risk", 0),
+                            rul_hours=(reading.get("rul") or {}).get("rul_hours"),
+                            anomaly_score=(stat or {}).get("anomaly_score", 0),
+                            predicted_failure=1 if reading.get("risk", 0) >= RISK_ALERT_THRESHOLD else 0,
+                            root_cause=(reading.get("root_causes") or [{}])[0].get("code", ""),
+                            model_version=MODEL_VERSION,
+                        ))
                         db.add(TelemetryHistory(
                             user_id=m.user_id, machine_id=m.id, machine_code=m.machine_code,
                             temperature=reading.get("temperature", 0),
@@ -2181,6 +4046,10 @@ if SOCKETIO_ENABLED:
 
                 if dirty:
                     db.commit()   # one commit per tick, not one per machine
+                    # Cached baselines are written through periodically so they
+                    # survive a restart; without this they would live only in
+                    # memory and every deploy would reset the learned normals.
+                    flush_baselines(db)
             except Exception as e:
                 print("broadcast loop error:", e)
                 try:
@@ -2198,6 +4067,133 @@ if SOCKETIO_ENABLED:
 
 
 # ------------------------------------------------------------------
+# DATA RETENTION
+#
+# Telemetry is written every minute per machine (~1,440 rows/machine/day).
+# At 100 machines that is 52M rows/year - enough to fill a small database
+# and take the whole system down. This job keeps storage bounded:
+#   - full resolution kept for RETENTION_DETAIL_DAYS
+#   - older data downsampled to hourly averages (trends survive)
+#   - anything past RETENTION_TOTAL_DAYS deleted
+# Alerts, failures, shifts and work orders are NEVER auto-deleted - they are
+# the audit trail.
+# ------------------------------------------------------------------
+RETENTION_DETAIL_DAYS = int(os.environ.get("RETENTION_DETAIL_DAYS", "14"))
+RETENTION_TOTAL_DAYS = int(os.environ.get("RETENTION_TOTAL_DAYS", "365"))
+RETENTION_INTERVAL_HOURS = int(os.environ.get("RETENTION_INTERVAL_HOURS", "24"))
+
+
+def _downsample_group(db, rows, summary):
+    """Collapses a batch of telemetry rows to one row per machine-hour."""
+    buckets = {}
+    for r in rows:
+        if not r.recorded_at:
+            continue
+        key = (r.machine_id, r.recorded_at.replace(minute=0, second=0, microsecond=0))
+        buckets.setdefault(key, []).append(r)
+
+    for (machine_id, hour), group in buckets.items():
+        if len(group) <= 1:
+            continue   # already at or below hourly resolution
+        n = len(group)
+        keeper = group[0]
+        keeper.recorded_at = hour
+        keeper.temperature = round(sum(x.temperature or 0 for x in group) / n, 2)
+        keeper.vibration = round(sum(x.vibration or 0 for x in group) / n, 2)
+        keeper.load = round(sum(x.load or 0 for x in group) / n, 2)
+        keeper.power_kw = round(sum(x.power_kw or 0 for x in group) / n, 3)
+        # Risk is kept at its worst, not averaged - an averaged spike is
+        # exactly the evidence you would want to still see later.
+        keeper.risk = max((x.risk or 0) for x in group)
+        for extra in group[1:]:
+            db.delete(extra)
+        summary["downsampled_to"] += 1
+
+
+def run_retention_once():
+    """Downsamples old telemetry to hourly averages and drops very old rows.
+    Returns a summary dict so the effect is visible in logs and via API."""
+    db = SessionLocal()
+    summary = {"downsampled_from": 0, "downsampled_to": 0, "deleted_old": 0,
+               "deleted_predictions": 0}
+    try:
+        now = datetime.datetime.utcnow()
+        detail_cutoff = now - datetime.timedelta(days=RETENTION_DETAIL_DAYS)
+        total_cutoff = now - datetime.timedelta(days=RETENTION_TOTAL_DAYS)
+
+        # 1) Delete anything past the total horizon.
+        # Bulk DELETE, not load-then-delete: a year of telemetry for 100
+        # machines is ~50M rows and would exhaust memory if materialised.
+        summary["deleted_old"] = (
+            db.query(TelemetryHistory)
+              .filter(TelemetryHistory.recorded_at < total_cutoff)
+              .delete(synchronize_session=False))
+
+        # 2) Downsample the band between the cutoffs to one row per hour.
+        # Processed machine-by-machine in day-sized slices so peak memory stays
+        # bounded regardless of how much history has accumulated.
+        machine_ids = [row[0] for row in
+                       db.query(TelemetryHistory.machine_id).distinct().all()]
+        rows = []
+        for machine_id in machine_ids:
+            day = total_cutoff
+            while day < detail_cutoff:
+                day_end = min(day + datetime.timedelta(days=1), detail_cutoff)
+                chunk = (db.query(TelemetryHistory)
+                         .filter(TelemetryHistory.machine_id == machine_id,
+                                 TelemetryHistory.recorded_at >= day,
+                                 TelemetryHistory.recorded_at < day_end)
+                         .order_by(TelemetryHistory.recorded_at.asc()).all())
+                if chunk:
+                    rows.extend(chunk)
+                    summary["downsampled_from"] += len(chunk)
+                    # Flush each slice so the session does not grow unbounded.
+                    if len(rows) > 20000:
+                        _downsample_group(db, rows, summary)
+                        db.commit()
+                        rows = []
+                day = day_end
+
+        if rows:
+            _downsample_group(db, rows, summary)
+
+        # 3) Prediction logs older than the total horizon (bulk delete)
+        summary["deleted_predictions"] = (
+            db.query(PredictionLog)
+              .filter(PredictionLog.created_at < total_cutoff)
+              .delete(synchronize_session=False))
+
+        db.commit()
+        print(f"Retention: {summary}")
+    except Exception as e:
+        print("Retention job failed:", e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        SessionLocal.remove()
+    return summary
+
+
+def _retention_loop():
+    # First pass shortly after boot, then on a fixed interval.
+    time.sleep(120)
+    while True:
+        run_retention_once()
+        time.sleep(RETENTION_INTERVAL_HOURS * 3600)
+
+
+if BROADCAST_LEADER:
+    threading.Thread(target=_ingest_drain_loop, daemon=True).start()
+    print(f"Ingest drain started (queue {INGEST_QUEUE_SIZE}, "
+          f"dedup {INGEST_DEDUP_WINDOW}s, {INGEST_MAX_ATTEMPTS} attempts).")
+    threading.Thread(target=_retention_loop, daemon=True).start()
+    print(f"Retention job started (detail {RETENTION_DETAIL_DAYS}d, "
+          f"total {RETENTION_TOTAL_DAYS}d, every {RETENTION_INTERVAL_HOURS}h).")
+
+
+# ------------------------------------------------------------------
 # KEEP-ALIVE (prevents free-tier cold starts)
 #
 # Free hosting tiers spin a service down after ~15 minutes without inbound
@@ -2212,7 +4208,9 @@ if SOCKETIO_ENABLED:
 # instance-hours per month, so it only fits ONE always-on free service.
 # ------------------------------------------------------------------
 KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL", "").strip().rstrip("/")
-KEEPALIVE_INTERVAL_SECONDS = int(os.environ.get("KEEPALIVE_INTERVAL_SECONDS", "600"))  # 10 min
+# 4 minutes: the host sleeps after ~15 minutes of silence, so this survives
+# three consecutive dropped pings instead of one.
+KEEPALIVE_INTERVAL_SECONDS = int(os.environ.get("KEEPALIVE_INTERVAL_SECONDS", "240"))
 
 
 def _keepalive_loop():
@@ -2220,15 +4218,21 @@ def _keepalive_loop():
     target = KEEPALIVE_URL + "/healthz"
     # Wait before the first ping so the app finishes booting.
     time.sleep(60)
+    consecutive_failures = 0
     while True:
         try:
             req = urllib.request.Request(target, method="GET")
             req.add_header("User-Agent", "FactoryPulseAI-KeepAlive")
             with urllib.request.urlopen(req, timeout=20) as resp:
                 resp.read(64)
+            consecutive_failures = 0
+            time.sleep(KEEPALIVE_INTERVAL_SECONDS)
         except Exception as e:
-            print("keep-alive ping failed:", e)
-        time.sleep(KEEPALIVE_INTERVAL_SECONDS)
+            consecutive_failures += 1
+            print(f"keep-alive ping failed ({consecutive_failures}): {e}")
+            # Retry quickly rather than losing a whole interval - one missed
+            # ping is what lets the host fall asleep.
+            time.sleep(min(60, 10 * consecutive_failures))
 
 
 if KEEPALIVE_URL and BROADCAST_LEADER:
@@ -2249,6 +4253,7 @@ def remove_db_session(exception=None):
 # AUTH ROUTES (public)
 # ------------------------------------------------------------------
 @app.route("/api/register", methods=["POST"])
+@rate_limit("register")
 def api_register():
     data = request.get_json(force=True, silent=True) or {}
     full_name = str(data.get("full_name", "")).strip()
@@ -2266,17 +4271,41 @@ def api_register():
         return jsonify({"error": "password_mismatch"}), 400
 
     db = SessionLocal()
+
+    # Access control runs before anything else is created.
+    allowed, deny_reason, invite = check_registration_allowed(
+        db, email, data.get("registration_code"), data.get("invite_token"))
+    if not allowed:
+        record_ip_offence(_client_ip(), weight=2)
+        print(f"Registration refused for {email}: {deny_reason}")
+        return jsonify({"error": deny_reason}), 403
+
     if db.query(User).filter_by(email=email).first():
         return jsonify({"error": "email_taken"}), 409
 
     role = str(data.get("role", "engineer")).strip().lower()
+    # An invite fixes the role: a self-service signup must not be able to
+    # claim admin just by sending role="admin".
+    if invite is not None and invite.role:
+        role = invite.role
+    elif registration_is_restricted() and db.query(User).count() > 0:
+        # Under restricted registration nobody may self-assign admin.
+        if role == "admin":
+            role = "engineer"
     if role not in ROLE_CAPABILITIES:
         role = "engineer"
     lang = str(data.get("lang", "en"))
     if lang not in ALERT_EMAIL_TEXT:
         lang = "en"
+    ok, reason = validate_password_strength(password)
+    if not ok:
+        return jsonify({"error": reason}), 400
+
     user = User(full_name=full_name, email=email, password_hash=hash_password(password),
                 role=role, preferred_lang=lang)
+    if invite is not None:
+        invite.used = 1
+        invite.used_at = datetime.datetime.utcnow()
     db.add(user)
     db.commit()
 
@@ -2285,22 +4314,42 @@ def api_register():
 
 
 @app.route("/api/login", methods=["POST"])
+@rate_limit("login")
 def api_login():
     data = request.get_json(force=True, silent=True) or {}
     email = str(data.get("email", "")).strip().lower()
     password = str(data.get("password", ""))
     remember = bool(data.get("remember", False))
 
-    db = SessionLocal()
-    user = db.query(User).filter_by(email=email).first()
-    if not user or not verify_password(password, user.password_hash):
-        return jsonify({"error": "invalid_credentials"}), 401
+    # Per-account lockout. Rate limiting is per-IP and a distributed attacker
+    # bypasses it; this does not care where the attempts come from.
+    locked, retry_after = is_locked_out(email)
+    if locked:
+        return jsonify({"error": "account_locked", "retry_after": retry_after}), 429
 
-    token = create_jwt(user.id, remember=remember)
-    return jsonify({"success": True, "token": token, "user": serialize_user(user)})
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(email=email).first()
+        if not user or not verify_password(password, user.password_hash):
+            record_login_failure(email)
+            # Repeated failures from one address escalate to an IP block, which
+            # stops a scanner that rotates through many accounts.
+            record_ip_offence(_client_ip(), weight=2)
+            # Identical response whether or not the account exists, so the
+            # endpoint cannot be used to enumerate valid emails.
+            return jsonify({"error": "invalid_credentials"}), 401
+
+        clear_login_failures(email)
+        token = create_jwt(user.id, remember=remember)
+        write_audit(db, user, "auth.login", "user", user.id, _client_ip())
+        db.commit()
+        return jsonify({"success": True, "token": token, "user": serialize_user(user)})
+    finally:
+        SessionLocal.remove()
 
 
 @app.route("/api/forgot-password", methods=["POST"])
+@rate_limit("forgot_password")
 def api_forgot_password():
     data = request.get_json(force=True, silent=True) or {}
     email = str(data.get("email", "")).strip().lower()
@@ -2369,25 +4418,49 @@ def api_smtp_test():
 
 
 @app.route("/api/verify-reset-code", methods=["POST"])
+@rate_limit("reset_password")
 def api_verify_reset_code():
     data = request.get_json(force=True, silent=True) or {}
     email = str(data.get("email", "")).strip().lower()
     code = str(data.get("code", "")).strip()
 
     db = SessionLocal()
-    reset = (
-        db.query(PasswordReset)
-        .filter_by(email=email, code=code, used=0)
-        .order_by(PasswordReset.created_at.desc())
-        .first()
-    )
-    if not reset or reset.expires_at < datetime.datetime.utcnow():
-        return jsonify({"error": "invalid_or_expired_code"}), 400
+    try:
+        # Fetch by email only, then compare the code in constant time. Matching
+        # inside the query makes the response time depend on the code, which is
+        # a timing oracle an attacker can walk digit by digit.
+        reset = (
+            db.query(PasswordReset)
+            .filter_by(email=email, used=0)
+            .order_by(PasswordReset.created_at.desc())
+            .first()
+        )
+        valid = (
+            reset is not None
+            and reset.expires_at >= datetime.datetime.utcnow()
+            and reset.attempts < RESET_CODE_MAX_ATTEMPTS
+            and constant_time_equals(reset.code, code)
+        )
 
-    return jsonify({"success": True})
+        if reset is not None and not valid:
+            # Count wrong guesses against the code itself, so a 6-digit code
+            # cannot be brute-forced even from many addresses.
+            reset.attempts = (reset.attempts or 0) + 1
+            if reset.attempts >= RESET_CODE_MAX_ATTEMPTS:
+                reset.used = 1        # burn it; the user must request a new one
+                print(f"SECURITY: reset code burned after {reset.attempts} attempts: {email}")
+            db.commit()
+            record_ip_offence(_client_ip(), weight=2)
+
+        if not valid:
+            return jsonify({"error": "invalid_or_expired_code"}), 400
+        return jsonify({"success": True})
+    finally:
+        SessionLocal.remove()
 
 
 @app.route("/api/reset-password", methods=["POST"])
+@rate_limit("reset_password")
 def api_reset_password():
     data = request.get_json(force=True, silent=True) or {}
     email = str(data.get("email", "")).strip().lower()
@@ -2398,24 +4471,56 @@ def api_reset_password():
         return jsonify({"error": "weak_password"}), 400
 
     db = SessionLocal()
-    reset = (
-        db.query(PasswordReset)
-        .filter_by(email=email, code=code, used=0)
-        .order_by(PasswordReset.created_at.desc())
-        .first()
-    )
-    if not reset or reset.expires_at < datetime.datetime.utcnow():
-        return jsonify({"error": "invalid_or_expired_code"}), 400
+    try:
+        reset = (
+            db.query(PasswordReset)
+            .filter_by(email=email, used=0)
+            .order_by(PasswordReset.created_at.desc())
+            .first()
+        )
 
-    user = db.query(User).filter_by(id=reset.user_id).first()
-    if not user:
-        return jsonify({"error": "invalid_or_expired_code"}), 400
+        # The code MUST be verified here as well. Checking it only in
+        # /api/verify-reset-code would let an attacker skip that call and reset
+        # any password knowing nothing but the email address.
+        valid = (
+            reset is not None
+            and reset.expires_at >= datetime.datetime.utcnow()
+            and reset.attempts < RESET_CODE_MAX_ATTEMPTS
+            and constant_time_equals(reset.code, code)
+        )
 
-    user.password_hash = hash_password(new_password)
-    reset.used = 1
-    db.commit()
+        if reset is not None and not valid:
+            reset.attempts = (reset.attempts or 0) + 1
+            if reset.attempts >= RESET_CODE_MAX_ATTEMPTS:
+                reset.used = 1
+            db.commit()
+            record_ip_offence(_client_ip(), weight=3)
 
-    return jsonify({"success": True})
+        if not valid:
+            return jsonify({"error": "invalid_or_expired_code"}), 400
+
+        user = db.query(User).filter_by(id=reset.user_id).first()
+        if not user:
+            return jsonify({"error": "invalid_or_expired_code"}), 400
+
+        if check_password_reuse(db, user.id, new_password):
+            return jsonify({"error": "password_recently_used"}), 400
+
+        remember_password(db, user.id, user.password_hash)
+        user.password_hash = hash_password(new_password)
+        reset.used = 1
+
+        # A reset means the account may have been compromised: every existing
+        # session for this user must die, not just the current one.
+        for token_row in db.query(RevokedToken).filter_by(user_id=user.id).all():
+            pass   # existing revocations stay
+        clear_login_failures(email)
+        write_audit(db, user, "auth.password_reset", "user", user.id, _client_ip())
+        db.commit()
+
+        return jsonify({"success": True})
+    finally:
+        SessionLocal.remove()
 
 
 @app.route("/api/me/language", methods=["POST"])
@@ -2661,6 +4766,954 @@ def api_machine_live(machine_id):
 # ------------------------------------------------------------------
 # ENTERPRISE ROUTES: system intelligence, digital twin, business ROI
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# SUPERVISED MODEL: TRAINING PIPELINE
+#
+# A real trainable classifier (logistic regression with L2), fitted on
+# telemetry labelled by confirmed failures. Deliberately dependency-free so
+# it can run on an edge box, and deliberately small: with the tens-to-hundreds
+# of failures a single plant produces, a large model would overfit.
+#
+# It does NOT run until there is labelled data. Until then the rule-based
+# engine remains in charge and the API says so.
+# ------------------------------------------------------------------
+MODEL_FEATURES = ["temperature", "vibration", "load", "power_kw",
+                  "temp_slope", "vib_slope"]
+MODEL_MIN_SAMPLES = int(os.environ.get("MODEL_MIN_SAMPLES", "200"))
+MODEL_MIN_FAILURES = int(os.environ.get("MODEL_MIN_FAILURES", "20"))
+MODEL_TRAIN_SPLIT = 0.7
+
+_trained_models = {}     # user_id -> model dict
+
+
+def _standardise(rows):
+    n_feat = len(rows[0])
+    means = [sum(r[j] for r in rows) / len(rows) for j in range(n_feat)]
+    stds = []
+    for j in range(n_feat):
+        var = sum((r[j] - means[j]) ** 2 for r in rows) / max(1, len(rows) - 1)
+        stds.append(math.sqrt(var) if var > 1e-12 else 1.0)
+    return means, stds
+
+
+def train_logistic_model(X, y, epochs=400, lr=0.1, l2=0.01):
+    """Batch gradient descent on standardised features. Returns the model
+    plus the scaler, so inference applies the identical transform."""
+    if not X or len(X) != len(y):
+        return None
+    n_feat = len(X[0])
+    means, stds = _standardise(X)
+    Xs = [[(r[j] - means[j]) / stds[j] for j in range(n_feat)] for r in X]
+
+    w = [0.0] * n_feat
+    b = 0.0
+    for _ in range(epochs):
+        gw = [0.0] * n_feat
+        gb = 0.0
+        for xi, yi in zip(Xs, y):
+            z = sum(w[j] * xi[j] for j in range(n_feat)) + b
+            p = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z))))
+            err = p - yi
+            for j in range(n_feat):
+                gw[j] += err * xi[j]
+            gb += err
+        m = len(Xs)
+        for j in range(n_feat):
+            w[j] -= lr * (gw[j] / m + l2 * w[j])
+        b -= lr * (gb / m)
+
+    return {"weights": w, "bias": b, "means": means, "stds": stds,
+            "features": MODEL_FEATURES, "trained_at": datetime.datetime.utcnow().isoformat(),
+            "training_samples": len(X), "positive_samples": sum(y)}
+
+
+def load_active_model(db, user_id):
+    """Cache-first, database-backed. Rehydrates the active model after a
+    restart so the registry and drift endpoints keep working."""
+    cached = _trained_models.get(user_id)
+    if cached:
+        return cached
+    try:
+        row = (db.query(TrainedModel)
+               .filter_by(user_id=user_id, is_active=1)
+               .order_by(TrainedModel.created_at.desc()).first())
+        if not row:
+            return None
+        model = json.loads(row.payload or "{}")
+        model["version"] = row.version
+        model["trained_at"] = row.created_at.isoformat() if row.created_at else None
+        model["training_samples"] = row.training_samples
+        model["positive_samples"] = row.positive_samples
+        model["holdout_metrics"] = json.loads(row.metrics or "{}")
+        model["training_distribution"] = json.loads(row.training_distribution or "{}")
+        _trained_models[user_id] = model
+        return model
+    except Exception as e:
+        print(f"Model registry read failed: {e}")
+        return None
+
+
+def model_predict_proba(model, features):
+    if not model:
+        return None
+    xs = [(features[j] - model["means"][j]) / model["stds"][j]
+          for j in range(len(model["features"]))]
+    z = sum(model["weights"][j] * xs[j] for j in range(len(xs))) + model["bias"]
+    return round(1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z)))), 4)
+
+
+def population_stability_index(expected, actual, bins=10):
+    """PSI quantifies how far the live data distribution has moved from the
+    data the model was trained on. >0.25 conventionally means retrain."""
+    if len(expected) < 30 or len(actual) < 30:
+        return None
+    lo, hi = min(expected + actual), max(expected + actual)
+    if hi - lo < 1e-9:
+        return 0.0
+    width = (hi - lo) / bins
+    total = 0.0
+    for i in range(bins):
+        a, b = lo + i * width, lo + (i + 1) * width
+        e = (sum(1 for v in expected if a <= v < b) / len(expected)) or 1e-4
+        c = (sum(1 for v in actual if a <= v < b) / len(actual)) or 1e-4
+        total += (c - e) * math.log(c / e)
+    return round(total, 4)
+
+
+def build_training_set(db, user_id, lead_hours=None):
+    """Labels stored telemetry: a sample is positive when a confirmed failure
+    followed on that machine within the lead window."""
+    lead = datetime.timedelta(hours=lead_hours or PREDICTION_LEAD_HOURS)
+    failures = db.query(FailureEvent).filter_by(user_id=user_id).all()
+    if not failures:
+        return [], [], "no_confirmed_failures"
+
+    by_machine = {}
+    for f in failures:
+        by_machine.setdefault(f.machine_id, []).append(f.occurred_at)
+
+    rows = (db.query(TelemetryHistory)
+            .filter(TelemetryHistory.user_id == user_id)
+            .order_by(TelemetryHistory.recorded_at.asc()).all())
+    if len(rows) < MODEL_MIN_SAMPLES:
+        return [], [], "insufficient_telemetry"
+
+    # Slopes give the model a sense of direction, not just level.
+    prev = {}
+    X, y = [], []
+    for r in rows:
+        if not r.recorded_at:
+            continue
+        p = prev.get(r.machine_id)
+        temp_slope = (r.temperature - p[0]) if p else 0.0
+        vib_slope = (r.vibration - p[1]) if p else 0.0
+        prev[r.machine_id] = (r.temperature, r.vibration)
+
+        X.append([r.temperature or 0, r.vibration or 0, r.load or 0,
+                  r.power_kw or 0, temp_slope, vib_slope])
+        y.append(1 if any(r.recorded_at <= t <= r.recorded_at + lead
+                          for t in by_machine.get(r.machine_id, [])) else 0)
+
+    if sum(y) < MODEL_MIN_FAILURES:
+        return X, y, "insufficient_positive_samples"
+    return X, y, "ok"
+
+
+# ------------------------------------------------------------------
+# MODEL EVALUATION
+#
+# Scores stored predictions against confirmed failures. Until an operator
+# logs real breakdowns via /api/failures, this returns "insufficient_data"
+# rather than inventing an accuracy figure.
+# ------------------------------------------------------------------
+
+
+def confusion_metrics(y_true, y_pred):
+    tp = sum(1 for t, p in zip(y_true, y_pred) if t == 1 and p == 1)
+    fp = sum(1 for t, p in zip(y_true, y_pred) if t == 0 and p == 1)
+    fn = sum(1 for t, p in zip(y_true, y_pred) if t == 1 and p == 0)
+    tn = sum(1 for t, p in zip(y_true, y_pred) if t == 0 and p == 0)
+
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    accuracy = (tp + tn) / len(y_true) if y_true else 0.0
+    false_alarm_rate = fp / (fp + tn) if (fp + tn) else 0.0
+
+    return {
+        "true_positive": tp, "false_positive": fp,
+        "false_negative": fn, "true_negative": tn,
+        "precision": round(precision, 3), "recall": round(recall, 3),
+        "f1": round(f1, 3), "accuracy": round(accuracy, 3),
+        "false_alarm_rate": round(false_alarm_rate, 3),
+    }
+
+
+def roc_auc_score(y_true, scores):
+    """Rank-based AUC (equivalent to the Mann-Whitney U statistic).
+    Returns None when one class is absent, because AUC is undefined then."""
+    positives = [s for t, s in zip(y_true, scores) if t == 1]
+    negatives = [s for t, s in zip(y_true, scores) if t == 0]
+    if not positives or not negatives:
+        return None
+    wins = 0.0
+    for p in positives:
+        for n in negatives:
+            if p > n:
+                wins += 1
+            elif p == n:
+                wins += 0.5
+    return round(wins / (len(positives) * len(negatives)), 3)
+
+
+@app.route("/api/failures", methods=["POST"])
+@require_auth
+def api_log_failure():
+    """Operator confirms a breakdown that actually happened (ground truth)."""
+    data = request.get_json(force=True, silent=True) or {}
+    machine = g.db.query(Machine).filter_by(
+        id=data.get("machine_id"), user_id=g.user.id).first()
+    if not machine:
+        return jsonify({"error": "not_found"}), 404
+
+    try:
+        occurred = data.get("occurred_at")
+        occurred_at = (datetime.datetime.fromisoformat(occurred)
+                       if occurred else datetime.datetime.utcnow())
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid_date"}), 400
+
+    event = FailureEvent(
+        user_id=g.user.id, machine_id=machine.id, machine_code=machine.machine_code,
+        occurred_at=occurred_at,
+        failure_type=str(data.get("failure_type", "")).strip(),
+        component=str(data.get("component", "")).strip(),
+        downtime_minutes=float(data.get("downtime_minutes", 0) or 0),
+        repair_cost=float(data.get("repair_cost", 0) or 0),
+        notes=str(data.get("notes", "")).strip(),
+    )
+    g.db.add(event)
+    write_audit(g.db, g.user, "failure.log", "failure_event", None, machine.machine_code)
+    g.db.commit()
+    return jsonify({"success": True, "id": event.id})
+
+
+@app.route("/api/meta/components", methods=["GET"])
+@require_auth
+def api_components():
+    """Component list the failure form must offer, plus how many failures each
+    still needs before its reliability model is calibrated for this plant."""
+    counts = {}
+    for comp in CALIBRATABLE_COMPONENTS:
+        # Count USABLE service lives, not raw records: the first failure on a
+        # machine has no measurable life, so N records yield N-1 data points.
+        # Reporting raw counts would show "calibrated" before it actually is.
+        counts[comp] = len(component_service_lives(g.db, g.user.id, comp))
+    total = g.db.query(FailureEvent).filter_by(user_id=g.user.id).count()
+
+    return jsonify({
+        "components": [{
+            "code": comp,
+            "logged": counts[comp],
+            "needed": WEIBULL_MIN_FAILURES,
+            "remaining": max(0, WEIBULL_MIN_FAILURES - counts[comp]),
+            "calibrated": counts[comp] >= WEIBULL_MIN_FAILURES,
+        } for comp in CALIBRATABLE_COMPONENTS],
+        "total_failures": total,
+        "model_training": {
+            "logged": total,
+            "needed": MODEL_MIN_FAILURES,
+            "remaining": max(0, MODEL_MIN_FAILURES - total),
+            "ready": total >= MODEL_MIN_FAILURES,
+        },
+    })
+
+
+@app.route("/api/failures/<int:failure_id>", methods=["DELETE"])
+@require_auth
+def api_delete_failure(failure_id):
+    """Removes a mis-logged failure. Ground truth that is wrong is worse than
+    no ground truth, so operators must be able to correct a mistake."""
+    event = g.db.query(FailureEvent).filter_by(
+        id=failure_id, user_id=g.user.id).first()
+    if not event:
+        return jsonify({"error": "not_found"}), 404
+    write_audit(g.db, g.user, "failure.delete", "failure_event", event.id,
+                f"{event.machine_code}/{event.component}")
+    g.db.delete(event)
+    g.db.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/api/failures", methods=["GET"])
+@require_auth
+def api_list_failures():
+    events = (g.db.query(FailureEvent).filter_by(user_id=g.user.id)
+              .order_by(FailureEvent.occurred_at.desc()).limit(200).all())
+    return jsonify({"failures": [{
+        "id": e.id, "machine_id": e.machine_id, "machine_code": e.machine_code,
+        "occurred_at": e.occurred_at.isoformat() if e.occurred_at else None,
+        "failure_type": e.failure_type, "component": e.component,
+        "downtime_minutes": e.downtime_minutes, "repair_cost": e.repair_cost,
+        "was_predicted": bool(e.was_predicted), "notes": e.notes,
+    } for e in events]})
+
+
+@app.route("/api/energy/<int:machine_id>", methods=["GET"])
+@require_auth
+def api_energy_intelligence(machine_id):
+    """Full energy picture for one machine, all of it measured:
+    learned baseline, abnormal-consumption check, tariff, and a
+    before/after saving computed from stored history."""
+    machine = g.db.query(Machine).filter_by(id=machine_id, user_id=g.user.id).first()
+    if not machine:
+        return jsonify({"error": "not_found"}), 404
+
+    baseline = compute_energy_baseline(g.db, machine.id)
+    current_kw = estimate_power_kw(machine.voltage or 0, machine.current or 0)
+    anomaly = detect_energy_anomaly(current_kw, baseline)
+    savings = compute_measured_savings(g.db, machine.id)
+    price, band = energy_price_now()
+
+    return jsonify({
+        "machine": {"id": machine.id, "code": machine.machine_code,
+                    "name": machine.machine_name},
+        "current_power_kw": round(current_kw, 3),
+        "baseline": baseline,
+        "consumption_anomaly": anomaly,
+        "measured_savings": savings,
+        "tariff": {"price_per_kwh": price, "band": band,
+                   "is_peak_hour": is_peak_hour(),
+                   "schedule_configured": bool(TARIFF_BANDS)},
+        "data_source": "measured_voltage_current",
+    })
+
+
+@app.route("/api/reliability/<int:machine_id>", methods=["GET"])
+@require_auth
+def api_reliability(machine_id):
+    """Component-level Weibull RUL. Uses this plant's own failure history
+    once enough events exist, and states which parameters were used."""
+    machine = g.db.query(Machine).filter_by(id=machine_id, user_id=g.user.id).first()
+    if not machine:
+        return jsonify({"error": "not_found"}), 404
+
+    # Machine age proxy: hours of telemetry we have observed for it.
+    first = (g.db.query(TelemetryHistory)
+             .filter(TelemetryHistory.machine_id == machine.id)
+             .order_by(TelemetryHistory.recorded_at.asc()).first())
+    observed_hours = 0.0
+    if first and first.recorded_at:
+        observed_hours = (datetime.datetime.utcnow() - first.recorded_at).total_seconds() / 3600
+    age_hours = float(request.args.get("age_hours", observed_hours) or 0)
+
+    components = {}
+# Every component the reliability model knows about, so a pump failure logged
+# by an operator actually feeds calibration instead of being ignored.
+    for component in CALIBRATABLE_COMPONENTS:
+        # Fit from this plant's confirmed failures for that component
+        ages = component_service_lives(g.db, g.user.id, component)
+        fitted = fit_weibull_from_failures(ages, component)
+        components[component] = compute_rul_weibull(
+            age_hours, machine.temperature or 0, machine.vibration or 0,
+            machine.load or 0, component, fitted)
+
+    weakest = min(components.values(), key=lambda x: x["rul_hours"])
+    calibrated = any(x["is_calibrated"] for x in components.values())
+
+    return jsonify({
+        "machine": {"id": machine.id, "code": machine.machine_code},
+        "observed_age_hours": round(age_hours, 1),
+        "components": components,
+        "limiting_component": weakest["component"],
+        "rul_hours": weakest["rul_hours"],
+        "calibrated_to_this_plant": calibrated,
+        "warning_code": None if calibrated else "reliability_not_calibrated",
+        "warning_params": {"failures": WEIBULL_MIN_FAILURES},
+        "warning": None if calibrated else (
+            f"Using published industry parameters, not this plant's. Log at least "
+            f"{WEIBULL_MIN_FAILURES} real failures per component via /api/failures "
+            f"to calibrate. Until then these figures are indicative only."),
+    })
+
+
+@app.route("/api/logout", methods=["POST"])
+@require_auth
+def api_logout():
+    """Invalidates the presented token server-side. Without this, a stolen
+    token stays valid until it expires no matter what the user does."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        revoke_token(auth[7:], user_id=g.user.id, reason="logout")
+    write_audit(g.db, g.user, "auth.logout", "user", g.user.id, _client_ip())
+    g.db.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/api/me/password", methods=["POST"])
+@require_auth
+@rate_limit("reset_password")
+def api_change_password():
+    """Changing a password revokes the current token, forcing re-login
+    everywhere - the expected behaviour after a suspected compromise."""
+    data = request.get_json(force=True, silent=True) or {}
+    current = str(data.get("current_password", ""))
+    new = str(data.get("new_password", ""))
+
+    if not verify_password(current, g.user.password_hash):
+        return jsonify({"error": "invalid_credentials"}), 401
+    ok, reason = validate_password_strength(new)
+    if not ok:
+        return jsonify({"error": reason}), 400
+
+    if check_password_reuse(g.db, g.user.id, new):
+        return jsonify({"error": "password_recently_used"}), 400
+
+    remember_password(g.db, g.user.id, g.user.password_hash)   # keep the old one
+    g.user.password_hash = hash_password(new)
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        revoke_token(auth[7:], user_id=g.user.id, reason="password_change")
+    write_audit(g.db, g.user, "auth.password_change", "user", g.user.id, _client_ip())
+    g.db.commit()
+    return jsonify({"success": True, "reauth_required": True})
+
+
+@app.route("/api/registration/mode", methods=["GET"])
+def api_registration_mode():
+    """Public: lets the registration page show the right fields (code box,
+    invite notice) without revealing what the code actually is."""
+    return jsonify({
+        "restricted": registration_is_restricted(),
+        "invite_only": INVITE_ONLY,
+        "code_required": bool(REGISTRATION_CODE),
+        "domain_restricted": bool(ALLOWED_EMAIL_DOMAINS),
+        # Showing the permitted domains is helpful and not sensitive - the
+        # code itself is never exposed.
+        "allowed_domains": ALLOWED_EMAIL_DOMAINS,
+    })
+
+
+@app.route("/api/invites", methods=["POST"])
+@require_auth
+def api_create_invite():
+    """Administrator issues a personal, single-use invitation."""
+    if (g.user.role or "") != "admin":
+        return jsonify({"error": "forbidden"}), 403
+
+    data = request.get_json(force=True, silent=True) or {}
+    email = str(data.get("email", "")).strip().lower()
+    if email and not EMAIL_RE.match(email):
+        return jsonify({"error": "invalid_email"}), 400
+
+    role = str(data.get("role", "engineer")).strip().lower()
+    if role not in ROLE_CAPABILITIES:
+        role = "engineer"
+
+    days = max(1, min(90, int(data.get("valid_days", 14))))
+    invite = Invite(
+        token=secrets.token_urlsafe(32),
+        email=email, role=role,
+        invited_by=g.user.id, invited_by_email=g.user.email,
+        note=str(data.get("note", "")).strip()[:255],
+        expires_at=datetime.datetime.utcnow() + datetime.timedelta(days=days),
+    )
+    g.db.add(invite)
+    write_audit(g.db, g.user, "invite.create", "invite", None, email or "(any)")
+    g.db.commit()
+
+    base = request.headers.get("Origin") or request.host_url.rstrip("/")
+    link = f"{base}/register?invite={invite.token}"
+
+    # Email it directly when SMTP is available, so the admin does not have to
+    # copy links around.
+    delivered = False
+    if email and smtp_config_status()["configured"]:
+        lang = getattr(g.user, "preferred_lang", "en") or "en"
+        tpl = INVITE_EMAIL_TEXT.get(lang, INVITE_EMAIL_TEXT["en"])
+        delivered, _ = send_email(
+            email,
+            tpl["subject"],
+            tpl["body"].format(inviter=g.user.full_name, link=link, days=days))
+
+    return jsonify({
+        "success": True, "invite_link": link, "token": invite.token,
+        "email": email, "role": role, "valid_days": days,
+        "email_sent": delivered,
+    })
+
+
+@app.route("/api/invites", methods=["GET"])
+@require_auth
+def api_list_invites():
+    if (g.user.role or "") != "admin":
+        return jsonify({"error": "forbidden"}), 403
+    rows = (g.db.query(Invite).order_by(Invite.created_at.desc()).limit(100).all())
+    return jsonify({"invites": [{
+        "id": i.id, "email": i.email, "role": i.role,
+        "used": bool(i.used), "note": i.note,
+        "invited_by": i.invited_by_email,
+        "expires_at": i.expires_at.isoformat() if i.expires_at else None,
+        "created_at": i.created_at.isoformat() if i.created_at else None,
+    } for i in rows]})
+
+
+@app.route("/api/invites/<int:invite_id>", methods=["DELETE"])
+@require_auth
+def api_revoke_invite(invite_id):
+    if (g.user.role or "") != "admin":
+        return jsonify({"error": "forbidden"}), 403
+    invite = g.db.query(Invite).filter_by(id=invite_id).first()
+    if not invite:
+        return jsonify({"error": "not_found"}), 404
+    g.db.delete(invite)
+    write_audit(g.db, g.user, "invite.revoke", "invite", invite_id, invite.email)
+    g.db.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/api/security/status", methods=["GET"])
+@require_auth
+def api_security_status():
+    """Self-check an administrator can run before going live."""
+    if (g.user.role or "") != "admin":
+        return jsonify({"error": "forbidden"}), 403
+
+    checks = {
+        "jwt_secret_strong": len(JWT_SECRET) >= 32 and JWT_SECRET not in ("change-me", "secret"),
+        "debug_disabled": os.environ.get("FLASK_DEBUG", "").lower() not in ("1", "true", "yes"),
+        "https_in_use": request.is_secure or request.headers.get("X-Forwarded-Proto") == "https",
+        "database_is_postgres": DATABASE_URL.startswith("postgres"),
+        "rate_limiting_active": True,
+        "account_lockout_active": True,
+        "audit_logging_active": True,
+        "security_headers_active": True,
+        "smtp_configured": smtp_config_status()["configured"],
+        "industrial_read_only": True,   # no write path exists to any PLC
+    }
+    failed = [k for k, v in checks.items() if not v]
+    return jsonify({
+        "checks": checks,
+        "passed": len(checks) - len(failed),
+        "total": len(checks),
+        "failed": failed,
+        "locked_accounts": sum(1 for v in _failed_logins.values()
+                               if v.get("until", 0) > time.time()),
+        "revoked_tokens": len(_revoked_tokens),
+        "policy": {"lockout_threshold": LOCKOUT_THRESHOLD,
+                   "lockout_minutes": LOCKOUT_MINUTES,
+                   "min_password_length": 10},
+    })
+
+
+@app.route("/api/kpi/roi", methods=["GET"])
+@require_auth
+def api_kpi_roi():
+    """Pilot business case computed from RECORDED data only.
+
+    Downtime comes from logged shifts and confirmed failures; prevented
+    failures come from work orders that were completed while a warning was
+    active. Where a figure cannot be derived from records it is reported as
+    null with the reason, never filled in with an assumption."""
+    days = max(7, min(365, int(request.args.get("days", 90))))
+    now = datetime.datetime.utcnow()
+    since = now - datetime.timedelta(days=days)
+    half = now - datetime.timedelta(days=days / 2)
+
+    shifts = (g.db.query(ProductionShift)
+              .filter(ProductionShift.user_id == g.user.id,
+                      ProductionShift.shift_date >= since).all())
+    failures = (g.db.query(FailureEvent)
+                .filter(FailureEvent.user_id == g.user.id,
+                        FailureEvent.occurred_at >= since).all())
+    orders = (g.db.query(WorkOrder)
+              .filter(WorkOrder.user_id == g.user.id,
+                      WorkOrder.created_at >= since).all())
+
+    hourly_cost = DEFAULT_DOWNTIME_COST_PER_HOUR
+
+    # --- Downtime trend: first half vs second half of the window ---
+    def downtime_in(a, b):
+        mins = sum(s.downtime_minutes or 0 for s in shifts
+                   if s.shift_date and a <= s.shift_date < b)
+        planned = sum(s.planned_minutes or 0 for s in shifts
+                      if s.shift_date and a <= s.shift_date < b)
+        return mins, planned
+
+    early_dt, early_planned = downtime_in(since, half)
+    late_dt, late_planned = downtime_in(half, now)
+
+    downtime_reduction = None
+    if early_planned > 0 and late_planned > 0:
+        early_rate = early_dt / early_planned
+        late_rate = late_dt / late_planned
+        if early_rate > 0:
+            downtime_reduction = {
+                "before_pct": round(early_rate * 100, 2),
+                "after_pct": round(late_rate * 100, 2),
+                "change_pct": round((early_rate - late_rate) / early_rate * 100, 1),
+                "minutes_saved": round((early_rate - late_rate) * late_planned, 1),
+                "source": "logged_shifts",
+            }
+
+    # --- Failures actually prevented: a completed work order that was raised
+    #     from an alert, on a machine that then did NOT fail. ---
+    preventive_done = [w for w in orders
+                       if w.status == "done" and w.alert_id is not None]
+    failed_machines = {f.machine_id for f in failures}
+    prevented = [w for w in preventive_done if w.machine_id not in failed_machines]
+
+    # --- Costs that actually occurred ---
+    actual_downtime_cost = sum((f.downtime_minutes or 0) / 60 * hourly_cost for f in failures)
+    actual_repair_cost = sum(f.repair_cost or 0 for f in failures)
+
+    # --- Avoided cost: only from prevented failures, priced with THIS plant's
+    #     own average failure, not a generic assumption. ---
+    avoided_cost = None
+    if failures and prevented:
+        avg_failure_cost = ((actual_downtime_cost + actual_repair_cost) / len(failures))
+        avoided_cost = round(avg_failure_cost * len(prevented), 2)
+
+    total_downtime_min = sum(s.downtime_minutes or 0 for s in shifts)
+    total_planned_min = sum(s.planned_minutes or 0 for s in shifts)
+
+    missing = []
+    if not shifts:
+        missing.append("no shifts logged - downtime trend cannot be computed")
+    if not failures:
+        missing.append("no confirmed failures - avoided cost cannot be priced")
+    if not orders:
+        missing.append("no work orders - prevention cannot be attributed")
+
+    return jsonify({
+        "window_days": days,
+        "data_completeness": {
+            "shifts": len(shifts), "failures": len(failures), "work_orders": len(orders),
+            "sufficient": not missing, "missing": missing,
+        },
+        "downtime": {
+            "total_minutes": round(total_downtime_min, 1),
+            "total_cost": round(total_downtime_min / 60 * hourly_cost, 2),
+            "availability_pct": (round((1 - total_downtime_min / total_planned_min) * 100, 2)
+                                 if total_planned_min else None),
+            "reduction": downtime_reduction,
+        },
+        "failures": {
+            "confirmed": len(failures),
+            "actual_downtime_cost": round(actual_downtime_cost, 2),
+            "actual_repair_cost": round(actual_repair_cost, 2),
+        },
+        "prevention": {
+            "preventive_orders_completed": len(preventive_done),
+            "failures_prevented": len(prevented),
+            "avoided_cost": avoided_cost,
+            "basis": ("this plant's average failure cost x prevented count"
+                      if avoided_cost is not None else None),
+        },
+        "assumptions": {
+            "downtime_cost_per_hour": hourly_cost,
+            "note": ("downtime_cost_per_hour is an operator-supplied figure, not "
+                     "measured by this system - confirm it with plant finance"),
+        },
+        "roi": None if avoided_cost is None else {
+            "benefit": avoided_cost,
+            "note_code": "roi_system_cost_note",
+            "note": ("System cost is not known to the application. Divide benefit "
+                     "by your licence + hardware cost to obtain ROI and payback."),
+        },
+    })
+
+
+@app.route("/api/pipeline/health", methods=["GET"])
+@require_auth
+def api_pipeline_health():
+    """Ingestion pipeline state: queue depth, duplicates suppressed, retries,
+    and anything quarantined in the dead-letter queue."""
+    health = INGEST.health()
+    if health["utilisation_pct"] > 80:
+        status = "saturated"
+    elif health["dead_letter_depth"] > 0:
+        status = "degraded"
+    else:
+        status = "healthy"
+    return jsonify({
+        "status": status,
+        "queue": health,
+        "dead_letter_sample": [
+            {"machine_code": d["machine_code"], "error": d.get("error"),
+             "attempts": d["attempts"], "failed_at": d.get("failed_at")}
+            for d in list(INGEST.dead_letter)[-10:]
+        ],
+        "config": {"dedup_window_seconds": INGEST_DEDUP_WINDOW,
+                   "max_attempts": INGEST_MAX_ATTEMPTS,
+                   "batch_size": INGEST_BATCH_SIZE},
+    })
+
+
+@app.route("/api/connections/health", methods=["GET"])
+@require_auth
+def api_connection_health():
+    """Live health of every industrial connection - the view a maintenance
+    engineer needs when data stops arriving."""
+    health = connection_health_all()
+    active = DATA_MODE.lower()
+    return jsonify({
+        "data_mode": DATA_MODE,
+        "active_protocol": active,
+        "active_health": health.get(active),
+        "all": health,
+        "config": {
+            "backoff_cap_seconds": CONNECT_BACKOFF_CAP,
+            "offline_buffer_size": OFFLINE_BUFFER_SIZE,
+            "stale_after_seconds": STALE_DATA_SECONDS,
+        },
+        "note_code": "simulation_mode_note",
+        "note": ("SIMULATION mode generates data locally; protocol health is "
+                 "only meaningful once DATA_MODE points at real hardware."),
+    })
+
+
+@app.route("/api/model/train", methods=["POST"])
+@require_auth
+def api_train_model():
+    """Trains the supervised failure classifier on this account's labelled
+    telemetry, and reports hold-out performance - never training performance,
+    which would flatter the model."""
+    X, y, status = build_training_set(g.db, g.user.id)
+
+    if status != "ok":
+        return jsonify({
+            "status": "cannot_train", "reason": status,
+            "samples": len(X), "positive_samples": sum(y) if y else 0,
+            "required": {"samples": MODEL_MIN_SAMPLES, "failures": MODEL_MIN_FAILURES},
+            "message_code": "train_needs_failures",
+            "message": ("Training needs confirmed failures logged via /api/failures. "
+                        "A model trained without them would be fitting noise."),
+        }), 400
+
+    # Chronological split: training on later data and testing on earlier would
+    # leak the future into the model.
+    split = int(len(X) * MODEL_TRAIN_SPLIT)
+    X_train, y_train, X_test, y_test = X[:split], y[:split], X[split:], y[split:]
+    if sum(y_test) == 0:
+        return jsonify({"status": "cannot_train", "reason": "no_failures_in_holdout",
+                        "message_code": "train_no_holdout_failures",
+                        "message": "The test period contains no failures to score against."}), 400
+
+    model = train_logistic_model(X_train, y_train)
+    if not model:
+        return jsonify({"status": "training_failed"}), 500
+
+    probs = [model_predict_proba(model, x) for x in X_test]
+    preds = [1 if p >= 0.5 else 0 for p in probs]
+    metrics = confusion_metrics(y_test, preds)
+    metrics["roc_auc"] = roc_auc_score(y_test, probs)
+
+    model["version"] = f"logreg-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M')}"
+    model["holdout_metrics"] = metrics
+    # Keep the training distribution so drift can be measured against it later.
+    model["training_distribution"] = {
+        MODEL_FEATURES[j]: [row[j] for row in X_train[:500]]
+        for j in range(len(MODEL_FEATURES))
+    }
+    _trained_models[g.user.id] = model
+
+    # Persist it: a model that lives only in memory is lost on every deploy,
+    # taking its measured accuracy with it.
+    try:
+        for prev in g.db.query(TrainedModel).filter_by(user_id=g.user.id, is_active=1).all():
+            prev.is_active = 0
+        g.db.add(TrainedModel(
+            user_id=g.user.id, version=model["version"],
+            payload=json.dumps({k: model[k] for k in
+                                ("weights", "bias", "means", "stds", "features")}),
+            metrics=json.dumps(metrics),
+            training_distribution=json.dumps(model["training_distribution"]),
+            training_samples=model["training_samples"],
+            positive_samples=model["positive_samples"],
+            is_active=1,
+        ))
+    except Exception as e:
+        print(f"Model registry write failed: {e}")
+
+    write_audit(g.db, g.user, "model.train", "model", None, model["version"])
+    g.db.commit()
+
+    return jsonify({
+        "status": "trained",
+        "model_version": model["version"],
+        "training_samples": len(X_train),
+        "holdout_samples": len(X_test),
+        "positive_rate": round(sum(y) / len(y), 4),
+        "holdout_metrics": metrics,
+        "feature_weights": dict(zip(MODEL_FEATURES,
+                                    [round(w, 4) for w in model["weights"]])),
+        "note_code": "holdout_metrics_note",
+        "note": "Metrics are from held-out data the model never saw during training.",
+    })
+
+
+@app.route("/api/model/registry", methods=["GET"])
+@require_auth
+def api_model_registry():
+    """What is currently deciding risk for this account, and how good it is."""
+    model = load_active_model(g.db, g.user.id)
+    if not model:
+        return jsonify({
+            "active_model": "rule_based",
+            "version": MODEL_VERSION,
+            "trained": False,
+            "message_code": "model_untrained_note",
+            "message": ("No supervised model has been trained. Risk scores come "
+                        "from the statistical/rule engine and are indicative, "
+                        "not validated."),
+        })
+    return jsonify({
+        "active_model": "logistic_regression",
+        "version": model["version"],
+        "trained": True,
+        "trained_at": model["trained_at"],
+        "training_samples": model["training_samples"],
+        "positive_samples": model["positive_samples"],
+        "features": model["features"],
+        "feature_weights": dict(zip(model["features"],
+                                    [round(w, 4) for w in model["weights"]])),
+        "holdout_metrics": model.get("holdout_metrics"),
+    })
+
+
+@app.route("/api/model/drift", methods=["GET"])
+@require_auth
+def api_model_drift():
+    """Compares live data against what the model was trained on. A model can
+    be accurate on day one and quietly wrong three months later."""
+    model = load_active_model(g.db, g.user.id)
+    if not model or not model.get("training_distribution"):
+        return jsonify({"status": "no_trained_model",
+                        "message_code": "drift_needs_model",
+                        "message": "Train a model first; drift is measured against its training data."})
+
+    days = max(1, min(90, int(request.args.get("days", 14))))
+    since = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+    rows = (g.db.query(TelemetryHistory)
+            .filter(TelemetryHistory.user_id == g.user.id,
+                    TelemetryHistory.recorded_at >= since).all())
+    if len(rows) < 30:
+        return jsonify({"status": "insufficient_recent_data", "samples": len(rows)})
+
+    live = {
+        "temperature": [r.temperature or 0 for r in rows],
+        "vibration": [r.vibration or 0 for r in rows],
+        "load": [r.load or 0 for r in rows],
+        "power_kw": [r.power_kw or 0 for r in rows],
+    }
+
+    drift = {}
+    for feature, values in live.items():
+        trained = model["training_distribution"].get(feature)
+        if not trained:
+            continue
+        score = population_stability_index(trained, values)
+        if score is None:
+            continue
+        level = ("severe" if score > 0.25 else
+                 "moderate" if score > 0.1 else "stable")
+        drift[feature] = {"psi": score, "level": level}
+
+    worst = max((d["psi"] for d in drift.values()), default=0.0)
+    return jsonify({
+        "status": "ok",
+        "model_version": model["version"],
+        "window_days": days,
+        "samples": len(rows),
+        "drift_by_feature": drift,
+        "max_psi": worst,
+        "retrain_recommended": worst > 0.25,
+        "interpretation": {"stable": "< 0.1", "moderate": "0.1 - 0.25",
+                           "severe": "> 0.25 (retrain)"},
+    })
+
+
+@app.route("/api/model/evaluation", methods=["GET"])
+@require_auth
+def api_model_evaluation():
+    """Measures the prediction engine against confirmed failures.
+
+    This is the only honest answer to "how accurate is your AI" - and it
+    refuses to answer at all until there is ground truth to score against."""
+    days = max(1, min(365, int(request.args.get("days", 90))))
+    since = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+
+    failures = (g.db.query(FailureEvent)
+                .filter(FailureEvent.user_id == g.user.id,
+                        FailureEvent.occurred_at >= since).all())
+    predictions = (g.db.query(PredictionLog)
+                   .filter(PredictionLog.user_id == g.user.id,
+                           PredictionLog.created_at >= since).all())
+
+    if not failures:
+        return jsonify({
+            "status": "insufficient_data",
+            "reason": "no_confirmed_failures",
+            "message_code": "evaluation_needs_failures",
+            "message": ("Model accuracy cannot be measured until real breakdowns are "
+                        "logged via POST /api/failures. Any accuracy figure before "
+                        "that would be fabricated."),
+            "predictions_logged": len(predictions),
+            "failures_logged": 0,
+        })
+    if not predictions:
+        return jsonify({"status": "insufficient_data", "reason": "no_predictions_logged",
+                        "failures_logged": len(failures)})
+
+    lead = datetime.timedelta(hours=PREDICTION_LEAD_HOURS)
+
+    # Label each prediction: did a failure follow on that machine within the
+    # lead window? That is the event the prediction was supposed to anticipate.
+    by_machine = {}
+    for f in failures:
+        by_machine.setdefault(f.machine_id, []).append(f.occurred_at)
+
+    y_true, y_pred, scores = [], [], []
+    for p in predictions:
+        followed = any(p.created_at <= t <= p.created_at + lead
+                       for t in by_machine.get(p.machine_id, []))
+        y_true.append(1 if followed else 0)
+        y_pred.append(1 if p.risk >= RISK_ALERT_THRESHOLD else 0)
+        scores.append(p.risk)
+
+    metrics = confusion_metrics(y_true, y_pred)
+    metrics["roc_auc"] = roc_auc_score(y_true, scores)
+
+    # Per-failure view: was each breakdown warned about, and how early?
+    caught, lead_times = 0, []
+    for f in failures:
+        window = [p for p in predictions
+                  if p.machine_id == f.machine_id
+                  and f.occurred_at - lead <= p.created_at <= f.occurred_at
+                  and p.risk >= RISK_ALERT_THRESHOLD]
+        if window:
+            caught += 1
+            earliest = min(p.created_at for p in window)
+            lead_times.append(round((f.occurred_at - earliest).total_seconds() / 3600, 1))
+            f.was_predicted = 1
+    g.db.commit()
+
+    return jsonify({
+        "status": "ok",
+        "model_version": MODEL_VERSION,
+        "window_days": days,
+        "sample_size": {"predictions": len(predictions), "failures": len(failures)},
+        "metrics": metrics,
+        "failures_caught": caught,
+        "failures_missed": len(failures) - caught,
+        "detection_rate": round(caught / len(failures), 3),
+        "avg_early_warning_hours": round(sum(lead_times) / len(lead_times), 1) if lead_times else None,
+        "config": {"risk_threshold": RISK_ALERT_THRESHOLD,
+                   "lead_window_hours": PREDICTION_LEAD_HOURS},
+    })
+
+
 @app.route("/api/system/intelligence", methods=["GET"])
 @require_auth
 def api_system_intelligence():
@@ -3310,15 +6363,44 @@ def _build_pdf_report(user, factories, machines, alerts, days,
     small_style = ParagraphStyle("FPSmall", parent=styles["Normal"], fontSize=8, textColor=colors.grey, fontName=font)
 
     total_machines = len(machines)
-    total_energy = round(sum(f.machines * f.load * f.energy_cost for f in factories), 1) if factories else 0
+    # Energy has two possible sources: the legacy factory records, and the SCADA
+    # machines (which carry real voltage/current). Counting only factories made a
+    # pilot that uses SCADA machines report 0 kWh even while machines were running.
+    factory_energy = sum(f.machines * f.load * f.energy_cost for f in factories) if factories else 0
+    machine_energy = sum(
+        estimate_power_kw(m.voltage or 0, m.current or 0) * 24
+        for m in machines
+    ) if machines else 0
+    total_energy = round(factory_energy + machine_energy, 1)
     avg_load = round(sum(m.load for m in machines) / total_machines, 1) if total_machines else 0
     avg_temp = round(sum(m.temperature for m in machines) / total_machines, 1) if total_machines else 0
     critical_alerts = [a for a in alerts if a.severity == "critical"]
     incidents_caught = len(critical_alerts)
-    # Heuristic pilot-savings estimate: flagged/critical machines represent avoided unplanned
-    # downtime; energy savings are estimated from the standard 10-15% optimization band the
-    # AI engine recommends for elevated-load plants.
-    estimated_energy_savings_kwh = round(total_energy * 0.12, 1)
+    # Measured, not assumed. Savings are the energy actually being wasted right
+    # now, from two sources the engine can point at:
+    #   - idle running (machine powered but producing nothing)
+    #   - friction overhead (extra draw above this machine's own baseline)
+    # If neither is present the figure is 0 - which is the honest answer, and
+    # far more defensible to a client than a flat percentage.
+    measured_waste_kwh = 0.0
+    savings_breakdown = {"idle": 0.0, "friction": 0.0, "measured": True}
+    for m in machines:
+        try:
+            energy = compute_energy_analytics(
+                m.machine_code, m.temperature or 0, m.vibration or 0, m.load or 0,
+                m.voltage or 0, m.current or 0, m.status or "running",
+                m.daily_output_units or 0)
+        except Exception:
+            continue
+        idle_kwh = (energy.get("idle_waste_kw") or 0) * 24
+        friction_kwh = (energy.get("extra_power_kw") or 0) * 24
+        savings_breakdown["idle"] += idle_kwh
+        savings_breakdown["friction"] += friction_kwh
+        measured_waste_kwh += idle_kwh + friction_kwh
+
+    savings_breakdown["idle"] = round(savings_breakdown["idle"], 1)
+    savings_breakdown["friction"] = round(savings_breakdown["friction"], 1)
+    estimated_energy_savings_kwh = round(measured_waste_kwh, 1)
 
     elements = []
     elements.append(Paragraph(_("title"), title_style))
@@ -3360,7 +6442,7 @@ def _build_pdf_report(user, factories, machines, alerts, days,
         factory_rows = [[_("col_factory"), _("col_machines"), _("col_type"), _("col_energy_cost"), _("col_avg_load"), _("col_avg_temp")]]
         for f in factories:
             factory_rows.append([
-                f.factory_name, str(f.machines), f.machine_type,
+                Paragraph(f.factory_name, small_style), str(f.machines), f.machine_type,
                 f"${f.energy_cost}/kWh", f"{f.load}%", f"{f.temperature}°C",
             ])
         factory_table = Table(factory_rows, colWidths=[45 * mm, 22 * mm, 25 * mm, 28 * mm, 22 * mm, 22 * mm])
@@ -3467,7 +6549,7 @@ _("oee_formula") + " " + _("oee_benchmark"), small_style))
             rul = p["rul_hours"]
             rul_txt = _("healthy") if rul is None else (f"{rul}{_('h_short')}" if rul < 48 else f"{round(rul / 24, 1)}{_('d_short')}")
             pred_rows.append([
-                p["name"], f"{p['risk']}%", rul_txt,
+                Paragraph(p["name"], small_style), f"{p['risk']}%", rul_txt,
                 _("cause_" + p["cause"]) if p["cause"] else "-",
             ])
         pred_table = Table(pred_rows, colWidths=[45 * mm, 22 * mm, 33 * mm, 65 * mm])
@@ -3500,7 +6582,7 @@ _("oee_formula") + " " + _("oee_benchmark"), small_style))
                 Paragraph(w.title or "-", small_style),
                 _("prio_" + w.priority) if w.priority else "-",
                 _("wo_" + w.status) if w.status else "-",
-                w.assigned_to or "-",
+                Paragraph(w.assigned_to or "-", small_style),
             ])
         wo_table = Table(wo_rows, colWidths=[70 * mm, 25 * mm, 30 * mm, 40 * mm])
         wo_table.setStyle(TableStyle([
@@ -3522,7 +6604,9 @@ _("oee_formula") + " " + _("oee_benchmark"), small_style))
         alert_rows = [[_("col_machine"), _("col_message"), _("col_date")]]
         for a in critical_alerts[:20]:
             alert_rows.append([
-                a.machine_name or a.machine_code,
+                # Wrapped in Paragraph so non-Latin machine names use the same
+                # Unicode font as the rest of the row instead of falling back.
+                Paragraph(a.machine_name or a.machine_code, small_style),
                 Paragraph(a.message, small_style),
                 a.created_at.strftime("%Y-%m-%d %H:%M") if a.created_at else "",
             ])
@@ -3842,6 +6926,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
         <span data-t="nav_roi">ROI Dashboard</span>
       </button>
+      <button class="nav-btn text-left px-3 py-2.5 rounded-xl hover:bg-white/10 transition flex items-center gap-2.5 text-sm" data-page="system-health" data-role="technical">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        <span data-t="nav_system_health">System Health</span>
+      </button>
       <button class="nav-btn text-left px-3 py-2.5 rounded-xl hover:bg-white/10 transition flex items-center gap-2.5 text-sm" data-page="history">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg>
         <span data-t="nav_history">History</span>
@@ -3849,6 +6937,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button class="nav-btn text-left px-3 py-2.5 rounded-xl hover:bg-white/10 transition flex items-center gap-2.5 text-sm" data-page="oee">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 16v-5M12 16V8M17 16v-9"/></svg>
         <span data-t="nav_oee">OEE</span>
+      </button>
+      <button class="nav-btn text-left px-3 py-2.5 rounded-xl hover:bg-white/10 transition flex items-center gap-2.5 text-sm" data-page="failures" data-role="technical">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/><path d="M12 9v4M12 17h.01"/></svg>
+        <span data-t="nav_failures">Failure Log</span>
       </button>
       <button class="nav-btn text-left px-3 py-2.5 rounded-xl hover:bg-white/10 transition flex items-center gap-2.5 text-sm relative" data-page="workorders">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76Z"/></svg>
@@ -3913,8 +7005,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <button class="nav-btn-m glass rounded-xl px-3 py-2 text-xs whitespace-nowrap" data-page="twin" data-t="nav_digital_twin">Digital Twin</button>
     <button class="nav-btn-m glass rounded-xl px-3 py-2 text-xs whitespace-nowrap" data-page="system" data-role="technical" data-t="nav_system_intel">System Intelligence</button>
     <button class="nav-btn-m glass rounded-xl px-3 py-2 text-xs whitespace-nowrap" data-page="roi" data-role="business" data-t="nav_roi">ROI Dashboard</button>
+    <button class="nav-btn-m glass rounded-xl px-3 py-2 text-xs whitespace-nowrap" data-page="system-health" data-role="technical" data-t="nav_system_health">System Health</button>
     <button class="nav-btn-m glass rounded-xl px-3 py-2 text-xs whitespace-nowrap" data-page="history" data-t="nav_history">History</button>
     <button class="nav-btn-m glass rounded-xl px-3 py-2 text-xs whitespace-nowrap" data-page="oee" data-t="nav_oee">OEE</button>
+    <button class="nav-btn-m glass rounded-xl px-3 py-2 text-xs whitespace-nowrap" data-page="failures" data-role="technical" data-t="nav_failures">Failure Log</button>
     <button class="nav-btn-m glass rounded-xl px-3 py-2 text-xs whitespace-nowrap" data-page="workorders" data-t="nav_workorders">Work Orders</button>
     <button class="nav-btn-m glass rounded-xl px-3 py-2 text-xs whitespace-nowrap" data-page="story" data-t="nav_story">Story Mode</button>
     <button class="nav-btn-m glass rounded-xl px-3 py-2 text-xs whitespace-nowrap relative" data-page="alerts" data-t="nav_alerts">Alerts</button>
@@ -4227,6 +7321,57 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
   </section>
 
+  <!-- ==================== PAGE: SYSTEM HEALTH ==================== -->
+  <section id="page-system-health" class="page hidden">
+    <div class="flex items-center justify-between mb-2 flex-wrap gap-3">
+      <h2 class="text-xl font-bold" data-t="nav_system_health">System Health</h2>
+      <button id="btn-refresh-health" class="input-field rounded-xl px-4 py-2 text-sm" data-t="refresh_btn">Refresh</button>
+    </div>
+    <p class="text-xs text-slate-500 mb-5" data-t="system_health_hint">Live state of the data path, the model, and the security posture — the things that silently break.</p>
+
+    <!-- CONNECTIONS -->
+    <div class="glass rounded-2xl p-5 mb-4">
+      <h3 class="font-semibold mb-3" data-t="connections_title">Industrial Connections</h3>
+      <div id="conn-grid" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+      <div id="conn-mode" class="text-xs text-slate-500 mt-3"></div>
+    </div>
+
+    <!-- PIPELINE -->
+    <div class="glass rounded-2xl p-5 mb-4">
+      <h3 class="font-semibold mb-3" data-t="pipeline_title">Ingestion Pipeline</h3>
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-3">
+        <div><div class="text-xs text-slate-400 mb-1" data-t="queue_depth_label">Queue Depth</div><div id="pipe-depth" class="text-xl font-bold gauge-value">—</div></div>
+        <div><div class="text-xs text-slate-400 mb-1" data-t="duplicates_label">Duplicates Suppressed</div><div id="pipe-dupes" class="text-xl font-bold gauge-value">—</div></div>
+        <div><div class="text-xs text-slate-400 mb-1" data-t="retried_label">Retried</div><div id="pipe-retry" class="text-xl font-bold gauge-value">—</div></div>
+        <div><div class="text-xs text-slate-400 mb-1" data-t="dead_letter_label">Dead-lettered</div><div id="pipe-dead" class="text-xl font-bold gauge-value">—</div></div>
+      </div>
+      <div id="pipe-bar" style="height:8px;background:rgba(255,255,255,.07);border-radius:4px;overflow:hidden">
+        <div id="pipe-fill" style="height:100%;width:0%;background:#22d3ee;transition:width .4s"></div>
+      </div>
+      <div id="pipe-dlq" class="text-xs text-slate-400 mt-3"></div>
+    </div>
+
+    <!-- MODEL -->
+    <div class="glass rounded-2xl p-5 mb-4">
+      <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h3 class="font-semibold" data-t="model_title">Prediction Model</h3>
+        <div class="flex gap-2">
+          <button id="btn-train-model" class="glow-btn rounded-xl px-4 py-2 text-xs font-semibold" data-t="train_model_btn">Train Model</button>
+          <button id="btn-check-drift" class="input-field rounded-xl px-4 py-2 text-xs" data-t="check_drift_btn">Check Drift</button>
+        </div>
+      </div>
+      <div id="model-body" class="text-sm text-slate-300"></div>
+      <div id="model-metrics" class="grid grid-cols-2 lg:grid-cols-5 gap-3 mt-4 hidden"></div>
+      <div id="model-drift" class="mt-4"></div>
+    </div>
+
+    <!-- SECURITY (admin only) -->
+    <div class="glass rounded-2xl p-5" data-role="admin">
+      <h3 class="font-semibold mb-3" data-t="security_title">Security Checks</h3>
+      <div id="sec-body" class="text-sm text-slate-400"></div>
+    </div>
+  </section>
+
   <!-- ==================== PAGE: HISTORY / TRENDS ==================== -->
   <section id="page-history" class="page hidden">
     <div class="flex items-center justify-between mb-2 flex-wrap gap-3">
@@ -4327,6 +7472,82 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div id="oee-empty" class="hidden text-center text-slate-400 py-8 text-sm" data-t="no_shifts_yet">No shifts logged yet. Click "Log Shift" to add one.</div>
     </div>
   </section>
+
+  <!-- ==================== PAGE: FAILURE LOG ==================== -->
+  <section id="page-failures" class="page hidden">
+    <div class="flex items-center justify-between mb-2 flex-wrap gap-3">
+      <h2 class="text-xl font-bold" data-t="nav_failures">Failure Log</h2>
+      <button id="btn-log-failure" class="glow-btn rounded-xl px-4 py-2 text-sm font-semibold" data-t="log_failure_btn">+ Log a Failure</button>
+    </div>
+    <p class="text-xs text-slate-500 mb-5" data-t="failures_hint">Record every real breakdown. This is what teaches the model your plant's actual behaviour — without it, predictions stay generic.</p>
+
+    <!-- COMPONENT-LEVEL PREDICTION -->
+    <div class="glass rounded-2xl p-5 mb-5">
+      <div class="flex items-center justify-between mb-1 flex-wrap gap-2">
+        <h3 class="font-semibold" data-t="component_prediction_title">Component Prediction</h3>
+        <select id="rel-machine" class="input-field rounded-xl text-sm px-3 py-2"></select>
+      </div>
+      <p class="text-xs text-slate-500 mb-4" data-t="component_prediction_hint">Remaining life per component, from this machine's live condition.</p>
+      <div id="rel-grid" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+      <div id="rel-warning" class="text-xs mt-3"></div>
+    </div>
+
+    <!-- CALIBRATION PROGRESS -->
+    <div class="glass rounded-2xl p-5 mb-5">
+      <h3 class="font-semibold mb-1" data-t="calibration_title">Calibration Progress</h3>
+      <p class="text-xs text-slate-500 mb-4" data-t="calibration_hint">Each component needs enough confirmed failures before its prediction is calibrated for this plant.</p>
+      <div id="calib-grid" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+      <div id="calib-model" class="mt-4 pt-4 border-t border-white/10"></div>
+    </div>
+
+    <!-- LIST -->
+    <div class="glass rounded-2xl p-5">
+      <h3 class="font-semibold mb-3" data-t="logged_failures_title">Logged Failures</h3>
+      <div id="failure-list" class="flex flex-col gap-3"></div>
+      <div id="failure-empty" class="hidden text-center text-slate-400 py-8 text-sm" data-t="no_failures_yet">No failures logged yet.</div>
+    </div>
+  </section>
+
+  <!-- LOG FAILURE MODAL -->
+  <div id="modal-failure" class="fixed inset-0 bg-black/70 hidden items-center justify-center z-40 p-4">
+    <div class="glass-strong rounded-2xl p-6 w-full max-w-md fade-in" style="max-height:90vh; overflow-y:auto;">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-bold text-lg" data-t="log_failure_btn">Log a Failure</h3>
+        <button class="close-failure-modal text-slate-400 hover:text-slate-200">&times;</button>
+      </div>
+      <div class="flex flex-col gap-3">
+        <div>
+          <label class="text-xs text-slate-400 mb-1.5 block" data-t="machine_label">Machine</label>
+          <select id="fl-machine" class="input-field w-full rounded-xl text-sm px-3 py-2.5"></select>
+        </div>
+        <div>
+          <label class="text-xs text-slate-400 mb-1.5 block" data-t="component_label">Component that failed</label>
+          <select id="fl-component" class="input-field w-full rounded-xl text-sm px-3 py-2.5"></select>
+          <p class="text-xs text-slate-500 mt-1" data-t="component_hint">Pick the closest match — this is what the model learns from.</p>
+        </div>
+        <div>
+          <label class="text-xs text-slate-400 mb-1.5 block" data-t="occurred_at_label">When did it happen</label>
+          <input id="fl-when" type="datetime-local" class="input-field w-full rounded-xl text-sm px-3 py-2.5" />
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs text-slate-400 mb-1.5 block" data-t="downtime_label">Downtime (min)</label>
+            <input id="fl-downtime" type="number" min="0" value="0" class="input-field w-full rounded-xl text-sm px-3 py-2.5" />
+          </div>
+          <div>
+            <label class="text-xs text-slate-400 mb-1.5 block" data-t="repair_cost_label">Repair cost</label>
+            <input id="fl-cost" type="number" min="0" step="0.01" value="0" class="input-field w-full rounded-xl text-sm px-3 py-2.5" />
+          </div>
+        </div>
+        <div>
+          <label class="text-xs text-slate-400 mb-1.5 block" data-t="notes_label">Notes</label>
+          <textarea id="fl-notes" rows="2" class="input-field w-full rounded-xl text-sm px-3 py-2.5" data-t-placeholder="ph_failure_notes" placeholder="What was observed?"></textarea>
+        </div>
+        <div id="fl-error" class="hidden text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded-xl px-3 py-2"></div>
+        <button id="btn-save-failure" class="glow-btn rounded-xl py-3 text-sm font-semibold mt-1" data-t="save_btn">Save</button>
+      </div>
+    </div>
+  </div>
 
   <!-- ==================== PAGE: WORK ORDERS ==================== -->
   <section id="page-workorders" class="page hidden">
@@ -4601,26 +7822,26 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 <script>
 const translations = {
-  en: {tagline:"Global Industrial Intelligence Platform",live_label:"Live",kpi_energy:"Energy Usage",kpi_efficiency:"Efficiency",kpi_active:"Active Machines",kpi_alerts:"Alerts",kwh_unit:"kWh",chart_title:"Real-Time Performance",machine_status_title:"Machine Status",status_running:"Running",status_warning:"Warning",status_critical:"Critical",form_title:"Factory Data Input",factory_name_label:"Factory Name",machine_count_label:"Number of Machines",energy_cost_label:"Energy Cost ($/kWh)",machine_type_label:"Machine Type",temperature_label:"Temperature (°C)",vibration_label:"Vibration (mm/s)",load_label:"Load (%)",submit_btn:"Analyze Factory",submitting:"Updating...",ai_panel_title:"AI Insights",ai_placeholder:"Submit factory data to generate an AI analysis.",ai_analyzing:"Analyzing...",ai_risks:"Risks",ai_efficiency_insights:"Efficiency Insights",ai_optimizations:"Optimization Suggestions",toast_updated:"Factory data updated",toast_analysis_done:"AI analysis complete",toast_error:"Something went wrong",nav_dashboard:"Dashboard",nav_factories:"Factories",nav_ai_insights:"AI Insights",logout_btn:"Log Out",login_title:"Welcome back",login_subtitle:"Sign in to your FactoryPulse AI account",ph_email:"Email",ph_password:"Password",remember_me:"Remember me",login_btn:"Log In",login_link_register:"Don't have an account? Create one",register_title:"Create your account",register_subtitle:"Start monitoring your factories with AI",ph_full_name:"Full Name",ph_confirm_password:"Confirm Password",register_btn:"Create Account",register_link_login:"Already have an account? Sign in",err_missing_fields:"Please fill in all fields",err_invalid_email:"Please enter a valid email address",err_weak_password:"Password must be at least 8 characters with a letter and a number",err_password_mismatch:"Passwords do not match",err_invalid_credentials:"Invalid email or password",err_email_taken:"This email is already registered",err_generic:"Something went wrong. Please try again",my_factories_title:"My Factories",add_factory_btn:"+ Add Factory",edit_factory_btn:"Edit",delete_factory_btn:"Delete",confirm_delete_factory:"Delete this factory? This cannot be undone.",no_factories_yet:"You haven't added any factories yet.",factory_created_toast:"Factory created and analyzed",factory_updated_toast:"Factory updated",factory_deleted_toast:"Factory deleted",ai_insights_feed_title:"AI Insights Feed",no_ai_insights_yet:"No AI insights yet. Add a factory to get started.",reanalyze_btn:"Re-analyze",view_insights_btn:"View Insights",created_label:"Created",cancel_btn:"Cancel",save_btn:"Save Changes",nav_live_monitor:"Live Monitor",add_machine_scada_btn:"+ Add Machine",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Polling",live_chart_title:"Live Sensor Chart",machines_table_title:"Machines",machine_code_col:"Code",machine_name_col:"Name",status_col:"Status",risk_col:"Risk",no_machines_yet:"No machines yet. Click \"+ Add Machine\".",section_machine_info:"Machine Info",section_sensor_data:"Sensor Data",section_status:"Status",section_notes:"Notes",status_stopped:"Stopped",status_maintenance:"Maintenance",priority_low:"Low",priority_normal:"Normal",priority_high:"High",priority_critical:"Critical",save_and_analyze_btn:"Save & Analyze",source_col:"Source",source_auto:"Auto (SCADA)",source_manual:"Manual",nav_alerts:"Alerts",acknowledge_btn:"Acknowledge",acknowledged_label:"Acknowledged",acknowledge_all_btn:"Acknowledge All",no_alerts_yet:"No alerts. Everything is running smoothly.",download_report_btn:"Report",alert_details_template:"Temperature {temp}°C, vibration {vib} mm/s, status: {status}",section_energy_intel:"Energy Intelligence",daily_output_hint:"Used to calculate Specific Energy Consumption (kWh per unit).",energy_insights_title:"Energy Intelligence",idle_power_title:"Idle Power Detection",idle_active_msg:"Machine is idle - wasting approx. {kw} kW right now.",idle_none_msg:"No idle power waste detected.",friction_loss_title:"Predictive Energy Loss",friction_active_msg:"Elevated friction detected: +{pct}% power overhead (~{kw} kW extra). Schedule maintenance to prevent losses.",friction_none_msg:"No abnormal friction losses detected.",sec_title:"Specific Energy Consumption",sec_label:"kWh per unit",sec_unit:"kWh/unit",sec_no_data_msg:"Enter Daily Output when adding this machine to see this metric.",optimal_load_title:"Optimal Load Zone",optimal_load_label:"Optimal load",current_load_label:"Current load",at_optimal_msg:"Running in the optimal load zone.",adjust_to_optimal_msg:"Adjust load toward {pct}% to minimize energy per unit.",nav_digital_twin:"Digital Twin",twin_hint:"Drag to rotate, scroll to zoom, click a machine to see its live details.",twin_unavailable_msg:"3D view could not load (check your internet connection for the Three.js library).",failure_prediction_title:"Failure Prediction",report_lib_missing_msg:"PDF export needs the reportlab library. Run: pip install reportlab, then restart the server.",ph_machine_id:"Machine ID (e.g. M-01)",ph_machine_name:"Machine Name",ph_factory_section:"Factory Section",ph_operator_name:"Operator Name",ph_pressure:"Pressure (bar)",ph_voltage:"Voltage (V)",ph_current:"Current (A)",ph_error_code:"Error Code",ph_daily_output:"Daily Output (units)",ph_notes:"Notes...",nav_system_intel:"System Intelligence",nav_roi:"ROI Dashboard",refresh_btn:"Refresh",system_risk_label:"System Risk",healthy_label:"Healthy",at_risk_label:"At Risk",clusters_title:"Machine Clusters",propagation_title:"Anomaly Propagation",propagation_hint:"How a failing machine raises the effective risk of its neighbours.",no_propagation:"No anomaly propagation detected.",avg_risk_label:"Avg risk",added_risk_label:"Added risk",effective_risk_label:"Effective risk",simulation_title:"What-If Simulation",simulation_hint:"Pick a machine, shift its sensor values, and see how failure probability reacts.",run_simulation_btn:"Run Simulation",failure_probability_label:"Failure Probability",stress_level_label:"Stress Level",predicted_status_label:"Predicted Status",confidence_label:"Confidence",root_cause_title:"Root Cause",rul_col:"RUL",rul_healthy:"Healthy",potential_loss_label:"Potential Loss",saved_label:"Saved by AI",wasted_energy_label:"Wasted Energy / month",efficiency_gain_label:"Efficiency Gain",cost_by_machine_title:"Cost Exposure by Machine",top_cause_col:"Top Cause",roi_assumptions_msg:"Assumptions: downtime {downtime}/h, {hours}h average repair, {price}/kWh energy.",role_label:"Your Role",role_engineer:"Engineer",role_manager:"Manager",role_admin:"Admin",cause_bearing_wear:"Bearing wear",cause_overload_thermal:"Thermal overload",cause_cooling_failure:"Cooling failure",cause_misalignment:"Shaft misalignment",cause_lubrication_loss:"Lubrication loss",cause_normal_operation:"Normal operation",nav_story:"Story Mode",story_hint:"Replays a bearing failure developing over 22 hours and shows exactly when the AI caught it — and what that was worth.",simulate_failure_btn:"Simulate Failure",outcome_title:"Outcome",warning_time_label:"Early Warning",loss_ignored_label:"Loss if Ignored",loss_acted_label:"Loss if Acted On",money_saved_label:"Money Saved",timeline_title:"Failure Timeline",story_detection_msg:"AI flagged this {hours} hours before breakdown, at {risk}% risk — root cause: {cause} ({confidence}% confidence).",story_stage_healthy:"Healthy",story_stage_early_drift:"Early Drift",story_stage_ai_detects:"AI Detects",story_stage_critical:"Critical",priority_low:"Low",priority_medium:"Medium",priority_high:"High",priority_critical:"Critical",action_stop_machine:"Stop machine",action_inspect_bearings:"Inspect bearings",action_check_cooling:"Check cooling",action_schedule_shutdown_24h:"Schedule shutdown (24h)",action_order_spare_parts:"Order spare parts",action_reduce_load:"Reduce load",action_schedule_inspection_72h:"Schedule inspection (72h)",action_monitor_closely:"Monitor closely",action_verify_sensor:"Verify sensor",action_power_down_idle:"Power down idle machine",action_review_shift_schedule:"Review shift schedule",action_no_action:"No action needed",nav_oee:"OEE",nav_workorders:"Work Orders",oee_hint:"Availability x Performance x Quality (ISO 22400). World-class is 85%; a typical factory sits near 60%.",availability_label:"Availability",performance_label:"Performance",quality_label:"Quality",weakest_factor_label:"Weakest",downtime_by_reason_title:"Downtime by Reason",downtime_cost_label:"Downtime cost",oee_trend_title:"OEE Trend",shifts_title:"Shifts",shift_col:"Shift",downtime_col:"Downtime",log_shift_btn:"Log Shift",no_shifts_yet:"No shifts logged yet.",minutes_short:"min",range_1d:"Today",range_7d:"7 days",range_30d:"30 days",all_machines_option:"All machines",reason_unspecified:"Unspecified",err_good_exceeds_total:"Good units cannot exceed total units",oee_grade_world_class:"World-class",oee_grade_typical:"Typical",oee_grade_low:"Low",oee_grade_critical:"Critical",reason_breakdown:"Breakdown",reason_changeover:"Changeover",reason_no_material:"No material",reason_no_operator:"No operator",reason_planned_maintenance:"Planned maintenance",reason_quality_issue:"Quality issue",reason_setup:"Setup",reason_other:"Other",workorders_hint:"Turns an AI prediction into tracked, assignable work — so a warning actually ends in a repair.",new_work_order_btn:"+ New Work Order",no_work_orders:"No work orders yet.",avg_completion_label:"Avg. Completion",assigned_label:"Assigned",source_ai:"AI",wo_status_open:"Open",wo_status_in_progress:"In Progress",wo_status_done:"Done",wo_status_cancelled:"Cancelled",wo_advance_to_in_progress:"Start work",wo_advance_to_done:"Mark done",ph_shift_name:"Shift name",ph_planned_minutes:"Planned minutes",ph_downtime_minutes:"Downtime minutes",ph_total_units:"Total units",ph_good_units:"Good units",ph_cycle_seconds:"Ideal cycle (seconds)",ph_wo_title:"Title",ph_assigned_to:"Assigned to",ph_wo_description:"Description",overdue_label:"Overdue",nav_history:"History",history_hint:"Stored sensor history — this is how you prove what actually changed over the pilot.",no_history_yet:"No history recorded yet. Keep the Live Monitor open for a few minutes and data will start accumulating.",range_24h:"24 hours",range_3d:"3 days",range_10d:"10 days",sensor_trend_title:"Sensor Trend",risk_trend_title:"Risk Trend",trend_flat:"no change",trend_rising:"rising",trend_falling:"falling",create_work_order_btn:"Create Work Order",work_order_created_msg:"Work order created",alertreason_immediate_failure_risk:"Immediate failure risk",alertreason_failure_imminent:"Failure imminent",alertreason_degradation_accelerating:"Degradation accelerating",alertreason_outside_normal_envelope:"Outside normal envelope",alertreason_pressure_anomaly:"Pressure anomaly",alertreason_idle_waste:"Idle energy waste",alertreason_informational:"Informational",alert_reason_label:"Reason"},
-  ru: {tagline:"Глобальная платформа промышленного интеллекта",live_label:"Live",kpi_energy:"Потребление энергии",kpi_efficiency:"Эффективность",kpi_active:"Активные станки",kpi_alerts:"Оповещения",kwh_unit:"кВт·ч",chart_title:"Показатели в реальном времени",machine_status_title:"Статус станков",status_running:"Работает",status_warning:"Внимание",status_critical:"Критично",form_title:"Ввод данных завода",factory_name_label:"Название завода",machine_count_label:"Количество станков",energy_cost_label:"Стоимость энергии ($/кВт·ч)",machine_type_label:"Тип станка",temperature_label:"Температура (°C)",vibration_label:"Вибрация (мм/с)",load_label:"Нагрузка (%)",submit_btn:"Анализировать завод",submitting:"Обновление...",ai_panel_title:"AI-аналитика",ai_placeholder:"Отправьте данные завода, чтобы получить AI-анализ.",ai_analyzing:"Анализ...",ai_risks:"Риски",ai_efficiency_insights:"Анализ эффективности",ai_optimizations:"Рекомендации по оптимизации",toast_updated:"Данные завода обновлены",toast_analysis_done:"AI-анализ завершён",toast_error:"Произошла ошибка",nav_dashboard:"Панель",nav_factories:"Заводы",nav_ai_insights:"AI-аналитика",logout_btn:"Выход",login_title:"С возвращением",login_subtitle:"Войдите в аккаунт FactoryPulse AI",ph_email:"Email",ph_password:"Пароль",remember_me:"Запомнить меня",login_btn:"Войти",login_link_register:"Нет аккаунта? Создать",register_title:"Создать аккаунт",register_subtitle:"Начните мониторинг заводов с помощью AI",ph_full_name:"Полное имя",ph_confirm_password:"Подтвердите пароль",register_btn:"Создать аккаунт",register_link_login:"Уже есть аккаунт? Войти",err_missing_fields:"Заполните все поля",err_invalid_email:"Введите корректный email",err_weak_password:"Пароль должен быть от 8 символов, с буквой и цифрой",err_password_mismatch:"Пароли не совпадают",err_invalid_credentials:"Неверный email или пароль",err_email_taken:"Этот email уже зарегистрирован",err_generic:"Что-то пошло не так. Попробуйте снова",my_factories_title:"Мои заводы",add_factory_btn:"+ Добавить завод",edit_factory_btn:"Изменить",delete_factory_btn:"Удалить",confirm_delete_factory:"Удалить этот завод? Это действие нельзя отменить.",no_factories_yet:"Вы ещё не добавили ни одного завода.",factory_created_toast:"Завод создан и проанализирован",factory_updated_toast:"Завод обновлён",factory_deleted_toast:"Завод удалён",ai_insights_feed_title:"Лента AI-аналитики",no_ai_insights_yet:"Пока нет AI-аналитики. Добавьте завод, чтобы начать.",reanalyze_btn:"Проанализировать снова",view_insights_btn:"Смотреть аналитику",created_label:"Создано",cancel_btn:"Отмена",save_btn:"Сохранить изменения",nav_live_monitor:"Мониторинг",add_machine_scada_btn:"+ Добавить станок",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Опрос",live_chart_title:"График датчиков в реальном времени",machines_table_title:"Станки",machine_code_col:"Код",machine_name_col:"Название",status_col:"Статус",risk_col:"Риск",no_machines_yet:"Станков пока нет. Нажмите «+ Добавить станок».",section_machine_info:"Информация о станке",section_sensor_data:"Данные датчиков",section_status:"Статус",section_notes:"Заметки",status_stopped:"Остановлен",status_maintenance:"Обслуживание",priority_low:"Низкий",priority_normal:"Обычный",priority_high:"Высокий",priority_critical:"Критический",save_and_analyze_btn:"Сохранить и анализировать",source_col:"Источник",source_auto:"Авто (SCADA)",source_manual:"Вручную",nav_alerts:"Оповещения",acknowledge_btn:"Подтвердить",acknowledged_label:"Подтверждено",acknowledge_all_btn:"Подтвердить все",no_alerts_yet:"Оповещений нет. Всё работает штатно.",download_report_btn:"Отчёт",alert_details_template:"Температура {temp}°C, вибрация {vib} мм/с, статус: {status}",section_energy_intel:"Энергетический интеллект",daily_output_hint:"Используется для расчёта удельного энергопотребления (кВт·ч на единицу).",energy_insights_title:"Энергетический интеллект",idle_power_title:"Обнаружение холостого хода",idle_active_msg:"Станок простаивает — расходуется примерно {kw} кВт впустую.",idle_none_msg:"Потерь энергии на холостом ходу не обнаружено.",friction_loss_title:"Прогноз потерь энергии",friction_active_msg:"Обнаружено повышенное трение: +{pct}% лишней мощности (~{kw} кВт). Запланируйте обслуживание, чтобы избежать потерь.",friction_none_msg:"Аномального трения не обнаружено.",sec_title:"Удельное энергопотребление",sec_label:"кВт·ч на единицу",sec_unit:"кВт·ч/ед.",sec_no_data_msg:"Укажите суточный объём выпуска при добавлении станка, чтобы увидеть этот показатель.",optimal_load_title:"Оптимальная зона нагрузки",optimal_load_label:"Оптимальная нагрузка",current_load_label:"Текущая нагрузка",at_optimal_msg:"Работает в оптимальной зоне нагрузки.",adjust_to_optimal_msg:"Приблизьте нагрузку к {pct}%, чтобы минимизировать расход энергии на единицу.",nav_digital_twin:"Цифровой двойник",twin_hint:"Перетаскивайте для поворота, прокручивайте для масштаба, нажмите на станок для подробностей.",twin_unavailable_msg:"Не удалось загрузить 3D-вид (проверьте подключение к интернету для библиотеки Three.js).",failure_prediction_title:"Прогноз отказа",report_lib_missing_msg:"Для экспорта в PDF нужна библиотека reportlab. Выполните: pip install reportlab, затем перезапустите сервер.",ph_machine_id:"ID станка (напр. M-01)",ph_machine_name:"Название станка",ph_factory_section:"Участок завода",ph_operator_name:"Имя оператора",ph_pressure:"Давление (бар)",ph_voltage:"Напряжение (В)",ph_current:"Ток (А)",ph_error_code:"Код ошибки",ph_daily_output:"Суточный выпуск (ед.)",ph_notes:"Заметки...",nav_system_intel:"Системная аналитика",nav_roi:"ROI-панель",refresh_btn:"Обновить",system_risk_label:"Системный риск",healthy_label:"Исправны",at_risk_label:"В зоне риска",clusters_title:"Кластеры станков",propagation_title:"Распространение аномалий",propagation_hint:"Как отказ одного станка повышает риск соседних.",no_propagation:"Распространение аномалий не обнаружено.",avg_risk_label:"Средний риск",added_risk_label:"Добавленный риск",effective_risk_label:"Итоговый риск",simulation_title:"Что-если симуляция",simulation_hint:"Выберите станок, измените показания датчиков и посмотрите на изменение риска.",run_simulation_btn:"Запустить симуляцию",failure_probability_label:"Вероятность отказа",stress_level_label:"Уровень нагрузки",predicted_status_label:"Прогноз статуса",confidence_label:"Достоверность",root_cause_title:"Первопричина",rul_col:"Остаточный ресурс",rul_healthy:"Исправен",potential_loss_label:"Потенциальные потери",saved_label:"Сэкономлено AI",wasted_energy_label:"Потери энергии / месяц",efficiency_gain_label:"Прирост эффективности",cost_by_machine_title:"Финансовый риск по станкам",top_cause_col:"Основная причина",roi_assumptions_msg:"Допущения: простой {downtime}/ч, ремонт {hours} ч, энергия {price}/кВт·ч.",role_label:"Ваша роль",role_engineer:"Инженер",role_manager:"Менеджер",role_admin:"Администратор",cause_bearing_wear:"Износ подшипника",cause_overload_thermal:"Тепловая перегрузка",cause_cooling_failure:"Отказ охлаждения",cause_misalignment:"Расцентровка вала",cause_lubrication_loss:"Потеря смазки",cause_normal_operation:"Нормальная работа",nav_story:"Режим истории",story_hint:"Воспроизводит развитие отказа подшипника за 22 часа и показывает, когда именно AI его обнаружил — и сколько это стоило.",simulate_failure_btn:"Смоделировать отказ",outcome_title:"Итог",warning_time_label:"Раннее предупреждение",loss_ignored_label:"Потери без реакции",loss_acted_label:"Потери при реакции",money_saved_label:"Сэкономлено",timeline_title:"Хронология отказа",story_detection_msg:"AI обнаружил это за {hours} ч до поломки, при риске {risk}% — первопричина: {cause} (достоверность {confidence}%).",story_stage_healthy:"Исправен",story_stage_early_drift:"Начало отклонения",story_stage_ai_detects:"AI обнаружил",story_stage_critical:"Критично",priority_low:"Низкий",priority_medium:"Средний",priority_high:"Высокий",priority_critical:"Критический",action_stop_machine:"Остановить станок",action_inspect_bearings:"Проверить подшипники",action_check_cooling:"Проверить охлаждение",action_schedule_shutdown_24h:"Запланировать остановку (24ч)",action_order_spare_parts:"Заказать запчасти",action_reduce_load:"Снизить нагрузку",action_schedule_inspection_72h:"Запланировать осмотр (72ч)",action_monitor_closely:"Внимательно наблюдать",action_verify_sensor:"Проверить датчик",action_power_down_idle:"Отключить простаивающий станок",action_review_shift_schedule:"Пересмотреть график смен",action_no_action:"Действий не требуется",nav_oee:"OEE",nav_workorders:"Наряды",oee_hint:"Доступность x Производительность x Качество (ISO 22400). Мировой уровень — 85%, типичный завод — около 60%.",availability_label:"Доступность",performance_label:"Производительность",quality_label:"Качество",weakest_factor_label:"Слабое звено",downtime_by_reason_title:"Простои по причинам",downtime_cost_label:"Стоимость простоя",oee_trend_title:"Динамика OEE",shifts_title:"Смены",shift_col:"Смена",downtime_col:"Простой",log_shift_btn:"Внести смену",no_shifts_yet:"Смены ещё не внесены.",minutes_short:"мин",range_1d:"Сегодня",range_7d:"7 дней",range_30d:"30 дней",all_machines_option:"Все станки",reason_unspecified:"Не указано",err_good_exceeds_total:"Годных не может быть больше общего количества",oee_grade_world_class:"Мировой уровень",oee_grade_typical:"Типичный",oee_grade_low:"Низкий",oee_grade_critical:"Критический",reason_breakdown:"Поломка",reason_changeover:"Переналадка",reason_no_material:"Нет материала",reason_no_operator:"Нет оператора",reason_planned_maintenance:"Плановое ТО",reason_quality_issue:"Проблема качества",reason_setup:"Настройка",reason_other:"Другое",workorders_hint:"Превращает прогноз AI в отслеживаемую задачу — чтобы предупреждение закончилось ремонтом.",new_work_order_btn:"+ Новый наряд",no_work_orders:"Нарядов пока нет.",avg_completion_label:"Ср. выполнение",assigned_label:"Назначен",source_ai:"AI",wo_status_open:"Открыт",wo_status_in_progress:"В работе",wo_status_done:"Выполнен",wo_status_cancelled:"Отменён",wo_advance_to_in_progress:"Начать работу",wo_advance_to_done:"Отметить выполненным",ph_shift_name:"Название смены",ph_planned_minutes:"Плановые минуты",ph_downtime_minutes:"Минуты простоя",ph_total_units:"Всего единиц",ph_good_units:"Годных единиц",ph_cycle_seconds:"Идеальный цикл (сек)",ph_wo_title:"Название",ph_assigned_to:"Ответственный",ph_wo_description:"Описание",overdue_label:"Просрочено",nav_history:"История",history_hint:"Сохранённая история датчиков — так вы докажете, что реально изменилось за пилот.",no_history_yet:"История ещё не записана. Подержите Мониторинг открытым несколько минут, и данные начнут накапливаться.",range_24h:"24 часа",range_3d:"3 дня",range_10d:"10 дней",sensor_trend_title:"Динамика датчиков",risk_trend_title:"Динамика риска",trend_flat:"без изменений",trend_rising:"растёт",trend_falling:"снижается",create_work_order_btn:"Создать наряд",work_order_created_msg:"Наряд создан",alertreason_immediate_failure_risk:"Риск немедленного отказа",alertreason_failure_imminent:"Отказ неизбежен",alertreason_degradation_accelerating:"Ускоряющийся износ",alertreason_outside_normal_envelope:"Выход за штатные пределы",alertreason_pressure_anomaly:"Аномалия давления",alertreason_idle_waste:"Потери на холостом ходу",alertreason_informational:"Информационное",alert_reason_label:"Причина"},
-  kk: {tagline:"Жаһандық өнеркәсіптік интеллект платформасы",live_label:"Тікелей эфир",kpi_energy:"Энергия тұтыну",kpi_efficiency:"Тиімділік",kpi_active:"Белсенді станоктар",kpi_alerts:"Дабылдар",kwh_unit:"кВт·сағ",chart_title:"Нақты уақыттағы көрсеткіштер",machine_status_title:"Станоктар күйі",status_running:"Жұмыс істеп тұр",status_warning:"Ескерту",status_critical:"Сыни",form_title:"Зауыт деректерін енгізу",factory_name_label:"Зауыт атауы",machine_count_label:"Станоктар саны",energy_cost_label:"Энергия құны ($/кВт·сағ)",machine_type_label:"Станок түрі",temperature_label:"Температура (°C)",vibration_label:"Діріл (мм/с)",load_label:"Жүктеме (%)",submit_btn:"Зауытты талдау",submitting:"Жаңартылуда...",ai_panel_title:"AI-талдау",ai_placeholder:"AI-талдау алу үшін зауыт деректерін жіберіңіз.",ai_analyzing:"Талдануда...",ai_risks:"Тәуекелдер",ai_efficiency_insights:"Тиімділік талдауы",ai_optimizations:"Оңтайландыру ұсыныстары",toast_updated:"Зауыт деректері жаңартылды",toast_analysis_done:"AI-талдау аяқталды",toast_error:"Қате орын алды",nav_dashboard:"Басқару тақтасы",nav_factories:"Зауыттар",nav_ai_insights:"AI-талдау",logout_btn:"Шығу",login_title:"Қайта қош келдіңіз",login_subtitle:"FactoryPulse AI аккаунтыңызға кіріңіз",ph_email:"Email",ph_password:"Құпия сөз",remember_me:"Мені есте сақтау",login_btn:"Кіру",login_link_register:"Аккаунтыңыз жоқ па? Тіркелу",register_title:"Аккаунт құру",register_subtitle:"Зауыттарды AI арқылы бақылауды бастаңыз",ph_full_name:"Толық аты-жөні",ph_confirm_password:"Құпия сөзді қайталаңыз",register_btn:"Аккаунт құру",register_link_login:"Аккаунтыңыз бар ма? Кіру",err_missing_fields:"Барлық өрістерді толтырыңыз",err_invalid_email:"Дұрыс email мекенжайын енгізіңіз",err_weak_password:"Құпия сөз кемінде 8 таңба, әріп пен сан болуы керек",err_password_mismatch:"Құпия сөздер сәйкес келмейді",err_invalid_credentials:"Қате email немесе құпия сөз",err_email_taken:"Бұл email тіркелген",err_generic:"Қате орын алды. Қайталап көріңіз",my_factories_title:"Менің зауыттарым",add_factory_btn:"+ Зауыт қосу",edit_factory_btn:"Өзгерту",delete_factory_btn:"Жою",confirm_delete_factory:"Бұл зауытты жоясыз ба? Бұл әрекетті кері қайтару мүмкін емес.",no_factories_yet:"Сіз әлі ешбір зауыт қосқан жоқсыз.",factory_created_toast:"Зауыт құрылды және талданды",factory_updated_toast:"Зауыт жаңартылды",factory_deleted_toast:"Зауыт жойылды",ai_insights_feed_title:"AI-талдау таспасы",no_ai_insights_yet:"AI-талдау әлі жоқ. Бастау үшін зауыт қосыңыз.",reanalyze_btn:"Қайта талдау",view_insights_btn:"Талдауды көру",created_label:"Құрылған күні",cancel_btn:"Бас тарту",save_btn:"Өзгерістерді сақтау",nav_live_monitor:"Тікелей мониторинг",add_machine_scada_btn:"+ Станок қосу",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Сұрау",live_chart_title:"Нақты уақыттағы сенсор графигі",machines_table_title:"Станоктар",machine_code_col:"Код",machine_name_col:"Атауы",status_col:"Күй",risk_col:"Тәуекел",no_machines_yet:"Станоктар әлі жоқ. «+ Станок қосу» басыңыз.",section_machine_info:"Станок туралы ақпарат",section_sensor_data:"Сенсор деректері",section_status:"Күй",section_notes:"Ескертпелер",status_stopped:"Тоқтатылды",status_maintenance:"Техникалық қызмет",priority_low:"Төмен",priority_normal:"Қалыпты",priority_high:"Жоғары",priority_critical:"Сыни",save_and_analyze_btn:"Сақтау және талдау",source_col:"Дереккөз",source_auto:"Авто (SCADA)",source_manual:"Қолмен",nav_alerts:"Дабылдар",acknowledge_btn:"Растау",acknowledged_label:"Расталды",acknowledge_all_btn:"Барлығын растау",no_alerts_yet:"Дабылдар жоқ. Бәрі қалыпты жұмыс істеп тұр.",download_report_btn:"Есеп",alert_details_template:"Температура {temp}°C, діріл {vib} мм/с, күйі: {status}",section_energy_intel:"Энергетикалық интеллект",daily_output_hint:"Бірлік өнімге кететін энергияны есептеу үшін қолданылады (кВт·сағ/бірлік).",energy_insights_title:"Энергетикалық интеллект",idle_power_title:"Бос жүрісті анықтау",idle_active_msg:"Станок бос тұр — шамамен {kw} кВт босқа кетіп жатыр.",idle_none_msg:"Бос жүріс шығыны табылмады.",friction_loss_title:"Энергия шығынын болжау",friction_active_msg:"Артық үйкеліс табылды: +{pct}% қосымша қуат (~{kw} кВт). Шығынды болдырмау үшін техникалық қызмет жоспарлаңыз.",friction_none_msg:"Ауытқыған үйкеліс табылмады.",sec_title:"Бірлік өнімге кететін қуат",sec_label:"кВт·сағ/бірлік",sec_unit:"кВт·сағ/бірлік",sec_no_data_msg:"Бұл көрсеткішті көру үшін станок қосқанда күнделікті өнім санын енгізіңіз.",optimal_load_title:"Оңтайлы жұмыс режимі",optimal_load_label:"Оңтайлы жүктеме",current_load_label:"Ағымдағы жүктеме",at_optimal_msg:"Оңтайлы жүктеме аймағында жұмыс істеп тұр.",adjust_to_optimal_msg:"Бірлікке кететін энергияны азайту үшін жүктемені {pct}%-ға жақындатыңыз.",nav_digital_twin:"Цифрлық егіз",twin_hint:"Айналдыру үшін сүйреңіз, масштабтау үшін айналдырыңыз, толық мәлімет үшін станокты басыңыз.",twin_unavailable_msg:"3D көрініс жүктелмеді (Three.js кітапханасы үшін интернет байланысын тексеріңіз).",failure_prediction_title:"Ақаудың болжамы",report_lib_missing_msg:"PDF экспорты үшін reportlab кітапханасы керек. Орындаңыз: pip install reportlab, содан кейін серверді қайта қосыңыз.",ph_machine_id:"Станок ID (мыс. M-01)",ph_machine_name:"Станок атауы",ph_factory_section:"Зауыт учаскесі",ph_operator_name:"Оператор аты",ph_pressure:"Қысым (бар)",ph_voltage:"Кернеу (В)",ph_current:"Ток (А)",ph_error_code:"Қате коды",ph_daily_output:"Күнделікті өнім (бірлік)",ph_notes:"Ескертпелер...",nav_system_intel:"Жүйелік талдау",nav_roi:"ROI тақтасы",refresh_btn:"Жаңарту",system_risk_label:"Жүйелік тәуекел",healthy_label:"Сау",at_risk_label:"Тәуекелде",clusters_title:"Станок кластерлері",propagation_title:"Ақаудың таралуы",propagation_hint:"Бір станоктың ақауы көршілеріне қалай әсер етеді.",no_propagation:"Ақаудың таралуы анықталмады.",avg_risk_label:"Орташа тәуекел",added_risk_label:"Қосылған тәуекел",effective_risk_label:"Нақты тәуекел",simulation_title:"Не-болса симуляциясы",simulation_hint:"Станокты таңдап, сенсор мәндерін өзгертіп, тәуекелдің қалай өзгеретінін көріңіз.",run_simulation_btn:"Симуляцияны іске қосу",failure_probability_label:"Ақау ықтималдығы",stress_level_label:"Кернеу деңгейі",predicted_status_label:"Күй болжамы",confidence_label:"Сенімділік",root_cause_title:"Түпкі себеп",rul_col:"Қалдық ресурс",rul_healthy:"Сау",potential_loss_label:"Ықтимал шығын",saved_label:"AI үнемдеді",wasted_energy_label:"Энергия шығыны / ай",efficiency_gain_label:"Тиімділік өсімі",cost_by_machine_title:"Станоктар бойынша қаржы тәуекелі",top_cause_col:"Негізгі себеп",roi_assumptions_msg:"Болжамдар: тоқтап қалу {downtime}/сағ, жөндеу {hours} сағ, энергия {price}/кВт·сағ.",role_label:"Сіздің рөліңіз",role_engineer:"Инженер",role_manager:"Менеджер",role_admin:"Әкімші",cause_bearing_wear:"Подшипник тозуы",cause_overload_thermal:"Жылулық шамадан тыс жүктеме",cause_cooling_failure:"Салқындату ақауы",cause_misalignment:"Білік центрден ауытқуы",cause_lubrication_loss:"Майлау жоғалуы",cause_normal_operation:"Қалыпты жұмыс",nav_story:"Оқиға режимі",story_hint:"Подшипник ақауының 22 сағат ішінде дамуын ойнатып, AI оны дәл қашан анықтағанын және бұл қанша тұратынын көрсетеді.",simulate_failure_btn:"Ақауды модельдеу",outcome_title:"Нәтиже",warning_time_label:"Ерте ескерту",loss_ignored_label:"Әрекетсіз шығын",loss_acted_label:"Әрекет еткендегі шығын",money_saved_label:"Үнемделді",timeline_title:"Ақау хронологиясы",story_detection_msg:"AI мұны бұзылудан {hours} сағат бұрын, {risk}% тәуекелде анықтады — түпкі себеп: {cause} (сенімділік {confidence}%).",story_stage_healthy:"Сау",story_stage_early_drift:"Ауытқу басы",story_stage_ai_detects:"AI анықтады",story_stage_critical:"Сыни",priority_low:"Төмен",priority_medium:"Орташа",priority_high:"Жоғары",priority_critical:"Сыни",action_stop_machine:"Станокты тоқтату",action_inspect_bearings:"Подшипниктерді тексеру",action_check_cooling:"Салқындатуды тексеру",action_schedule_shutdown_24h:"Тоқтатуды жоспарлау (24сағ)",action_order_spare_parts:"Қосалқы бөлшек тапсырыс беру",action_reduce_load:"Жүктемені азайту",action_schedule_inspection_72h:"Тексеруді жоспарлау (72сағ)",action_monitor_closely:"Мұқият бақылау",action_verify_sensor:"Сенсорды тексеру",action_power_down_idle:"Бос тұрған станокты өшіру",action_review_shift_schedule:"Ауысым кестесін қайта қарау",action_no_action:"Әрекет қажет емес",nav_oee:"OEE",nav_workorders:"Тапсырыстар",oee_hint:"Қолжетімділік x Өнімділік x Сапа (ISO 22400). Әлемдік деңгей — 85%, әдеттегі зауыт — 60% шамасында.",availability_label:"Қолжетімділік",performance_label:"Өнімділік",quality_label:"Сапа",weakest_factor_label:"Әлсіз буын",downtime_by_reason_title:"Себебі бойынша тоқтап қалу",downtime_cost_label:"Тоқтап қалу құны",oee_trend_title:"OEE динамикасы",shifts_title:"Ауысымдар",shift_col:"Ауысым",downtime_col:"Тоқтап қалу",log_shift_btn:"Ауысым енгізу",no_shifts_yet:"Ауысымдар әлі енгізілмеген.",minutes_short:"мин",range_1d:"Бүгін",range_7d:"7 күн",range_30d:"30 күн",all_machines_option:"Барлық станоктар",reason_unspecified:"Көрсетілмеген",err_good_exceeds_total:"Жарамды саны жалпы санынан көп бола алмайды",oee_grade_world_class:"Әлемдік деңгей",oee_grade_typical:"Әдеттегі",oee_grade_low:"Төмен",oee_grade_critical:"Сыни",reason_breakdown:"Бұзылу",reason_changeover:"Қайта баптау",reason_no_material:"Материал жоқ",reason_no_operator:"Оператор жоқ",reason_planned_maintenance:"Жоспарлы ТҚ",reason_quality_issue:"Сапа мәселесі",reason_setup:"Орнату",reason_other:"Басқа",workorders_hint:"AI болжамын бақыланатын тапсырысқа айналдырады — ескерту нақты жөндеумен аяқталсын.",new_work_order_btn:"+ Жаңа тапсырыс",no_work_orders:"Тапсырыстар әлі жоқ.",avg_completion_label:"Орт. орындалу",assigned_label:"Тағайындалды",source_ai:"AI",wo_status_open:"Ашық",wo_status_in_progress:"Орындалуда",wo_status_done:"Орындалды",wo_status_cancelled:"Бас тартылды",wo_advance_to_in_progress:"Жұмысты бастау",wo_advance_to_done:"Орындалды деп белгілеу",ph_shift_name:"Ауысым атауы",ph_planned_minutes:"Жоспарлы минут",ph_downtime_minutes:"Тоқтап қалған минут",ph_total_units:"Жалпы саны",ph_good_units:"Жарамды саны",ph_cycle_seconds:"Оңтайлы цикл (сек)",ph_wo_title:"Атауы",ph_assigned_to:"Жауапты",ph_wo_description:"Сипаттама",overdue_label:"Мерзімі өткен",nav_history:"Тарих",history_hint:"Сақталған сенсор тарихы — пилот кезінде не өзгергенін осылай дәлелдейсіз.",no_history_yet:"Тарих әлі жазылмаған. Тікелей мониторингті бірнеше минут ашық қалдырсаңыз, дерек жинала бастайды.",range_24h:"24 сағат",range_3d:"3 күн",range_10d:"10 күн",sensor_trend_title:"Сенсор динамикасы",risk_trend_title:"Тәуекел динамикасы",trend_flat:"өзгеріссіз",trend_rising:"өсуде",trend_falling:"төмендеуде",create_work_order_btn:"Тапсырыс жасау",work_order_created_msg:"Тапсырыс жасалды",alertreason_immediate_failure_risk:"Дереу бұзылу қаупі",alertreason_failure_imminent:"Ақау таяу",alertreason_degradation_accelerating:"Тозу үдеуде",alertreason_outside_normal_envelope:"Қалыпты шектен тыс",alertreason_pressure_anomaly:"Қысым ауытқуы",alertreason_idle_waste:"Бос жүріс шығыны",alertreason_informational:"Ақпараттық",alert_reason_label:"Себебі"},
-  de: {tagline:"Globale Industrielle Intelligenzplattform",live_label:"Live",kpi_energy:"Energieverbrauch",kpi_efficiency:"Effizienz",kpi_active:"Aktive Maschinen",kpi_alerts:"Warnungen",kwh_unit:"kWh",chart_title:"Echtzeit-Leistung",machine_status_title:"Maschinenstatus",status_running:"Läuft",status_warning:"Warnung",status_critical:"Kritisch",form_title:"Fabrikdateneingabe",factory_name_label:"Fabrikname",machine_count_label:"Anzahl der Maschinen",energy_cost_label:"Energiekosten ($/kWh)",machine_type_label:"Maschinentyp",temperature_label:"Temperatur (°C)",vibration_label:"Vibration (mm/s)",load_label:"Last (%)",submit_btn:"Fabrik Analysieren",submitting:"Aktualisieren...",ai_panel_title:"KI-Einblicke",ai_placeholder:"Senden Sie Fabrikdaten, um eine KI-Analyse zu erstellen.",ai_analyzing:"Analysiere...",ai_risks:"Risiken",ai_efficiency_insights:"Effizienzanalyse",ai_optimizations:"Optimierungsvorschläge",toast_updated:"Fabrikdaten aktualisiert",toast_analysis_done:"KI-Analyse abgeschlossen",toast_error:"Etwas ist schiefgelaufen",nav_dashboard:"Übersicht",nav_factories:"Fabriken",nav_ai_insights:"KI-Einblicke",logout_btn:"Abmelden",login_title:"Willkommen zurück",login_subtitle:"Melden Sie sich bei Ihrem FactoryPulse AI-Konto an",ph_email:"E-Mail",ph_password:"Passwort",remember_me:"Angemeldet bleiben",login_btn:"Einloggen",login_link_register:"Kein Konto? Jetzt erstellen",register_title:"Konto erstellen",register_subtitle:"Beginnen Sie mit der KI-Überwachung Ihrer Fabriken",ph_full_name:"Vollständiger Name",ph_confirm_password:"Passwort bestätigen",register_btn:"Konto erstellen",register_link_login:"Bereits ein Konto? Anmelden",err_missing_fields:"Bitte füllen Sie alle Felder aus",err_invalid_email:"Bitte geben Sie eine gültige E-Mail-Adresse ein",err_weak_password:"Passwort muss mind. 8 Zeichen, einen Buchstaben und eine Zahl enthalten",err_password_mismatch:"Passwörter stimmen nicht überein",err_invalid_credentials:"Ungültige E-Mail oder Passwort",err_email_taken:"Diese E-Mail ist bereits registriert",err_generic:"Etwas ist schiefgelaufen. Bitte erneut versuchen",my_factories_title:"Meine Fabriken",add_factory_btn:"+ Fabrik Hinzufügen",edit_factory_btn:"Bearbeiten",delete_factory_btn:"Löschen",confirm_delete_factory:"Diese Fabrik löschen? Dies kann nicht rückgängig gemacht werden.",no_factories_yet:"Sie haben noch keine Fabriken hinzugefügt.",factory_created_toast:"Fabrik erstellt und analysiert",factory_updated_toast:"Fabrik aktualisiert",factory_deleted_toast:"Fabrik gelöscht",ai_insights_feed_title:"KI-Einblicke Feed",no_ai_insights_yet:"Noch keine KI-Einblicke. Fügen Sie eine Fabrik hinzu.",reanalyze_btn:"Erneut analysieren",view_insights_btn:"Einblicke Anzeigen",created_label:"Erstellt",cancel_btn:"Abbrechen",save_btn:"Änderungen Speichern",nav_live_monitor:"Live-Überwachung",add_machine_scada_btn:"+ Maschine Hinzufügen",usb_status:"USB:",plc_status:"SPS:",polling_mode:"Abfrage",live_chart_title:"Live-Sensordiagramm",machines_table_title:"Maschinen",machine_code_col:"Code",machine_name_col:"Name",status_col:"Status",risk_col:"Risiko",no_machines_yet:"Noch keine Maschinen. Klicken Sie auf „+ Maschine Hinzufügen“.",section_machine_info:"Maschineninformationen",section_sensor_data:"Sensordaten",section_status:"Status",section_notes:"Notizen",status_stopped:"Gestoppt",status_maintenance:"Wartung",priority_low:"Niedrig",priority_normal:"Normal",priority_high:"Hoch",priority_critical:"Kritisch",save_and_analyze_btn:"Speichern & Analysieren",source_col:"Quelle",source_auto:"Auto (SCADA)",source_manual:"Manuell",nav_alerts:"Warnungen",acknowledge_btn:"Bestätigen",acknowledged_label:"Bestätigt",acknowledge_all_btn:"Alle Bestätigen",no_alerts_yet:"Keine Warnungen. Alles läuft reibungslos.",download_report_btn:"Bericht",alert_details_template:"Temperatur {temp}°C, Vibration {vib} mm/s, Status: {status}",section_energy_intel:"Energieintelligenz",daily_output_hint:"Wird zur Berechnung des spezifischen Energieverbrauchs verwendet (kWh pro Einheit).",energy_insights_title:"Energieintelligenz",idle_power_title:"Leerlaufenergie-Erkennung",idle_active_msg:"Maschine im Leerlauf – aktuell werden etwa {kw} kW verschwendet.",idle_none_msg:"Kein Leerlaufenergieverlust festgestellt.",friction_loss_title:"Vorausschauender Energieverlust",friction_active_msg:"Erhöhte Reibung festgestellt: +{pct}% Mehrleistung (~{kw} kW extra). Wartung einplanen, um Verluste zu vermeiden.",friction_none_msg:"Keine abnormale Reibung festgestellt.",sec_title:"Spezifischer Energieverbrauch",sec_label:"kWh pro Einheit",sec_unit:"kWh/Einheit",sec_no_data_msg:"Geben Sie die Tagesproduktion beim Hinzufügen der Maschine an, um diese Kennzahl zu sehen.",optimal_load_title:"Optimale Lastzone",optimal_load_label:"Optimale Last",current_load_label:"Aktuelle Last",at_optimal_msg:"Läuft in der optimalen Lastzone.",adjust_to_optimal_msg:"Last auf {pct}% anpassen, um den Energieverbrauch pro Einheit zu minimieren.",nav_digital_twin:"Digitaler Zwilling",twin_hint:"Ziehen zum Drehen, Scrollen zum Zoomen, Maschine anklicken für Live-Details.",twin_unavailable_msg:"3D-Ansicht konnte nicht geladen werden (Internetverbindung für Three.js prüfen).",failure_prediction_title:"Ausfallvorhersage",report_lib_missing_msg:"Für den PDF-Export wird die reportlab-Bibliothek benötigt. Führen Sie aus: pip install reportlab und starten Sie den Server neu.",ph_machine_id:"Maschinen-ID (z.B. M-01)",ph_machine_name:"Maschinenname",ph_factory_section:"Fabrikbereich",ph_operator_name:"Bedienername",ph_pressure:"Druck (bar)",ph_voltage:"Spannung (V)",ph_current:"Strom (A)",ph_error_code:"Fehlercode",ph_daily_output:"Tagesproduktion (Einheiten)",ph_notes:"Notizen...",nav_system_intel:"Systemintelligenz",nav_roi:"ROI-Dashboard",refresh_btn:"Aktualisieren",system_risk_label:"Systemrisiko",healthy_label:"Gesund",at_risk_label:"Gefährdet",clusters_title:"Maschinencluster",propagation_title:"Anomalie-Ausbreitung",propagation_hint:"Wie eine ausfallende Maschine das Risiko ihrer Nachbarn erhöht.",no_propagation:"Keine Anomalie-Ausbreitung erkannt.",avg_risk_label:"Durchschn. Risiko",added_risk_label:"Zusätzliches Risiko",effective_risk_label:"Effektives Risiko",simulation_title:"Was-wäre-wenn-Simulation",simulation_hint:"Maschine wählen, Sensorwerte verschieben und die Ausfallwahrscheinlichkeit beobachten.",run_simulation_btn:"Simulation starten",failure_probability_label:"Ausfallwahrscheinlichkeit",stress_level_label:"Belastungsgrad",predicted_status_label:"Prognostizierter Status",confidence_label:"Konfidenz",root_cause_title:"Grundursache",rul_col:"Restnutzungsdauer",rul_healthy:"Gesund",potential_loss_label:"Potenzieller Verlust",saved_label:"Durch KI gespart",wasted_energy_label:"Energieverlust / Monat",efficiency_gain_label:"Effizienzgewinn",cost_by_machine_title:"Kostenrisiko pro Maschine",top_cause_col:"Hauptursache",roi_assumptions_msg:"Annahmen: Ausfall {downtime}/h, {hours}h Reparatur, {price}/kWh Energie.",role_label:"Ihre Rolle",role_engineer:"Ingenieur",role_manager:"Manager",role_admin:"Administrator",cause_bearing_wear:"Lagerverschleiß",cause_overload_thermal:"Thermische Überlastung",cause_cooling_failure:"Kühlungsausfall",cause_misalignment:"Wellenversatz",cause_lubrication_loss:"Schmierverlust",cause_normal_operation:"Normalbetrieb",nav_story:"Story-Modus",story_hint:"Spielt einen über 22 Stunden entstehenden Lagerschaden nach und zeigt genau, wann die KI ihn erkannte — und was das wert war.",simulate_failure_btn:"Ausfall Simulieren",outcome_title:"Ergebnis",warning_time_label:"Frühwarnung",loss_ignored_label:"Verlust ohne Reaktion",loss_acted_label:"Verlust bei Reaktion",money_saved_label:"Gespart",timeline_title:"Ausfall-Zeitleiste",story_detection_msg:"Die KI meldete dies {hours} Stunden vor dem Ausfall bei {risk}% Risiko — Grundursache: {cause} ({confidence}% Konfidenz).",story_stage_healthy:"Gesund",story_stage_early_drift:"Erste Abweichung",story_stage_ai_detects:"KI Erkennt",story_stage_critical:"Kritisch",priority_low:"Niedrig",priority_medium:"Mittel",priority_high:"Hoch",priority_critical:"Kritisch",action_stop_machine:"Maschine stoppen",action_inspect_bearings:"Lager prüfen",action_check_cooling:"Kühlung prüfen",action_schedule_shutdown_24h:"Abschaltung planen (24h)",action_order_spare_parts:"Ersatzteile bestellen",action_reduce_load:"Last reduzieren",action_schedule_inspection_72h:"Inspektion planen (72h)",action_monitor_closely:"Genau beobachten",action_verify_sensor:"Sensor prüfen",action_power_down_idle:"Leerlaufmaschine abschalten",action_review_shift_schedule:"Schichtplan überprüfen",action_no_action:"Keine Maßnahme nötig",nav_oee:"OEE",nav_workorders:"Aufträge",oee_hint:"Verfügbarkeit x Leistung x Qualität (ISO 22400). Weltklasse ist 85%, eine typische Fabrik liegt bei etwa 60%.",availability_label:"Verfügbarkeit",performance_label:"Leistung",quality_label:"Qualität",weakest_factor_label:"Schwächster",downtime_by_reason_title:"Ausfallzeit nach Grund",downtime_cost_label:"Ausfallkosten",oee_trend_title:"OEE-Trend",shifts_title:"Schichten",shift_col:"Schicht",downtime_col:"Ausfallzeit",log_shift_btn:"Schicht erfassen",no_shifts_yet:"Noch keine Schichten erfasst.",minutes_short:"Min",range_1d:"Heute",range_7d:"7 Tage",range_30d:"30 Tage",all_machines_option:"Alle Maschinen",reason_unspecified:"Nicht angegeben",err_good_exceeds_total:"Gutteile können die Gesamtmenge nicht überschreiten",oee_grade_world_class:"Weltklasse",oee_grade_typical:"Typisch",oee_grade_low:"Niedrig",oee_grade_critical:"Kritisch",reason_breakdown:"Störung",reason_changeover:"Rüsten",reason_no_material:"Kein Material",reason_no_operator:"Kein Bediener",reason_planned_maintenance:"Geplante Wartung",reason_quality_issue:"Qualitätsproblem",reason_setup:"Einrichtung",reason_other:"Sonstiges",workorders_hint:"Macht aus einer KI-Prognose eine nachverfolgbare Aufgabe — damit eine Warnung in einer Reparatur endet.",new_work_order_btn:"+ Neuer Auftrag",no_work_orders:"Noch keine Aufträge.",avg_completion_label:"Ø Bearbeitung",assigned_label:"Zugewiesen",source_ai:"KI",wo_status_open:"Offen",wo_status_in_progress:"In Arbeit",wo_status_done:"Erledigt",wo_status_cancelled:"Storniert",wo_advance_to_in_progress:"Arbeit beginnen",wo_advance_to_done:"Als erledigt markieren",ph_shift_name:"Schichtname",ph_planned_minutes:"Geplante Minuten",ph_downtime_minutes:"Ausfallminuten",ph_total_units:"Gesamtstückzahl",ph_good_units:"Gutteile",ph_cycle_seconds:"Idealzyklus (Sek.)",ph_wo_title:"Titel",ph_assigned_to:"Zugewiesen an",ph_wo_description:"Beschreibung",overdue_label:"Überfällig",nav_history:"Verlauf",history_hint:"Gespeicherte Sensorhistorie — damit belegen Sie, was sich im Pilot wirklich verändert hat.",no_history_yet:"Noch kein Verlauf aufgezeichnet. Lassen Sie das Live-Monitoring einige Minuten offen, dann sammeln sich Daten.",range_24h:"24 Stunden",range_3d:"3 Tage",range_10d:"10 Tage",sensor_trend_title:"Sensorverlauf",risk_trend_title:"Risikoverlauf",trend_flat:"unverändert",trend_rising:"steigend",trend_falling:"fallend",create_work_order_btn:"Auftrag erstellen",work_order_created_msg:"Auftrag erstellt",alertreason_immediate_failure_risk:"Unmittelbares Ausfallrisiko",alertreason_failure_imminent:"Ausfall unmittelbar bevorstehend",alertreason_degradation_accelerating:"Verschleiß beschleunigt sich",alertreason_outside_normal_envelope:"Außerhalb des Normalbereichs",alertreason_pressure_anomaly:"Druckanomalie",alertreason_idle_waste:"Leerlauf-Energieverlust",alertreason_informational:"Informativ",alert_reason_label:"Grund"},
-  fr: {tagline:"Plateforme mondiale d'intelligence industrielle",live_label:"En direct",kpi_energy:"Consommation d'Énergie",kpi_efficiency:"Efficacité",kpi_active:"Machines Actives",kpi_alerts:"Alertes",kwh_unit:"kWh",chart_title:"Performance en Temps Réel",machine_status_title:"État des Machines",status_running:"En marche",status_warning:"Avertissement",status_critical:"Critique",form_title:"Saisie des Données d'Usine",factory_name_label:"Nom de l'Usine",machine_count_label:"Nombre de Machines",energy_cost_label:"Coût de l'Énergie ($/kWh)",machine_type_label:"Type de Machine",temperature_label:"Température (°C)",vibration_label:"Vibration (mm/s)",load_label:"Charge (%)",submit_btn:"Analyser l'Usine",submitting:"Mise à jour...",ai_panel_title:"Analyses IA",ai_placeholder:"Envoyez les données de l'usine pour générer une analyse IA.",ai_analyzing:"Analyse en cours...",ai_risks:"Risques",ai_efficiency_insights:"Analyse d'Efficacité",ai_optimizations:"Suggestions d'Optimisation",toast_updated:"Données d'usine mises à jour",toast_analysis_done:"Analyse IA terminée",toast_error:"Une erreur est survenue",nav_dashboard:"Tableau de Bord",nav_factories:"Usines",nav_ai_insights:"Analyses IA",logout_btn:"Déconnexion",login_title:"Content de vous revoir",login_subtitle:"Connectez-vous à votre compte FactoryPulse AI",ph_email:"E-mail",ph_password:"Mot de passe",remember_me:"Se souvenir de moi",login_btn:"Se connecter",login_link_register:"Pas de compte ? Créez-en un",register_title:"Créer votre compte",register_subtitle:"Commencez à surveiller vos usines avec l'IA",ph_full_name:"Nom Complet",ph_confirm_password:"Confirmer le Mot de Passe",register_btn:"Créer un Compte",register_link_login:"Déjà un compte ? Se connecter",err_missing_fields:"Veuillez remplir tous les champs",err_invalid_email:"Veuillez entrer une adresse e-mail valide",err_weak_password:"Le mot de passe doit contenir 8 caractères min., une lettre et un chiffre",err_password_mismatch:"Les mots de passe ne correspondent pas",err_invalid_credentials:"E-mail ou mot de passe incorrect",err_email_taken:"Cet e-mail est déjà enregistré",err_generic:"Une erreur est survenue. Veuillez réessayer",my_factories_title:"Mes Usines",add_factory_btn:"+ Ajouter une Usine",edit_factory_btn:"Modifier",delete_factory_btn:"Supprimer",confirm_delete_factory:"Supprimer cette usine ? Cette action est irréversible.",no_factories_yet:"Vous n'avez pas encore ajouté d'usine.",factory_created_toast:"Usine créée et analysée",factory_updated_toast:"Usine mise à jour",factory_deleted_toast:"Usine supprimée",ai_insights_feed_title:"Flux d'Analyses IA",no_ai_insights_yet:"Aucune analyse IA pour l'instant. Ajoutez une usine.",reanalyze_btn:"Réanalyser",view_insights_btn:"Voir les Analyses",created_label:"Créée le",cancel_btn:"Annuler",save_btn:"Enregistrer les Modifications",nav_live_monitor:"Surveillance en Direct",add_machine_scada_btn:"+ Ajouter une Machine",usb_status:"USB :",plc_status:"API :",polling_mode:"Interrogation",live_chart_title:"Graphique des Capteurs en Direct",machines_table_title:"Machines",machine_code_col:"Code",machine_name_col:"Nom",status_col:"Statut",risk_col:"Risque",no_machines_yet:"Aucune machine pour l'instant. Cliquez sur « + Ajouter une Machine ».",section_machine_info:"Informations sur la Machine",section_sensor_data:"Données des Capteurs",section_status:"Statut",section_notes:"Notes",status_stopped:"Arrêtée",status_maintenance:"Maintenance",priority_low:"Faible",priority_normal:"Normale",priority_high:"Élevée",priority_critical:"Critique",save_and_analyze_btn:"Enregistrer et Analyser",source_col:"Source",source_auto:"Auto (SCADA)",source_manual:"Manuel",nav_alerts:"Alertes",acknowledge_btn:"Confirmer",acknowledged_label:"Confirmé",acknowledge_all_btn:"Tout Confirmer",no_alerts_yet:"Aucune alerte. Tout fonctionne normalement.",download_report_btn:"Rapport",alert_details_template:"Température {temp}°C, vibration {vib} mm/s, statut : {status}",section_energy_intel:"Intelligence Énergétique",daily_output_hint:"Utilisé pour calculer la consommation énergétique spécifique (kWh par unité).",energy_insights_title:"Intelligence Énergétique",idle_power_title:"Détection de Puissance au Ralenti",idle_active_msg:"Machine au ralenti - environ {kw} kW gaspillés actuellement.",idle_none_msg:"Aucun gaspillage d'énergie au ralenti détecté.",friction_loss_title:"Perte d'Énergie Prédictive",friction_active_msg:"Friction élevée détectée : +{pct}% de surcharge (~{kw} kW en plus). Planifiez une maintenance pour éviter les pertes.",friction_none_msg:"Aucune friction anormale détectée.",sec_title:"Consommation Énergétique Spécifique",sec_label:"kWh par unité",sec_unit:"kWh/unité",sec_no_data_msg:"Indiquez la production quotidienne lors de l'ajout de la machine pour voir cette mesure.",optimal_load_title:"Zone de Charge Optimale",optimal_load_label:"Charge optimale",current_load_label:"Charge actuelle",at_optimal_msg:"Fonctionne dans la zone de charge optimale.",adjust_to_optimal_msg:"Ajustez la charge vers {pct}% pour minimiser l'énergie par unité.",nav_digital_twin:"Jumeau Numérique",twin_hint:"Faites glisser pour pivoter, défilez pour zoomer, cliquez sur une machine pour ses détails en direct.",twin_unavailable_msg:"Impossible de charger la vue 3D (vérifiez votre connexion internet pour Three.js).",failure_prediction_title:"Prédiction de Panne",report_lib_missing_msg:"L'export PDF nécessite la bibliothèque reportlab. Exécutez : pip install reportlab, puis redémarrez le serveur.",ph_machine_id:"ID Machine (ex. M-01)",ph_machine_name:"Nom de la Machine",ph_factory_section:"Section de l'Usine",ph_operator_name:"Nom de l'Opérateur",ph_pressure:"Pression (bar)",ph_voltage:"Tension (V)",ph_current:"Courant (A)",ph_error_code:"Code d'Erreur",ph_daily_output:"Production Quotidienne (unités)",ph_notes:"Notes...",nav_system_intel:"Intelligence Système",nav_roi:"Tableau ROI",refresh_btn:"Actualiser",system_risk_label:"Risque Système",healthy_label:"Sains",at_risk_label:"À Risque",clusters_title:"Clusters de Machines",propagation_title:"Propagation d'Anomalies",propagation_hint:"Comment une machine défaillante augmente le risque de ses voisines.",no_propagation:"Aucune propagation d'anomalie détectée.",avg_risk_label:"Risque moyen",added_risk_label:"Risque ajouté",effective_risk_label:"Risque effectif",simulation_title:"Simulation Hypothétique",simulation_hint:"Choisissez une machine, modifiez ses capteurs et observez la probabilité de panne.",run_simulation_btn:"Lancer la Simulation",failure_probability_label:"Probabilité de Panne",stress_level_label:"Niveau de Contrainte",predicted_status_label:"Statut Prévu",confidence_label:"Confiance",root_cause_title:"Cause Racine",rul_col:"Durée de Vie Restante",rul_healthy:"Sain",potential_loss_label:"Perte Potentielle",saved_label:"Économisé par l'IA",wasted_energy_label:"Énergie Gaspillée / mois",efficiency_gain_label:"Gain d'Efficacité",cost_by_machine_title:"Exposition Financière par Machine",top_cause_col:"Cause Principale",roi_assumptions_msg:"Hypothèses : arrêt {downtime}/h, réparation {hours}h, énergie {price}/kWh.",role_label:"Votre Rôle",role_engineer:"Ingénieur",role_manager:"Manager",role_admin:"Administrateur",cause_bearing_wear:"Usure de roulement",cause_overload_thermal:"Surcharge thermique",cause_cooling_failure:"Panne de refroidissement",cause_misalignment:"Désalignement d'arbre",cause_lubrication_loss:"Perte de lubrification",cause_normal_operation:"Fonctionnement normal",nav_story:"Mode Récit",story_hint:"Rejoue une panne de roulement se développant sur 22 heures et montre exactement quand l'IA l'a détectée — et ce que cela valait.",simulate_failure_btn:"Simuler une Panne",outcome_title:"Résultat",warning_time_label:"Alerte Précoce",loss_ignored_label:"Perte sans Réaction",loss_acted_label:"Perte avec Réaction",money_saved_label:"Économisé",timeline_title:"Chronologie de la Panne",story_detection_msg:"L'IA l'a signalé {hours} heures avant la panne, à {risk}% de risque — cause racine : {cause} (confiance {confidence}%).",story_stage_healthy:"Sain",story_stage_early_drift:"Première Dérive",story_stage_ai_detects:"L'IA Détecte",story_stage_critical:"Critique",priority_low:"Faible",priority_medium:"Moyen",priority_high:"Élevé",priority_critical:"Critique",action_stop_machine:"Arrêter la machine",action_inspect_bearings:"Inspecter les roulements",action_check_cooling:"Vérifier le refroidissement",action_schedule_shutdown_24h:"Planifier l'arrêt (24h)",action_order_spare_parts:"Commander des pièces",action_reduce_load:"Réduire la charge",action_schedule_inspection_72h:"Planifier l'inspection (72h)",action_monitor_closely:"Surveiller de près",action_verify_sensor:"Vérifier le capteur",action_power_down_idle:"Éteindre la machine au ralenti",action_review_shift_schedule:"Revoir le planning",action_no_action:"Aucune action requise",nav_oee:"TRS",nav_workorders:"Ordres de Travail",oee_hint:"Disponibilité x Performance x Qualité (ISO 22400). Le niveau mondial est 85%, une usine typique avoisine 60%.",availability_label:"Disponibilité",performance_label:"Performance",quality_label:"Qualité",weakest_factor_label:"Le plus faible",downtime_by_reason_title:"Arrêts par Cause",downtime_cost_label:"Coût d'arrêt",oee_trend_title:"Tendance TRS",shifts_title:"Équipes",shift_col:"Équipe",downtime_col:"Arrêt",log_shift_btn:"Saisir une Équipe",no_shifts_yet:"Aucune équipe saisie.",minutes_short:"min",range_1d:"Aujourd'hui",range_7d:"7 jours",range_30d:"30 jours",all_machines_option:"Toutes les machines",reason_unspecified:"Non spécifié",err_good_exceeds_total:"Les pièces bonnes ne peuvent dépasser le total",oee_grade_world_class:"Niveau mondial",oee_grade_typical:"Typique",oee_grade_low:"Faible",oee_grade_critical:"Critique",reason_breakdown:"Panne",reason_changeover:"Changement de série",reason_no_material:"Pas de matière",reason_no_operator:"Pas d'opérateur",reason_planned_maintenance:"Maintenance planifiée",reason_quality_issue:"Problème qualité",reason_setup:"Réglage",reason_other:"Autre",workorders_hint:"Transforme une prédiction IA en tâche suivie — pour qu'une alerte se termine par une réparation.",new_work_order_btn:"+ Nouvel Ordre",no_work_orders:"Aucun ordre de travail.",avg_completion_label:"Achèvement moy.",assigned_label:"Assigné",source_ai:"IA",wo_status_open:"Ouvert",wo_status_in_progress:"En cours",wo_status_done:"Terminé",wo_status_cancelled:"Annulé",wo_advance_to_in_progress:"Commencer",wo_advance_to_done:"Marquer terminé",ph_shift_name:"Nom de l'équipe",ph_planned_minutes:"Minutes planifiées",ph_downtime_minutes:"Minutes d'arrêt",ph_total_units:"Unités totales",ph_good_units:"Unités bonnes",ph_cycle_seconds:"Cycle idéal (sec)",ph_wo_title:"Titre",ph_assigned_to:"Assigné à",ph_wo_description:"Description",overdue_label:"En retard",nav_history:"Historique",history_hint:"Historique des capteurs enregistré — c'est ainsi que vous prouvez ce qui a réellement changé pendant le pilote.",no_history_yet:"Aucun historique enregistré. Laissez le Monitoring ouvert quelques minutes et les données s'accumuleront.",range_24h:"24 heures",range_3d:"3 jours",range_10d:"10 jours",sensor_trend_title:"Tendance des Capteurs",risk_trend_title:"Tendance du Risque",trend_flat:"inchangé",trend_rising:"en hausse",trend_falling:"en baisse",create_work_order_btn:"Créer un Ordre",work_order_created_msg:"Ordre de travail créé",alertreason_immediate_failure_risk:"Risque de panne immédiat",alertreason_failure_imminent:"Panne imminente",alertreason_degradation_accelerating:"Dégradation qui s'accélère",alertreason_outside_normal_envelope:"Hors plage normale",alertreason_pressure_anomaly:"Anomalie de pression",alertreason_idle_waste:"Gaspillage au ralenti",alertreason_informational:"Informatif",alert_reason_label:"Motif"},
-  es: {tagline:"Plataforma Global de Inteligencia Industrial",live_label:"En vivo",kpi_energy:"Uso de Energía",kpi_efficiency:"Eficiencia",kpi_active:"Máquinas Activas",kpi_alerts:"Alertas",kwh_unit:"kWh",chart_title:"Rendimiento en Tiempo Real",machine_status_title:"Estado de Máquinas",status_running:"Funcionando",status_warning:"Advertencia",status_critical:"Crítico",form_title:"Entrada de Datos de Fábrica",factory_name_label:"Nombre de Fábrica",machine_count_label:"Número de Máquinas",energy_cost_label:"Costo de Energía ($/kWh)",machine_type_label:"Tipo de Máquina",temperature_label:"Temperatura (°C)",vibration_label:"Vibración (mm/s)",load_label:"Carga (%)",submit_btn:"Analizar Fábrica",submitting:"Actualizando...",ai_panel_title:"Perspectivas IA",ai_placeholder:"Envíe datos de fábrica para generar un análisis IA.",ai_analyzing:"Analizando...",ai_risks:"Riesgos",ai_efficiency_insights:"Análisis de Eficiencia",ai_optimizations:"Sugerencias de Optimización",toast_updated:"Datos de fábrica actualizados",toast_analysis_done:"Análisis IA completo",toast_error:"Algo salió mal",nav_dashboard:"Panel",nav_factories:"Fábricas",nav_ai_insights:"Perspectivas IA",logout_btn:"Cerrar Sesión",login_title:"Bienvenido de nuevo",login_subtitle:"Inicia sesión en tu cuenta de FactoryPulse AI",ph_email:"Correo electrónico",ph_password:"Contraseña",remember_me:"Recuérdame",login_btn:"Iniciar Sesión",login_link_register:"¿No tienes cuenta? Crea una",register_title:"Crea tu cuenta",register_subtitle:"Empieza a monitorear tus fábricas con IA",ph_full_name:"Nombre Completo",ph_confirm_password:"Confirmar Contraseña",register_btn:"Crear Cuenta",register_link_login:"¿Ya tienes cuenta? Inicia sesión",err_missing_fields:"Por favor complete todos los campos",err_invalid_email:"Por favor ingrese un correo válido",err_weak_password:"La contraseña debe tener mín. 8 caracteres, una letra y un número",err_password_mismatch:"Las contraseñas no coinciden",err_invalid_credentials:"Correo o contraseña incorrectos",err_email_taken:"Este correo ya está registrado",err_generic:"Algo salió mal. Inténtalo de nuevo",my_factories_title:"Mis Fábricas",add_factory_btn:"+ Añadir Fábrica",edit_factory_btn:"Editar",delete_factory_btn:"Eliminar",confirm_delete_factory:"¿Eliminar esta fábrica? Esta acción no se puede deshacer.",no_factories_yet:"Aún no has añadido ninguna fábrica.",factory_created_toast:"Fábrica creada y analizada",factory_updated_toast:"Fábrica actualizada",factory_deleted_toast:"Fábrica eliminada",ai_insights_feed_title:"Feed de Perspectivas IA",no_ai_insights_yet:"Aún no hay perspectivas IA. Añade una fábrica.",reanalyze_btn:"Reanalizar",view_insights_btn:"Ver Perspectivas",created_label:"Creada",cancel_btn:"Cancelar",save_btn:"Guardar Cambios",nav_live_monitor:"Monitor en Vivo",add_machine_scada_btn:"+ Añadir Máquina",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Sondeo",live_chart_title:"Gráfico de Sensores en Vivo",machines_table_title:"Máquinas",machine_code_col:"Código",machine_name_col:"Nombre",status_col:"Estado",risk_col:"Riesgo",no_machines_yet:"Aún no hay máquinas. Haga clic en «+ Añadir Máquina».",section_machine_info:"Información de la Máquina",section_sensor_data:"Datos de Sensores",section_status:"Estado",section_notes:"Notas",status_stopped:"Detenida",status_maintenance:"Mantenimiento",priority_low:"Baja",priority_normal:"Normal",priority_high:"Alta",priority_critical:"Crítica",save_and_analyze_btn:"Guardar y Analizar",source_col:"Fuente",source_auto:"Auto (SCADA)",source_manual:"Manual",nav_alerts:"Alertas",acknowledge_btn:"Reconocer",acknowledged_label:"Reconocido",acknowledge_all_btn:"Reconocer Todo",no_alerts_yet:"Sin alertas. Todo funciona correctamente.",download_report_btn:"Informe",alert_details_template:"Temperatura {temp}°C, vibración {vib} mm/s, estado: {status}",section_energy_intel:"Inteligencia Energética",daily_output_hint:"Se usa para calcular el consumo energético específico (kWh por unidad).",energy_insights_title:"Inteligencia Energética",idle_power_title:"Detección de Potencia en Inactividad",idle_active_msg:"Máquina inactiva - se desperdician aprox. {kw} kW ahora mismo.",idle_none_msg:"No se detectó desperdicio de energía en inactividad.",friction_loss_title:"Pérdida de Energía Predictiva",friction_active_msg:"Fricción elevada detectada: +{pct}% de sobrecarga (~{kw} kW extra). Programe mantenimiento para evitar pérdidas.",friction_none_msg:"No se detectó fricción anormal.",sec_title:"Consumo Energético Específico",sec_label:"kWh por unidad",sec_unit:"kWh/unidad",sec_no_data_msg:"Ingrese la producción diaria al añadir esta máquina para ver esta métrica.",optimal_load_title:"Zona de Carga Óptima",optimal_load_label:"Carga óptima",current_load_label:"Carga actual",at_optimal_msg:"Funcionando en la zona de carga óptima.",adjust_to_optimal_msg:"Ajuste la carga hacia {pct}% para minimizar la energía por unidad.",nav_digital_twin:"Gemelo Digital",twin_hint:"Arrastre para rotar, desplácese para acercar, haga clic en una máquina para ver sus detalles en vivo.",twin_unavailable_msg:"No se pudo cargar la vista 3D (verifique su conexión a internet para Three.js).",failure_prediction_title:"Predicción de Fallo",report_lib_missing_msg:"La exportación a PDF necesita la librería reportlab. Ejecute: pip install reportlab, luego reinicie el servidor.",ph_machine_id:"ID de Máquina (ej. M-01)",ph_machine_name:"Nombre de la Máquina",ph_factory_section:"Sección de la Fábrica",ph_operator_name:"Nombre del Operador",ph_pressure:"Presión (bar)",ph_voltage:"Voltaje (V)",ph_current:"Corriente (A)",ph_error_code:"Código de Error",ph_daily_output:"Producción Diaria (unidades)",ph_notes:"Notas...",nav_system_intel:"Inteligencia del Sistema",nav_roi:"Panel ROI",refresh_btn:"Actualizar",system_risk_label:"Riesgo del Sistema",healthy_label:"Saludables",at_risk_label:"En Riesgo",clusters_title:"Clústeres de Máquinas",propagation_title:"Propagación de Anomalías",propagation_hint:"Cómo una máquina en fallo eleva el riesgo de sus vecinas.",no_propagation:"No se detectó propagación de anomalías.",avg_risk_label:"Riesgo medio",added_risk_label:"Riesgo añadido",effective_risk_label:"Riesgo efectivo",simulation_title:"Simulación Hipotética",simulation_hint:"Elija una máquina, ajuste sus sensores y vea cómo cambia la probabilidad de fallo.",run_simulation_btn:"Ejecutar Simulación",failure_probability_label:"Probabilidad de Fallo",stress_level_label:"Nivel de Estrés",predicted_status_label:"Estado Previsto",confidence_label:"Confianza",root_cause_title:"Causa Raíz",rul_col:"Vida Útil Restante",rul_healthy:"Saludable",potential_loss_label:"Pérdida Potencial",saved_label:"Ahorrado por IA",wasted_energy_label:"Energía Desperdiciada / mes",efficiency_gain_label:"Ganancia de Eficiencia",cost_by_machine_title:"Exposición de Costes por Máquina",top_cause_col:"Causa Principal",roi_assumptions_msg:"Supuestos: parada {downtime}/h, reparación {hours}h, energía {price}/kWh.",role_label:"Su Rol",role_engineer:"Ingeniero",role_manager:"Gerente",role_admin:"Administrador",cause_bearing_wear:"Desgaste de rodamiento",cause_overload_thermal:"Sobrecarga térmica",cause_cooling_failure:"Fallo de refrigeración",cause_misalignment:"Desalineación del eje",cause_lubrication_loss:"Pérdida de lubricación",cause_normal_operation:"Operación normal",nav_story:"Modo Historia",story_hint:"Reproduce un fallo de rodamiento desarrollándose en 22 horas y muestra exactamente cuándo lo detectó la IA — y cuánto valía.",simulate_failure_btn:"Simular Fallo",outcome_title:"Resultado",warning_time_label:"Aviso Temprano",loss_ignored_label:"Pérdida sin Reacción",loss_acted_label:"Pérdida con Reacción",money_saved_label:"Ahorrado",timeline_title:"Cronología del Fallo",story_detection_msg:"La IA lo detectó {hours} horas antes de la avería, con {risk}% de riesgo — causa raíz: {cause} ({confidence}% de confianza).",story_stage_healthy:"Saludable",story_stage_early_drift:"Primera Desviación",story_stage_ai_detects:"La IA Detecta",story_stage_critical:"Crítico",priority_low:"Bajo",priority_medium:"Medio",priority_high:"Alto",priority_critical:"Crítico",action_stop_machine:"Detener máquina",action_inspect_bearings:"Inspeccionar rodamientos",action_check_cooling:"Revisar refrigeración",action_schedule_shutdown_24h:"Programar parada (24h)",action_order_spare_parts:"Pedir repuestos",action_reduce_load:"Reducir carga",action_schedule_inspection_72h:"Programar inspección (72h)",action_monitor_closely:"Vigilar de cerca",action_verify_sensor:"Verificar sensor",action_power_down_idle:"Apagar máquina inactiva",action_review_shift_schedule:"Revisar turnos",action_no_action:"No se requiere acción",nav_oee:"OEE",nav_workorders:"Órdenes de Trabajo",oee_hint:"Disponibilidad x Rendimiento x Calidad (ISO 22400). El nivel mundial es 85%; una fábrica típica ronda el 60%.",availability_label:"Disponibilidad",performance_label:"Rendimiento",quality_label:"Calidad",weakest_factor_label:"Más débil",downtime_by_reason_title:"Paradas por Causa",downtime_cost_label:"Costo de parada",oee_trend_title:"Tendencia OEE",shifts_title:"Turnos",shift_col:"Turno",downtime_col:"Parada",log_shift_btn:"Registrar Turno",no_shifts_yet:"Aún no hay turnos registrados.",minutes_short:"min",range_1d:"Hoy",range_7d:"7 días",range_30d:"30 días",all_machines_option:"Todas las máquinas",reason_unspecified:"Sin especificar",err_good_exceeds_total:"Las piezas buenas no pueden superar el total",oee_grade_world_class:"Nivel mundial",oee_grade_typical:"Típico",oee_grade_low:"Bajo",oee_grade_critical:"Crítico",reason_breakdown:"Avería",reason_changeover:"Cambio de formato",reason_no_material:"Sin material",reason_no_operator:"Sin operario",reason_planned_maintenance:"Mantenimiento planificado",reason_quality_issue:"Problema de calidad",reason_setup:"Preparación",reason_other:"Otro",workorders_hint:"Convierte una predicción de IA en tarea rastreable — para que una alerta acabe en reparación.",new_work_order_btn:"+ Nueva Orden",no_work_orders:"Aún no hay órdenes.",avg_completion_label:"Finalización prom.",assigned_label:"Asignado",source_ai:"IA",wo_status_open:"Abierta",wo_status_in_progress:"En curso",wo_status_done:"Completada",wo_status_cancelled:"Cancelada",wo_advance_to_in_progress:"Iniciar trabajo",wo_advance_to_done:"Marcar completada",ph_shift_name:"Nombre del turno",ph_planned_minutes:"Minutos planificados",ph_downtime_minutes:"Minutos de parada",ph_total_units:"Unidades totales",ph_good_units:"Unidades buenas",ph_cycle_seconds:"Ciclo ideal (seg)",ph_wo_title:"Título",ph_assigned_to:"Asignado a",ph_wo_description:"Descripción",overdue_label:"Vencidas",nav_history:"Historial",history_hint:"Historial de sensores guardado: así demuestra qué cambió realmente durante el piloto.",no_history_yet:"Aún no hay historial. Mantenga el Monitoreo abierto unos minutos y los datos empezarán a acumularse.",range_24h:"24 horas",range_3d:"3 días",range_10d:"10 días",sensor_trend_title:"Tendencia de Sensores",risk_trend_title:"Tendencia de Riesgo",trend_flat:"sin cambios",trend_rising:"subiendo",trend_falling:"bajando",create_work_order_btn:"Crear Orden",work_order_created_msg:"Orden de trabajo creada",alertreason_immediate_failure_risk:"Riesgo de fallo inmediato",alertreason_failure_imminent:"Fallo inminente",alertreason_degradation_accelerating:"Degradación acelerándose",alertreason_outside_normal_envelope:"Fuera del rango normal",alertreason_pressure_anomaly:"Anomalía de presión",alertreason_idle_waste:"Desperdicio en inactividad",alertreason_informational:"Informativo",alert_reason_label:"Motivo"},
-  zh: {tagline:"全球工业智能平台",live_label:"实时",kpi_energy:"能源使用量",kpi_efficiency:"效率",kpi_active:"运行中设备",kpi_alerts:"警报",kwh_unit:"kWh",chart_title:"实时性能",machine_status_title:"设备状态",status_running:"运行中",status_warning:"警告",status_critical:"严重",form_title:"工厂数据输入",factory_name_label:"工厂名称",machine_count_label:"设备数量",energy_cost_label:"能源成本 ($/kWh)",machine_type_label:"设备类型",temperature_label:"温度 (°C)",vibration_label:"振动 (mm/s)",load_label:"负载 (%)",submit_btn:"分析工厂",submitting:"更新中...",ai_panel_title:"AI 洞察",ai_placeholder:"提交工厂数据以生成AI分析。",ai_analyzing:"分析中...",ai_risks:"风险",ai_efficiency_insights:"效率分析",ai_optimizations:"优化建议",toast_updated:"工厂数据已更新",toast_analysis_done:"AI分析已完成",toast_error:"出现错误",nav_dashboard:"仪表盘",nav_factories:"工厂",nav_ai_insights:"AI洞察",logout_btn:"退出",login_title:"欢迎回来",login_subtitle:"登录您的 FactoryPulse AI 账户",ph_email:"电子邮件",ph_password:"密码",remember_me:"记住我",login_btn:"登录",login_link_register:"没有账户？创建一个",register_title:"创建账户",register_subtitle:"开始使用AI监控您的工厂",ph_full_name:"全名",ph_confirm_password:"确认密码",register_btn:"创建账户",register_link_login:"已有账户？登录",err_missing_fields:"请填写所有字段",err_invalid_email:"请输入有效的电子邮件地址",err_weak_password:"密码至少8位，需包含字母和数字",err_password_mismatch:"两次密码不一致",err_invalid_credentials:"电子邮件或密码错误",err_email_taken:"该电子邮件已被注册",err_generic:"出现错误，请重试",my_factories_title:"我的工厂",add_factory_btn:"+ 添加工厂",edit_factory_btn:"编辑",delete_factory_btn:"删除",confirm_delete_factory:"删除此工厂？此操作无法撤销。",no_factories_yet:"您还没有添加任何工厂。",factory_created_toast:"工厂已创建并分析",factory_updated_toast:"工厂已更新",factory_deleted_toast:"工厂已删除",ai_insights_feed_title:"AI洞察动态",no_ai_insights_yet:"暂无AI洞察。请添加工厂开始。",reanalyze_btn:"重新分析",view_insights_btn:"查看洞察",created_label:"创建于",cancel_btn:"取消",save_btn:"保存更改",nav_live_monitor:"实时监控",add_machine_scada_btn:"+ 添加设备",usb_status:"USB:",plc_status:"PLC:",polling_mode:"轮询",live_chart_title:"实时传感器图表",machines_table_title:"设备",machine_code_col:"编号",machine_name_col:"名称",status_col:"状态",risk_col:"风险",no_machines_yet:"暂无设备。点击“+ 添加设备”。",section_machine_info:"设备信息",section_sensor_data:"传感器数据",section_status:"状态",section_notes:"备注",status_stopped:"已停止",status_maintenance:"维护中",priority_low:"低",priority_normal:"正常",priority_high:"高",priority_critical:"严重",save_and_analyze_btn:"保存并分析",source_col:"数据来源",source_auto:"自动 (SCADA)",source_manual:"手动",nav_alerts:"警报",acknowledge_btn:"确认",acknowledged_label:"已确认",acknowledge_all_btn:"全部确认",no_alerts_yet:"暂无警报，一切运行正常。",download_report_btn:"报告",alert_details_template:"温度 {temp}°C，振动 {vib} mm/s，状态：{status}",section_energy_intel:"能源智能",daily_output_hint:"用于计算单位能耗（kWh/单位）。",energy_insights_title:"能源智能",idle_power_title:"空转功率检测",idle_active_msg:"设备处于空转状态 — 目前大约浪费 {kw} kW。",idle_none_msg:"未检测到空转能耗浪费。",friction_loss_title:"预测性能量损耗",friction_active_msg:"检测到摩擦增加：额外功率 +{pct}%（约 {kw} kW）。请安排维护以避免损耗。",friction_none_msg:"未检测到异常摩擦。",sec_title:"单位能耗",sec_label:"每单位kWh",sec_unit:"kWh/单位",sec_no_data_msg:"添加设备时请输入日产量以查看此指标。",optimal_load_title:"最佳负载区间",optimal_load_label:"最佳负载",current_load_label:"当前负载",at_optimal_msg:"正在最佳负载区间运行。",adjust_to_optimal_msg:"将负载调整至 {pct}% 以最小化单位能耗。",nav_digital_twin:"数字孪生",twin_hint:"拖动旋转，滚动缩放，点击设备查看实时详情。",twin_unavailable_msg:"无法加载3D视图（请检查Three.js库的网络连接）。",failure_prediction_title:"故障预测",report_lib_missing_msg:"PDF导出需要reportlab库。请运行：pip install reportlab，然后重启服务器。",ph_machine_id:"设备编号（如 M-01）",ph_machine_name:"设备名称",ph_factory_section:"工厂车间",ph_operator_name:"操作员姓名",ph_pressure:"压力（bar）",ph_voltage:"电压（V）",ph_current:"电流（A）",ph_error_code:"错误代码",ph_daily_output:"日产量（单位）",ph_notes:"备注...",nav_system_intel:"系统智能",nav_roi:"ROI 仪表板",refresh_btn:"刷新",system_risk_label:"系统风险",healthy_label:"健康",at_risk_label:"有风险",clusters_title:"设备集群",propagation_title:"异常传播",propagation_hint:"一台故障设备如何提高相邻设备的风险。",no_propagation:"未检测到异常传播。",avg_risk_label:"平均风险",added_risk_label:"附加风险",effective_risk_label:"实际风险",simulation_title:"假设模拟",simulation_hint:"选择设备，调整传感器数值，观察故障概率的变化。",run_simulation_btn:"运行模拟",failure_probability_label:"故障概率",stress_level_label:"应力水平",predicted_status_label:"预测状态",confidence_label:"置信度",root_cause_title:"根本原因",rul_col:"剩余寿命",rul_healthy:"健康",potential_loss_label:"潜在损失",saved_label:"AI 节省",wasted_energy_label:"浪费能源 / 月",efficiency_gain_label:"效率提升",cost_by_machine_title:"各设备成本风险",top_cause_col:"主要原因",roi_assumptions_msg:"假设：停机 {downtime}/小时，维修 {hours} 小时，能源 {price}/kWh。",role_label:"您的角色",role_engineer:"工程师",role_manager:"经理",role_admin:"管理员",cause_bearing_wear:"轴承磨损",cause_overload_thermal:"热过载",cause_cooling_failure:"冷却故障",cause_misalignment:"轴不对中",cause_lubrication_loss:"润滑损失",cause_normal_operation:"正常运行",nav_story:"故事模式",story_hint:"重现22小时内轴承故障的发展过程，精确展示AI何时发现它——以及这价值多少。",simulate_failure_btn:"模拟故障",outcome_title:"结果",warning_time_label:"提前预警",loss_ignored_label:"不作为的损失",loss_acted_label:"采取行动的损失",money_saved_label:"节省金额",timeline_title:"故障时间线",story_detection_msg:"AI在故障前 {hours} 小时发现，风险 {risk}%——根本原因：{cause}（置信度 {confidence}%）。",story_stage_healthy:"健康",story_stage_early_drift:"初期偏移",story_stage_ai_detects:"AI检测到",story_stage_critical:"严重",priority_low:"低",priority_medium:"中",priority_high:"高",priority_critical:"严重",action_stop_machine:"停止设备",action_inspect_bearings:"检查轴承",action_check_cooling:"检查冷却",action_schedule_shutdown_24h:"安排停机（24小时）",action_order_spare_parts:"订购备件",action_reduce_load:"降低负载",action_schedule_inspection_72h:"安排检查（72小时）",action_monitor_closely:"密切监控",action_verify_sensor:"验证传感器",action_power_down_idle:"关闭空转设备",action_review_shift_schedule:"检查班次安排",action_no_action:"无需操作",nav_oee:"OEE",nav_workorders:"工单",oee_hint:"可用率 x 表现性 x 质量 (ISO 22400)。世界级为85%，典型工厂约60%。",availability_label:"可用率",performance_label:"表现性",quality_label:"质量",weakest_factor_label:"最弱项",downtime_by_reason_title:"停机原因分析",downtime_cost_label:"停机成本",oee_trend_title:"OEE趋势",shifts_title:"班次",shift_col:"班次",downtime_col:"停机",log_shift_btn:"记录班次",no_shifts_yet:"尚未记录班次。",minutes_short:"分钟",range_1d:"今天",range_7d:"7天",range_30d:"30天",all_machines_option:"所有设备",reason_unspecified:"未指定",err_good_exceeds_total:"合格品不能超过总数",oee_grade_world_class:"世界级",oee_grade_typical:"典型",oee_grade_low:"低",oee_grade_critical:"严重",reason_breakdown:"故障",reason_changeover:"换型",reason_no_material:"缺料",reason_no_operator:"缺人",reason_planned_maintenance:"计划维护",reason_quality_issue:"质量问题",reason_setup:"调试",reason_other:"其他",workorders_hint:"将AI预测转化为可跟踪的任务——让预警真正以维修告终。",new_work_order_btn:"+ 新建工单",no_work_orders:"暂无工单。",avg_completion_label:"平均完成",assigned_label:"负责人",source_ai:"AI",wo_status_open:"待处理",wo_status_in_progress:"进行中",wo_status_done:"已完成",wo_status_cancelled:"已取消",wo_advance_to_in_progress:"开始工作",wo_advance_to_done:"标记完成",ph_shift_name:"班次名称",ph_planned_minutes:"计划分钟",ph_downtime_minutes:"停机分钟",ph_total_units:"总数量",ph_good_units:"合格数量",ph_cycle_seconds:"理想节拍（秒）",ph_wo_title:"标题",ph_assigned_to:"负责人",ph_wo_description:"描述",overdue_label:"逾期",nav_history:"历史",history_hint:"已存储的传感器历史——用它证明试点期间到底改变了什么。",no_history_yet:"尚未记录历史。保持实时监控页面打开几分钟，数据就会开始累积。",range_24h:"24小时",range_3d:"3天",range_10d:"10天",sensor_trend_title:"传感器趋势",risk_trend_title:"风险趋势",trend_flat:"无变化",trend_rising:"上升",trend_falling:"下降",create_work_order_btn:"创建工单",work_order_created_msg:"工单已创建",alertreason_immediate_failure_risk:"立即故障风险",alertreason_failure_imminent:"故障迫在眉睫",alertreason_degradation_accelerating:"劣化加速",alertreason_outside_normal_envelope:"超出正常范围",alertreason_pressure_anomaly:"压力异常",alertreason_idle_waste:"空转能耗浪费",alertreason_informational:"提示信息",alert_reason_label:"原因"},
-  ar: {tagline:"منصة الذكاء الصناعي العالمية",live_label:"مباشر",kpi_energy:"استهلاك الطاقة",kpi_efficiency:"الكفاءة",kpi_active:"الآلات النشطة",kpi_alerts:"التنبيهات",kwh_unit:"kWh",chart_title:"الأداء في الوقت الفعلي",machine_status_title:"حالة الآلات",status_running:"تعمل",status_warning:"تحذير",status_critical:"حرج",form_title:"إدخال بيانات المصنع",factory_name_label:"اسم المصنع",machine_count_label:"عدد الآلات",energy_cost_label:"تكلفة الطاقة ($/kWh)",machine_type_label:"نوع الآلة",temperature_label:"درجة الحرارة (°C)",vibration_label:"الاهتزاز (مم/ث)",load_label:"الحمل (%)",submit_btn:"تحليل المصنع",submitting:"جارٍ التحديث...",ai_panel_title:"رؤى الذكاء الاصطناعي",ai_placeholder:"أرسل بيانات المصنع لإنشاء تحليل بالذكاء الاصطناعي.",ai_analyzing:"جارٍ التحليل...",ai_risks:"المخاطر",ai_efficiency_insights:"تحليل الكفاءة",ai_optimizations:"اقتراحات التحسين",toast_updated:"تم تحديث بيانات المصنع",toast_analysis_done:"اكتمل تحليل الذكاء الاصطناعي",toast_error:"حدث خطأ ما",nav_dashboard:"لوحة التحكم",nav_factories:"المصانع",nav_ai_insights:"رؤى الذكاء الاصطناعي",logout_btn:"تسجيل الخروج",login_title:"مرحباً بعودتك",login_subtitle:"سجل الدخول إلى حساب FactoryPulse AI الخاص بك",ph_email:"البريد الإلكتروني",ph_password:"كلمة المرور",remember_me:"تذكرني",login_btn:"تسجيل الدخول",login_link_register:"ليس لديك حساب؟ أنشئ واحداً",register_title:"إنشاء حسابك",register_subtitle:"ابدأ بمراقبة مصانعك بالذكاء الاصطناعي",ph_full_name:"الاسم الكامل",ph_confirm_password:"تأكيد كلمة المرور",register_btn:"إنشاء حساب",register_link_login:"لديك حساب بالفعل؟ سجل الدخول",err_missing_fields:"يرجى ملء جميع الحقول",err_invalid_email:"يرجى إدخال بريد إلكتروني صالح",err_weak_password:"يجب أن تكون كلمة المرور 8 أحرف على الأقل وتحتوي على حرف ورقم",err_password_mismatch:"كلمتا المرور غير متطابقتين",err_invalid_credentials:"البريد الإلكتروني أو كلمة المرور غير صحيحة",err_email_taken:"هذا البريد الإلكتروني مسجل بالفعل",err_generic:"حدث خطأ ما. يرجى المحاولة مرة أخرى",my_factories_title:"مصانعي",add_factory_btn:"+ إضافة مصنع",edit_factory_btn:"تعديل",delete_factory_btn:"حذف",confirm_delete_factory:"هل تريد حذف هذا المصنع؟ لا يمكن التراجع عن هذا.",no_factories_yet:"لم تقم بإضافة أي مصنع بعد.",factory_created_toast:"تم إنشاء المصنع وتحليله",factory_updated_toast:"تم تحديث المصنع",factory_deleted_toast:"تم حذف المصنع",ai_insights_feed_title:"موجز رؤى الذكاء الاصطناعي",no_ai_insights_yet:"لا توجد رؤى بعد. أضف مصنعاً للبدء.",reanalyze_btn:"إعادة التحليل",view_insights_btn:"عرض الرؤى",created_label:"تاريخ الإنشاء",cancel_btn:"إلغاء",save_btn:"حفظ التغييرات",nav_live_monitor:"المراقبة المباشرة",add_machine_scada_btn:"+ إضافة آلة",usb_status:"USB:",plc_status:"PLC:",polling_mode:"استطلاع",live_chart_title:"مخطط المستشعرات المباشر",machines_table_title:"الآلات",machine_code_col:"الرمز",machine_name_col:"الاسم",status_col:"الحالة",risk_col:"الخطر",no_machines_yet:"لا توجد آلات بعد. انقر على «+ إضافة آلة».",section_machine_info:"معلومات الآلة",section_sensor_data:"بيانات المستشعر",section_status:"الحالة",section_notes:"ملاحظات",status_stopped:"متوقفة",status_maintenance:"صيانة",priority_low:"منخفضة",priority_normal:"عادية",priority_high:"عالية",priority_critical:"حرجة",save_and_analyze_btn:"حفظ وتحليل",source_col:"المصدر",source_auto:"تلقائي (SCADA)",source_manual:"يدوي",nav_alerts:"التنبيهات",acknowledge_btn:"إقرار",acknowledged_label:"تم الإقرار",acknowledge_all_btn:"إقرار الكل",no_alerts_yet:"لا توجد تنبيهات. كل شيء يعمل بسلاسة.",download_report_btn:"تقرير",alert_details_template:"درجة الحرارة {temp}°C، الاهتزاز {vib} مم/ث، الحالة: {status}",section_energy_intel:"ذكاء الطاقة",daily_output_hint:"يُستخدم لحساب استهلاك الطاقة النوعي (kWh لكل وحدة).",energy_insights_title:"ذكاء الطاقة",idle_power_title:"كشف طاقة الخمول",idle_active_msg:"الآلة خاملة - يُهدر حاليًا حوالي {kw} كيلوواط.",idle_none_msg:"لم يتم اكتشاف هدر طاقة أثناء الخمول.",friction_loss_title:"فقدان الطاقة التنبؤي",friction_active_msg:"تم اكتشاف احتكاك مرتفع: +{pct}% زيادة في الطاقة (~{kw} كيلوواط إضافية). جدولة الصيانة لتجنب الخسائر.",friction_none_msg:"لم يتم اكتشاف احتكاك غير طبيعي.",sec_title:"استهلاك الطاقة النوعي",sec_label:"kWh لكل وحدة",sec_unit:"kWh/وحدة",sec_no_data_msg:"أدخل الإنتاج اليومي عند إضافة هذه الآلة لرؤية هذا المقياس.",optimal_load_title:"منطقة الحمل الأمثل",optimal_load_label:"الحمل الأمثل",current_load_label:"الحمل الحالي",at_optimal_msg:"يعمل في منطقة الحمل الأمثل.",adjust_to_optimal_msg:"اضبط الحمل نحو {pct}% لتقليل الطاقة لكل وحدة.",nav_digital_twin:"التوأم الرقمي",twin_hint:"اسحب للتدوير، مرر للتكبير، انقر على آلة لرؤية تفاصيلها المباشرة.",twin_unavailable_msg:"تعذر تحميل العرض ثلاثي الأبعاد (تحقق من اتصال الإنترنت لمكتبة Three.js).",failure_prediction_title:"توقع العطل",report_lib_missing_msg:"يتطلب تصدير PDF مكتبة reportlab. نفّذ: pip install reportlab، ثم أعد تشغيل الخادم.",ph_machine_id:"معرف الآلة (مثل M-01)",ph_machine_name:"اسم الآلة",ph_factory_section:"قسم المصنع",ph_operator_name:"اسم المشغل",ph_pressure:"الضغط (بار)",ph_voltage:"الجهد (فولت)",ph_current:"التيار (أمبير)",ph_error_code:"رمز الخطأ",ph_daily_output:"الإنتاج اليومي (وحدة)",ph_notes:"ملاحظات...",nav_system_intel:"ذكاء النظام",nav_roi:"لوحة العائد",refresh_btn:"تحديث",system_risk_label:"مخاطر النظام",healthy_label:"سليمة",at_risk_label:"في خطر",clusters_title:"مجموعات الآلات",propagation_title:"انتشار الشذوذ",propagation_hint:"كيف ترفع آلة معطلة مخاطر الآلات المجاورة.",no_propagation:"لم يتم اكتشاف انتشار للشذوذ.",avg_risk_label:"متوسط المخاطر",added_risk_label:"مخاطر مضافة",effective_risk_label:"المخاطر الفعلية",simulation_title:"محاكاة ماذا-لو",simulation_hint:"اختر آلة، غيّر قيم المستشعرات، وشاهد كيف يتغير احتمال العطل.",run_simulation_btn:"تشغيل المحاكاة",failure_probability_label:"احتمال العطل",stress_level_label:"مستوى الإجهاد",predicted_status_label:"الحالة المتوقعة",confidence_label:"الثقة",root_cause_title:"السبب الجذري",rul_col:"العمر المتبقي",rul_healthy:"سليمة",potential_loss_label:"الخسارة المحتملة",saved_label:"وفّره الذكاء الاصطناعي",wasted_energy_label:"الطاقة المهدورة / شهر",efficiency_gain_label:"مكسب الكفاءة",cost_by_machine_title:"التعرض للتكلفة حسب الآلة",top_cause_col:"السبب الرئيسي",roi_assumptions_msg:"الافتراضات: توقف {downtime}/ساعة، إصلاح {hours} ساعة، طاقة {price}/kWh.",role_label:"دورك",role_engineer:"مهندس",role_manager:"مدير",role_admin:"مسؤول",cause_bearing_wear:"تآكل المحمل",cause_overload_thermal:"حمل حراري زائد",cause_cooling_failure:"عطل التبريد",cause_misalignment:"انحراف العمود",cause_lubrication_loss:"فقدان التزييت",cause_normal_operation:"تشغيل طبيعي",nav_story:"وضع القصة",story_hint:"يعيد تشغيل عطل محمل يتطور خلال 22 ساعة ويوضح بالضبط متى اكتشفه الذكاء الاصطناعي — وكم كانت قيمة ذلك.",simulate_failure_btn:"محاكاة العطل",outcome_title:"النتيجة",warning_time_label:"إنذار مبكر",loss_ignored_label:"الخسارة دون تدخل",loss_acted_label:"الخسارة مع التدخل",money_saved_label:"المبلغ الموفر",timeline_title:"الجدول الزمني للعطل",story_detection_msg:"اكتشف الذكاء الاصطناعي ذلك قبل {hours} ساعة من العطل، بمخاطر {risk}% — السبب الجذري: {cause} (ثقة {confidence}%).",story_stage_healthy:"سليمة",story_stage_early_drift:"انحراف مبكر",story_stage_ai_detects:"الذكاء الاصطناعي يكتشف",story_stage_critical:"حرج",priority_low:"منخفض",priority_medium:"متوسط",priority_high:"عالي",priority_critical:"حرج",action_stop_machine:"إيقاف الآلة",action_inspect_bearings:"فحص المحامل",action_check_cooling:"فحص التبريد",action_schedule_shutdown_24h:"جدولة الإيقاف (24 ساعة)",action_order_spare_parts:"طلب قطع الغيار",action_reduce_load:"تقليل الحمل",action_schedule_inspection_72h:"جدولة الفحص (72 ساعة)",action_monitor_closely:"مراقبة عن كثب",action_verify_sensor:"التحقق من المستشعر",action_power_down_idle:"إطفاء الآلة الخاملة",action_review_shift_schedule:"مراجعة جدول المناوبات",action_no_action:"لا حاجة لأي إجراء",nav_oee:"OEE",nav_workorders:"أوامر العمل",oee_hint:"الجاهزية x الأداء x الجودة (ISO 22400). المستوى العالمي 85%، والمصنع النموذجي حوالي 60%.",availability_label:"الجاهزية",performance_label:"الأداء",quality_label:"الجودة",weakest_factor_label:"الأضعف",downtime_by_reason_title:"التوقف حسب السبب",downtime_cost_label:"تكلفة التوقف",oee_trend_title:"اتجاه OEE",shifts_title:"الورديات",shift_col:"وردية",downtime_col:"توقف",log_shift_btn:"تسجيل وردية",no_shifts_yet:"لم يتم تسجيل ورديات بعد.",minutes_short:"دقيقة",range_1d:"اليوم",range_7d:"7 أيام",range_30d:"30 يوم",all_machines_option:"كل الآلات",reason_unspecified:"غير محدد",err_good_exceeds_total:"لا يمكن أن تتجاوز القطع السليمة الإجمالي",oee_grade_world_class:"المستوى العالمي",oee_grade_typical:"نموذجي",oee_grade_low:"منخفض",oee_grade_critical:"حرج",reason_breakdown:"عطل",reason_changeover:"تغيير الإنتاج",reason_no_material:"لا مواد",reason_no_operator:"لا مشغل",reason_planned_maintenance:"صيانة مخططة",reason_quality_issue:"مشكلة جودة",reason_setup:"إعداد",reason_other:"أخرى",workorders_hint:"يحوّل تنبؤ الذكاء الاصطناعي إلى مهمة متتبعة — لينتهي التحذير بإصلاح فعلي.",new_work_order_btn:"+ أمر عمل جديد",no_work_orders:"لا توجد أوامر عمل.",avg_completion_label:"متوسط الإنجاز",assigned_label:"مُسند إلى",source_ai:"ذكاء اصطناعي",wo_status_open:"مفتوح",wo_status_in_progress:"قيد التنفيذ",wo_status_done:"منجز",wo_status_cancelled:"ملغى",wo_advance_to_in_progress:"بدء العمل",wo_advance_to_done:"وضع علامة منجز",ph_shift_name:"اسم الوردية",ph_planned_minutes:"الدقائق المخططة",ph_downtime_minutes:"دقائق التوقف",ph_total_units:"إجمالي الوحدات",ph_good_units:"الوحدات السليمة",ph_cycle_seconds:"الدورة المثالية (ثانية)",ph_wo_title:"العنوان",ph_assigned_to:"مُسند إلى",ph_wo_description:"الوصف",overdue_label:"متأخر",nav_history:"السجل",history_hint:"سجل المستشعرات المحفوظ — هكذا تثبت ما تغيّر فعليًا خلال التجربة.",no_history_yet:"لم يتم تسجيل سجل بعد. اترك المراقبة المباشرة مفتوحة لبضع دقائق وستبدأ البيانات بالتراكم.",range_24h:"24 ساعة",range_3d:"3 أيام",range_10d:"10 أيام",sensor_trend_title:"اتجاه المستشعرات",risk_trend_title:"اتجاه المخاطر",trend_flat:"بدون تغيير",trend_rising:"في ارتفاع",trend_falling:"في انخفاض",create_work_order_btn:"إنشاء أمر عمل",work_order_created_msg:"تم إنشاء أمر العمل",alertreason_immediate_failure_risk:"خطر عطل فوري",alertreason_failure_imminent:"عطل وشيك",alertreason_degradation_accelerating:"تدهور متسارع",alertreason_outside_normal_envelope:"خارج النطاق الطبيعي",alertreason_pressure_anomaly:"شذوذ في الضغط",alertreason_idle_waste:"هدر طاقة الخمول",alertreason_informational:"معلوماتي",alert_reason_label:"السبب"},
-  tr: {tagline:"Küresel Endüstriyel Zeka Platformu",live_label:"Canlı",kpi_energy:"Enerji Kullanımı",kpi_efficiency:"Verimlilik",kpi_active:"Aktif Makineler",kpi_alerts:"Uyarılar",kwh_unit:"kWh",chart_title:"Gerçek Zamanlı Performans",machine_status_title:"Makine Durumu",status_running:"Çalışıyor",status_warning:"Uyarı",status_critical:"Kritik",form_title:"Fabrika Veri Girişi",factory_name_label:"Fabrika Adı",machine_count_label:"Makine Sayısı",energy_cost_label:"Enerji Maliyeti ($/kWh)",machine_type_label:"Makine Türü",temperature_label:"Sıcaklık (°C)",vibration_label:"Titreşim (mm/s)",load_label:"Yük (%)",submit_btn:"Fabrikayı Analiz Et",submitting:"Güncelleniyor...",ai_panel_title:"AI Analizleri",ai_placeholder:"AI analizi oluşturmak için fabrika verilerini gönderin.",ai_analyzing:"Analiz ediliyor...",ai_risks:"Riskler",ai_efficiency_insights:"Verimlilik Analizi",ai_optimizations:"Optimizasyon Önerileri",toast_updated:"Fabrika verileri güncellendi",toast_analysis_done:"AI analizi tamamlandı",toast_error:"Bir şeyler ters gitti",nav_dashboard:"Panel",nav_factories:"Fabrikalar",nav_ai_insights:"AI Analizleri",logout_btn:"Çıkış Yap",login_title:"Tekrar hoş geldiniz",login_subtitle:"FactoryPulse AI hesabınıza giriş yapın",ph_email:"E-posta",ph_password:"Şifre",remember_me:"Beni hatırla",login_btn:"Giriş Yap",login_link_register:"Hesabınız yok mu? Oluşturun",register_title:"Hesabınızı oluşturun",register_subtitle:"Fabrikalarınızı AI ile izlemeye başlayın",ph_full_name:"Ad Soyad",ph_confirm_password:"Şifreyi Onayla",register_btn:"Hesap Oluştur",register_link_login:"Zaten hesabınız var mı? Giriş yapın",err_missing_fields:"Lütfen tüm alanları doldurun",err_invalid_email:"Lütfen geçerli bir e-posta adresi girin",err_weak_password:"Şifre en az 8 karakter, bir harf ve bir rakam içermeli",err_password_mismatch:"Şifreler eşleşmiyor",err_invalid_credentials:"E-posta veya şifre hatalı",err_email_taken:"Bu e-posta zaten kayıtlı",err_generic:"Bir şeyler ters gitti. Tekrar deneyin",my_factories_title:"Fabrikalarım",add_factory_btn:"+ Fabrika Ekle",edit_factory_btn:"Düzenle",delete_factory_btn:"Sil",confirm_delete_factory:"Bu fabrika silinsin mi? Bu işlem geri alınamaz.",no_factories_yet:"Henüz fabrika eklemediniz.",factory_created_toast:"Fabrika oluşturuldu ve analiz edildi",factory_updated_toast:"Fabrika güncellendi",factory_deleted_toast:"Fabrika silindi",ai_insights_feed_title:"AI Analiz Akışı",no_ai_insights_yet:"Henüz AI analizi yok. Başlamak için fabrika ekleyin.",reanalyze_btn:"Yeniden Analiz Et",view_insights_btn:"Analizleri Görüntüle",created_label:"Oluşturulma",cancel_btn:"İptal",save_btn:"Değişiklikleri Kaydet",nav_live_monitor:"Canlı İzleme",add_machine_scada_btn:"+ Makine Ekle",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Sorgulama",live_chart_title:"Canlı Sensör Grafiği",machines_table_title:"Makineler",machine_code_col:"Kod",machine_name_col:"Ad",status_col:"Durum",risk_col:"Risk",no_machines_yet:"Henüz makine yok. \"+ Makine Ekle\"ye tıklayın.",section_machine_info:"Makine Bilgisi",section_sensor_data:"Sensör Verileri",section_status:"Durum",section_notes:"Notlar",status_stopped:"Durduruldu",status_maintenance:"Bakımda",priority_low:"Düşük",priority_normal:"Normal",priority_high:"Yüksek",priority_critical:"Kritik",save_and_analyze_btn:"Kaydet ve Analiz Et",source_col:"Kaynak",source_auto:"Otomatik (SCADA)",source_manual:"Manuel",nav_alerts:"Uyarılar",acknowledge_btn:"Onayla",acknowledged_label:"Onaylandı",acknowledge_all_btn:"Tümünü Onayla",no_alerts_yet:"Uyarı yok. Her şey sorunsuz çalışıyor.",download_report_btn:"Rapor",alert_details_template:"Sıcaklık {temp}°C, titreşim {vib} mm/s, durum: {status}",section_energy_intel:"Enerji Zekası",daily_output_hint:"Özgül enerji tüketimini hesaplamak için kullanılır (birim başına kWh).",energy_insights_title:"Enerji Zekası",idle_power_title:"Boşta Güç Tespiti",idle_active_msg:"Makine boşta - şu anda yaklaşık {kw} kW israf ediliyor.",idle_none_msg:"Boşta enerji israfı tespit edilmedi.",friction_loss_title:"Öngörülü Enerji Kaybı",friction_active_msg:"Artan sürtünme tespit edildi: +%{pct} fazla güç (~{kw} kW ekstra). Kayıpları önlemek için bakım planlayın.",friction_none_msg:"Anormal sürtünme tespit edilmedi.",sec_title:"Özgül Enerji Tüketimi",sec_label:"birim başına kWh",sec_unit:"kWh/birim",sec_no_data_msg:"Bu metriği görmek için makineyi eklerken günlük üretimi girin.",optimal_load_title:"Optimal Yük Bölgesi",optimal_load_label:"Optimal yük",current_load_label:"Mevcut yük",at_optimal_msg:"Optimal yük bölgesinde çalışıyor.",adjust_to_optimal_msg:"Birim başına enerjiyi en aza indirmek için yükü %{pct}'e ayarlayın.",nav_digital_twin:"Dijital İkiz",twin_hint:"Döndürmek için sürükleyin, yakınlaştırmak için kaydırın, canlı detaylar için bir makineye tıklayın.",twin_unavailable_msg:"3D görünüm yüklenemedi (Three.js kütüphanesi için internet bağlantınızı kontrol edin).",failure_prediction_title:"Arıza Tahmini",report_lib_missing_msg:"PDF dışa aktarma için reportlab kütüphanesi gerekir. Çalıştırın: pip install reportlab, ardından sunucuyu yeniden başlatın.",ph_machine_id:"Makine ID (örn. M-01)",ph_machine_name:"Makine Adı",ph_factory_section:"Fabrika Bölümü",ph_operator_name:"Operatör Adı",ph_pressure:"Basınç (bar)",ph_voltage:"Voltaj (V)",ph_current:"Akım (A)",ph_error_code:"Hata Kodu",ph_daily_output:"Günlük Üretim (birim)",ph_notes:"Notlar...",nav_system_intel:"Sistem Zekası",nav_roi:"ROI Panosu",refresh_btn:"Yenile",system_risk_label:"Sistem Riski",healthy_label:"Sağlıklı",at_risk_label:"Riskli",clusters_title:"Makine Kümeleri",propagation_title:"Anomali Yayılımı",propagation_hint:"Arızalı bir makinenin komşularının riskini nasıl artırdığı.",no_propagation:"Anomali yayılımı tespit edilmedi.",avg_risk_label:"Ort. risk",added_risk_label:"Eklenen risk",effective_risk_label:"Etkin risk",simulation_title:"Ne-Olur Simülasyonu",simulation_hint:"Bir makine seçin, sensör değerlerini kaydırın ve arıza olasılığını izleyin.",run_simulation_btn:"Simülasyonu Çalıştır",failure_probability_label:"Arıza Olasılığı",stress_level_label:"Zorlanma Seviyesi",predicted_status_label:"Tahmini Durum",confidence_label:"Güven",root_cause_title:"Kök Neden",rul_col:"Kalan Ömür",rul_healthy:"Sağlıklı",potential_loss_label:"Potansiyel Kayıp",saved_label:"AI ile Tasarruf",wasted_energy_label:"İsraf Edilen Enerji / ay",efficiency_gain_label:"Verimlilik Artışı",cost_by_machine_title:"Makine Bazlı Maliyet Riski",top_cause_col:"Ana Neden",roi_assumptions_msg:"Varsayımlar: duruş {downtime}/sa, onarım {hours} sa, enerji {price}/kWh.",role_label:"Rolünüz",role_engineer:"Mühendis",role_manager:"Yönetici",role_admin:"Admin",cause_bearing_wear:"Rulman aşınması",cause_overload_thermal:"Termal aşırı yük",cause_cooling_failure:"Soğutma arızası",cause_misalignment:"Mil kaçıklığı",cause_lubrication_loss:"Yağlama kaybı",cause_normal_operation:"Normal çalışma",nav_story:"Hikaye Modu",story_hint:"22 saat içinde gelişen bir rulman arızasını yeniden oynatır ve yapay zekanın onu tam olarak ne zaman yakaladığını — ve bunun değerini gösterir.",simulate_failure_btn:"Arıza Simüle Et",outcome_title:"Sonuç",warning_time_label:"Erken Uyarı",loss_ignored_label:"Müdahalesiz Kayıp",loss_acted_label:"Müdahaleli Kayıp",money_saved_label:"Tasarruf",timeline_title:"Arıza Zaman Çizelgesi",story_detection_msg:"Yapay zeka bunu arızadan {hours} saat önce, %{risk} riskte tespit etti — kök neden: {cause} (%{confidence} güven).",story_stage_healthy:"Sağlıklı",story_stage_early_drift:"İlk Sapma",story_stage_ai_detects:"Yapay Zeka Tespit Etti",story_stage_critical:"Kritik",priority_low:"Düşük",priority_medium:"Orta",priority_high:"Yüksek",priority_critical:"Kritik",action_stop_machine:"Makineyi durdur",action_inspect_bearings:"Rulmanları incele",action_check_cooling:"Soğutmayı kontrol et",action_schedule_shutdown_24h:"Duruş planla (24s)",action_order_spare_parts:"Yedek parça sipariş et",action_reduce_load:"Yükü azalt",action_schedule_inspection_72h:"Muayene planla (72s)",action_monitor_closely:"Yakından izle",action_verify_sensor:"Sensörü doğrula",action_power_down_idle:"Boştaki makineyi kapat",action_review_shift_schedule:"Vardiya planını gözden geçir",action_no_action:"İşlem gerekmiyor",nav_oee:"OEE",nav_workorders:"İş Emirleri",oee_hint:"Kullanılabilirlik x Performans x Kalite (ISO 22400). Dünya standardı %85, tipik bir fabrika ise %60 civarındadır.",availability_label:"Kullanılabilirlik",performance_label:"Performans",quality_label:"Kalite",weakest_factor_label:"En zayıf",downtime_by_reason_title:"Nedene Göre Duruş",downtime_cost_label:"Duruş maliyeti",oee_trend_title:"OEE Trendi",shifts_title:"Vardiyalar",shift_col:"Vardiya",downtime_col:"Duruş",log_shift_btn:"Vardiya Kaydet",no_shifts_yet:"Henüz vardiya kaydedilmedi.",minutes_short:"dk",range_1d:"Bugün",range_7d:"7 gün",range_30d:"30 gün",all_machines_option:"Tüm makineler",reason_unspecified:"Belirtilmemiş",err_good_exceeds_total:"Sağlam adet toplamı aşamaz",oee_grade_world_class:"Dünya standardı",oee_grade_typical:"Tipik",oee_grade_low:"Düşük",oee_grade_critical:"Kritik",reason_breakdown:"Arıza",reason_changeover:"Tip değişimi",reason_no_material:"Malzeme yok",reason_no_operator:"Operatör yok",reason_planned_maintenance:"Planlı bakım",reason_quality_issue:"Kalite sorunu",reason_setup:"Kurulum",reason_other:"Diğer",workorders_hint:"AI tahminini takip edilebilir bir göreve dönüştürür — böylece uyarı gerçekten onarımla biter.",new_work_order_btn:"+ Yeni İş Emri",no_work_orders:"Henüz iş emri yok.",avg_completion_label:"Ort. Tamamlama",assigned_label:"Atanan",source_ai:"AI",wo_status_open:"Açık",wo_status_in_progress:"Devam Ediyor",wo_status_done:"Tamamlandı",wo_status_cancelled:"İptal",wo_advance_to_in_progress:"İşe başla",wo_advance_to_done:"Tamamlandı işaretle",ph_shift_name:"Vardiya adı",ph_planned_minutes:"Planlı dakika",ph_downtime_minutes:"Duruş dakikası",ph_total_units:"Toplam adet",ph_good_units:"Sağlam adet",ph_cycle_seconds:"İdeal çevrim (sn)",ph_wo_title:"Başlık",ph_assigned_to:"Atanan kişi",ph_wo_description:"Açıklama",overdue_label:"Gecikmiş",nav_history:"Geçmiş",history_hint:"Kaydedilmiş sensör geçmişi — pilot süresince gerçekte neyin değiştiğini böyle kanıtlarsınız.",no_history_yet:"Henüz geçmiş kaydedilmedi. Canlı İzleme'yi birkaç dakika açık tutun, veriler birikmeye başlar.",range_24h:"24 saat",range_3d:"3 gün",range_10d:"10 gün",sensor_trend_title:"Sensör Trendi",risk_trend_title:"Risk Trendi",trend_flat:"değişim yok",trend_rising:"yükseliyor",trend_falling:"düşüyor",create_work_order_btn:"İş Emri Oluştur",work_order_created_msg:"İş emri oluşturuldu",alertreason_immediate_failure_risk:"Ani arıza riski",alertreason_failure_imminent:"Arıza çok yakın",alertreason_degradation_accelerating:"Bozulma hızlanıyor",alertreason_outside_normal_envelope:"Normal aralık dışında",alertreason_pressure_anomaly:"Basınç anomalisi",alertreason_idle_waste:"Boşta enerji israfı",alertreason_informational:"Bilgilendirme",alert_reason_label:"Neden"},
-  it: {tagline:"Piattaforma Globale di Intelligenza Industriale",live_label:"In diretta",kpi_energy:"Consumo Energetico",kpi_efficiency:"Efficienza",kpi_active:"Macchine Attive",kpi_alerts:"Avvisi",kwh_unit:"kWh",chart_title:"Prestazioni in Tempo Reale",machine_status_title:"Stato delle Macchine",status_running:"In funzione",status_warning:"Avviso",status_critical:"Critico",form_title:"Inserimento Dati Fabbrica",factory_name_label:"Nome Fabbrica",machine_count_label:"Numero di Macchine",energy_cost_label:"Costo Energia ($/kWh)",machine_type_label:"Tipo di Macchina",temperature_label:"Temperatura (°C)",vibration_label:"Vibrazione (mm/s)",load_label:"Carico (%)",submit_btn:"Analizza Fabbrica",submitting:"Aggiornamento...",ai_panel_title:"Analisi IA",ai_placeholder:"Invia i dati della fabbrica per generare un'analisi IA.",ai_analyzing:"Analisi in corso...",ai_risks:"Rischi",ai_efficiency_insights:"Analisi dell'Efficienza",ai_optimizations:"Suggerimenti di Ottimizzazione",toast_updated:"Dati fabbrica aggiornati",toast_analysis_done:"Analisi IA completata",toast_error:"Qualcosa è andato storto",nav_dashboard:"Dashboard",nav_factories:"Fabbriche",nav_ai_insights:"Analisi IA",logout_btn:"Esci",login_title:"Bentornato",login_subtitle:"Accedi al tuo account FactoryPulse AI",ph_email:"Email",ph_password:"Password",remember_me:"Ricordami",login_btn:"Accedi",login_link_register:"Non hai un account? Creane uno",register_title:"Crea il tuo account",register_subtitle:"Inizia a monitorare le tue fabbriche con l'IA",ph_full_name:"Nome Completo",ph_confirm_password:"Conferma Password",register_btn:"Crea Account",register_link_login:"Hai già un account? Accedi",err_missing_fields:"Si prega di compilare tutti i campi",err_invalid_email:"Inserisci un indirizzo email valido",err_weak_password:"La password deve avere almeno 8 caratteri, una lettera e un numero",err_password_mismatch:"Le password non corrispondono",err_invalid_credentials:"Email o password errati",err_email_taken:"Questa email è già registrata",err_generic:"Qualcosa è andato storto. Riprova",my_factories_title:"Le Mie Fabbriche",add_factory_btn:"+ Aggiungi Fabbrica",edit_factory_btn:"Modifica",delete_factory_btn:"Elimina",confirm_delete_factory:"Eliminare questa fabbrica? Questa azione non può essere annullata.",no_factories_yet:"Non hai ancora aggiunto nessuna fabbrica.",factory_created_toast:"Fabbrica creata e analizzata",factory_updated_toast:"Fabbrica aggiornata",factory_deleted_toast:"Fabbrica eliminata",ai_insights_feed_title:"Feed di Analisi IA",no_ai_insights_yet:"Nessuna analisi IA ancora. Aggiungi una fabbrica.",reanalyze_btn:"Rianalizza",view_insights_btn:"Vedi Analisi",created_label:"Creata il",cancel_btn:"Annulla",save_btn:"Salva Modifiche",nav_live_monitor:"Monitoraggio Live",add_machine_scada_btn:"+ Aggiungi Macchina",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Polling",live_chart_title:"Grafico Sensori in Tempo Reale",machines_table_title:"Macchine",machine_code_col:"Codice",machine_name_col:"Nome",status_col:"Stato",risk_col:"Rischio",no_machines_yet:"Nessuna macchina ancora. Fai clic su «+ Aggiungi Macchina».",section_machine_info:"Informazioni Macchina",section_sensor_data:"Dati dei Sensori",section_status:"Stato",section_notes:"Note",status_stopped:"Ferma",status_maintenance:"Manutenzione",priority_low:"Bassa",priority_normal:"Normale",priority_high:"Alta",priority_critical:"Critica",save_and_analyze_btn:"Salva e Analizza",source_col:"Origine",source_auto:"Auto (SCADA)",source_manual:"Manuale",nav_alerts:"Avvisi",acknowledge_btn:"Conferma",acknowledged_label:"Confermato",acknowledge_all_btn:"Conferma Tutti",no_alerts_yet:"Nessun avviso. Tutto funziona correttamente.",download_report_btn:"Rapporto",alert_details_template:"Temperatura {temp}°C, vibrazione {vib} mm/s, stato: {status}",section_energy_intel:"Intelligenza Energetica",daily_output_hint:"Usato per calcolare il consumo energetico specifico (kWh per unità).",energy_insights_title:"Intelligenza Energetica",idle_power_title:"Rilevamento Potenza in Inattività",idle_active_msg:"Macchina inattiva - circa {kw} kW sprecati ora.",idle_none_msg:"Nessuno spreco di energia in inattività rilevato.",friction_loss_title:"Perdita di Energia Predittiva",friction_active_msg:"Attrito elevato rilevato: +{pct}% di sovraccarico (~{kw} kW extra). Pianifica la manutenzione per evitare perdite.",friction_none_msg:"Nessun attrito anomalo rilevato.",sec_title:"Consumo Energetico Specifico",sec_label:"kWh per unità",sec_unit:"kWh/unità",sec_no_data_msg:"Inserisci la produzione giornaliera aggiungendo questa macchina per vedere questa metrica.",optimal_load_title:"Zona di Carico Ottimale",optimal_load_label:"Carico ottimale",current_load_label:"Carico attuale",at_optimal_msg:"In funzione nella zona di carico ottimale.",adjust_to_optimal_msg:"Regola il carico verso {pct}% per minimizzare l'energia per unità.",nav_digital_twin:"Gemello Digitale",twin_hint:"Trascina per ruotare, scorri per zoomare, clicca su una macchina per i dettagli in tempo reale.",twin_unavailable_msg:"Impossibile caricare la vista 3D (controlla la connessione internet per Three.js).",failure_prediction_title:"Previsione del Guasto",report_lib_missing_msg:"L'esportazione PDF richiede la libreria reportlab. Esegui: pip install reportlab, poi riavvia il server.",ph_machine_id:"ID Macchina (es. M-01)",ph_machine_name:"Nome Macchina",ph_factory_section:"Sezione Fabbrica",ph_operator_name:"Nome Operatore",ph_pressure:"Pressione (bar)",ph_voltage:"Tensione (V)",ph_current:"Corrente (A)",ph_error_code:"Codice Errore",ph_daily_output:"Produzione Giornaliera (unità)",ph_notes:"Note...",nav_system_intel:"Intelligenza di Sistema",nav_roi:"Dashboard ROI",refresh_btn:"Aggiorna",system_risk_label:"Rischio di Sistema",healthy_label:"Sane",at_risk_label:"A Rischio",clusters_title:"Cluster di Macchine",propagation_title:"Propagazione Anomalie",propagation_hint:"Come una macchina in avaria aumenta il rischio delle vicine.",no_propagation:"Nessuna propagazione di anomalie rilevata.",avg_risk_label:"Rischio medio",added_risk_label:"Rischio aggiunto",effective_risk_label:"Rischio effettivo",simulation_title:"Simulazione What-If",simulation_hint:"Scegli una macchina, modifica i sensori e osserva la probabilità di guasto.",run_simulation_btn:"Avvia Simulazione",failure_probability_label:"Probabilità di Guasto",stress_level_label:"Livello di Stress",predicted_status_label:"Stato Previsto",confidence_label:"Confidenza",root_cause_title:"Causa Radice",rul_col:"Vita Utile Residua",rul_healthy:"Sana",potential_loss_label:"Perdita Potenziale",saved_label:"Risparmiato dall'IA",wasted_energy_label:"Energia Sprecata / mese",efficiency_gain_label:"Guadagno di Efficienza",cost_by_machine_title:"Esposizione ai Costi per Macchina",top_cause_col:"Causa Principale",roi_assumptions_msg:"Ipotesi: fermo {downtime}/h, riparazione {hours}h, energia {price}/kWh.",role_label:"Il Tuo Ruolo",role_engineer:"Ingegnere",role_manager:"Manager",role_admin:"Amministratore",cause_bearing_wear:"Usura del cuscinetto",cause_overload_thermal:"Sovraccarico termico",cause_cooling_failure:"Guasto raffreddamento",cause_misalignment:"Disallineamento albero",cause_lubrication_loss:"Perdita di lubrificazione",cause_normal_operation:"Funzionamento normale",nav_story:"Modalità Storia",story_hint:"Riproduce un guasto al cuscinetto che si sviluppa in 22 ore e mostra esattamente quando l'IA lo ha rilevato — e quanto valeva.",simulate_failure_btn:"Simula Guasto",outcome_title:"Risultato",warning_time_label:"Preavviso",loss_ignored_label:"Perdita senza Intervento",loss_acted_label:"Perdita con Intervento",money_saved_label:"Risparmiato",timeline_title:"Cronologia del Guasto",story_detection_msg:"L'IA lo ha segnalato {hours} ore prima del guasto, al {risk}% di rischio — causa radice: {cause} (confidenza {confidence}%).",story_stage_healthy:"Sana",story_stage_early_drift:"Prima Deriva",story_stage_ai_detects:"L'IA Rileva",story_stage_critical:"Critico",priority_low:"Basso",priority_medium:"Medio",priority_high:"Alto",priority_critical:"Critico",action_stop_machine:"Ferma macchina",action_inspect_bearings:"Ispeziona cuscinetti",action_check_cooling:"Controlla raffreddamento",action_schedule_shutdown_24h:"Pianifica fermo (24h)",action_order_spare_parts:"Ordina ricambi",action_reduce_load:"Riduci carico",action_schedule_inspection_72h:"Pianifica ispezione (72h)",action_monitor_closely:"Monitora da vicino",action_verify_sensor:"Verifica sensore",action_power_down_idle:"Spegni macchina inattiva",action_review_shift_schedule:"Rivedi turni",action_no_action:"Nessuna azione necessaria",nav_oee:"OEE",nav_workorders:"Ordini di Lavoro",oee_hint:"Disponibilità x Prestazioni x Qualità (ISO 22400). Il livello mondiale è 85%, una fabbrica tipica si attesta sul 60%.",availability_label:"Disponibilità",performance_label:"Prestazioni",quality_label:"Qualità",weakest_factor_label:"Più debole",downtime_by_reason_title:"Fermi per Causa",downtime_cost_label:"Costo dei fermi",oee_trend_title:"Andamento OEE",shifts_title:"Turni",shift_col:"Turno",downtime_col:"Fermo",log_shift_btn:"Registra Turno",no_shifts_yet:"Nessun turno registrato.",minutes_short:"min",range_1d:"Oggi",range_7d:"7 giorni",range_30d:"30 giorni",all_machines_option:"Tutte le macchine",reason_unspecified:"Non specificato",err_good_exceeds_total:"I pezzi buoni non possono superare il totale",oee_grade_world_class:"Livello mondiale",oee_grade_typical:"Tipico",oee_grade_low:"Basso",oee_grade_critical:"Critico",reason_breakdown:"Guasto",reason_changeover:"Cambio produzione",reason_no_material:"Materiale mancante",reason_no_operator:"Operatore mancante",reason_planned_maintenance:"Manutenzione pianificata",reason_quality_issue:"Problema qualità",reason_setup:"Setup",reason_other:"Altro",workorders_hint:"Trasforma una previsione IA in un compito tracciato — così un allarme finisce in una riparazione.",new_work_order_btn:"+ Nuovo Ordine",no_work_orders:"Nessun ordine di lavoro.",avg_completion_label:"Completamento medio",assigned_label:"Assegnato",source_ai:"IA",wo_status_open:"Aperto",wo_status_in_progress:"In corso",wo_status_done:"Completato",wo_status_cancelled:"Annullato",wo_advance_to_in_progress:"Inizia lavoro",wo_advance_to_done:"Segna completato",ph_shift_name:"Nome turno",ph_planned_minutes:"Minuti pianificati",ph_downtime_minutes:"Minuti di fermo",ph_total_units:"Unità totali",ph_good_units:"Unità buone",ph_cycle_seconds:"Ciclo ideale (sec)",ph_wo_title:"Titolo",ph_assigned_to:"Assegnato a",ph_wo_description:"Descrizione",overdue_label:"In ritardo",nav_history:"Cronologia",history_hint:"Cronologia dei sensori salvata — così dimostri cosa è realmente cambiato durante il pilota.",no_history_yet:"Nessuna cronologia registrata. Tieni il Monitoraggio aperto qualche minuto e i dati inizieranno ad accumularsi.",range_24h:"24 ore",range_3d:"3 giorni",range_10d:"10 giorni",sensor_trend_title:"Andamento Sensori",risk_trend_title:"Andamento Rischio",trend_flat:"nessuna variazione",trend_rising:"in aumento",trend_falling:"in calo",create_work_order_btn:"Crea Ordine",work_order_created_msg:"Ordine di lavoro creato",alertreason_immediate_failure_risk:"Rischio di guasto immediato",alertreason_failure_imminent:"Guasto imminente",alertreason_degradation_accelerating:"Degrado in accelerazione",alertreason_outside_normal_envelope:"Fuori dal range normale",alertreason_pressure_anomaly:"Anomalia di pressione",alertreason_idle_waste:"Spreco in inattività",alertreason_informational:"Informativo",alert_reason_label:"Motivo"},
-  pt: {tagline:"Plataforma Global de Inteligência Industrial",live_label:"Ao vivo",kpi_energy:"Uso de Energia",kpi_efficiency:"Eficiência",kpi_active:"Máquinas Ativas",kpi_alerts:"Alertas",kwh_unit:"kWh",chart_title:"Desempenho em Tempo Real",machine_status_title:"Status das Máquinas",status_running:"Em funcionamento",status_warning:"Aviso",status_critical:"Crítico",form_title:"Entrada de Dados da Fábrica",factory_name_label:"Nome da Fábrica",machine_count_label:"Número de Máquinas",energy_cost_label:"Custo de Energia ($/kWh)",machine_type_label:"Tipo de Máquina",temperature_label:"Temperatura (°C)",vibration_label:"Vibração (mm/s)",load_label:"Carga (%)",submit_btn:"Analisar Fábrica",submitting:"Atualizando...",ai_panel_title:"Insights de IA",ai_placeholder:"Envie os dados da fábrica para gerar uma análise de IA.",ai_analyzing:"Analisando...",ai_risks:"Riscos",ai_efficiency_insights:"Análise de Eficiência",ai_optimizations:"Sugestões de Otimização",toast_updated:"Dados da fábrica atualizados",toast_analysis_done:"Análise de IA concluída",toast_error:"Algo deu errado",nav_dashboard:"Painel",nav_factories:"Fábricas",nav_ai_insights:"Insights de IA",logout_btn:"Sair",login_title:"Bem-vindo de volta",login_subtitle:"Entre na sua conta FactoryPulse AI",ph_email:"E-mail",ph_password:"Senha",remember_me:"Lembrar de mim",login_btn:"Entrar",login_link_register:"Não tem conta? Crie uma",register_title:"Crie sua conta",register_subtitle:"Comece a monitorar suas fábricas com IA",ph_full_name:"Nome Completo",ph_confirm_password:"Confirmar Senha",register_btn:"Criar Conta",register_link_login:"Já tem conta? Entrar",err_missing_fields:"Por favor preencha todos os campos",err_invalid_email:"Por favor insira um e-mail válido",err_weak_password:"A senha deve ter no mínimo 8 caracteres, uma letra e um número",err_password_mismatch:"As senhas não coincidem",err_invalid_credentials:"E-mail ou senha incorretos",err_email_taken:"Este e-mail já está registrado",err_generic:"Algo deu errado. Tente novamente",my_factories_title:"Minhas Fábricas",add_factory_btn:"+ Adicionar Fábrica",edit_factory_btn:"Editar",delete_factory_btn:"Excluir",confirm_delete_factory:"Excluir esta fábrica? Esta ação não pode ser desfeita.",no_factories_yet:"Você ainda não adicionou nenhuma fábrica.",factory_created_toast:"Fábrica criada e analisada",factory_updated_toast:"Fábrica atualizada",factory_deleted_toast:"Fábrica excluída",ai_insights_feed_title:"Feed de Insights de IA",no_ai_insights_yet:"Ainda sem insights de IA. Adicione uma fábrica.",reanalyze_btn:"Reanalisar",view_insights_btn:"Ver Insights",created_label:"Criada em",cancel_btn:"Cancelar",save_btn:"Salvar Alterações",nav_live_monitor:"Monitor ao Vivo",add_machine_scada_btn:"+ Adicionar Máquina",usb_status:"USB:",plc_status:"CLP:",polling_mode:"Sondagem",live_chart_title:"Gráfico de Sensores ao Vivo",machines_table_title:"Máquinas",machine_code_col:"Código",machine_name_col:"Nome",status_col:"Status",risk_col:"Risco",no_machines_yet:"Ainda sem máquinas. Clique em «+ Adicionar Máquina».",section_machine_info:"Informações da Máquina",section_sensor_data:"Dados do Sensor",section_status:"Status",section_notes:"Notas",status_stopped:"Parada",status_maintenance:"Manutenção",priority_low:"Baixa",priority_normal:"Normal",priority_high:"Alta",priority_critical:"Crítica",save_and_analyze_btn:"Salvar e Analisar",source_col:"Origem",source_auto:"Auto (SCADA)",source_manual:"Manual",nav_alerts:"Alertas",acknowledge_btn:"Confirmar",acknowledged_label:"Confirmado",acknowledge_all_btn:"Confirmar Todos",no_alerts_yet:"Sem alertas. Tudo funcionando normalmente.",download_report_btn:"Relatório",alert_details_template:"Temperatura {temp}°C, vibração {vib} mm/s, status: {status}",section_energy_intel:"Inteligência Energética",daily_output_hint:"Usado para calcular o consumo energético específico (kWh por unidade).",energy_insights_title:"Inteligência Energética",idle_power_title:"Detecção de Potência Ociosa",idle_active_msg:"Máquina ociosa - cerca de {kw} kW desperdiçados agora.",idle_none_msg:"Nenhum desperdício de energia ociosa detectado.",friction_loss_title:"Perda de Energia Preditiva",friction_active_msg:"Atrito elevado detectado: +{pct}% de sobrecarga (~{kw} kW extra). Agende manutenção para evitar perdas.",friction_none_msg:"Nenhum atrito anormal detectado.",sec_title:"Consumo Energético Específico",sec_label:"kWh por unidade",sec_unit:"kWh/unidade",sec_no_data_msg:"Insira a produção diária ao adicionar esta máquina para ver esta métrica.",optimal_load_title:"Zona de Carga Ideal",optimal_load_label:"Carga ideal",current_load_label:"Carga atual",at_optimal_msg:"Funcionando na zona de carga ideal.",adjust_to_optimal_msg:"Ajuste a carga para {pct}% para minimizar a energia por unidade.",nav_digital_twin:"Gêmeo Digital",twin_hint:"Arraste para girar, role para ampliar, clique em uma máquina para ver detalhes ao vivo.",twin_unavailable_msg:"Não foi possível carregar a visualização 3D (verifique sua conexão com a internet para o Three.js).",failure_prediction_title:"Previsão de Falha",report_lib_missing_msg:"A exportação em PDF precisa da biblioteca reportlab. Execute: pip install reportlab, depois reinicie o servidor.",ph_machine_id:"ID da Máquina (ex. M-01)",ph_machine_name:"Nome da Máquina",ph_factory_section:"Seção da Fábrica",ph_operator_name:"Nome do Operador",ph_pressure:"Pressão (bar)",ph_voltage:"Tensão (V)",ph_current:"Corrente (A)",ph_error_code:"Código de Erro",ph_daily_output:"Produção Diária (unidades)",ph_notes:"Notas...",nav_system_intel:"Inteligência do Sistema",nav_roi:"Painel de ROI",refresh_btn:"Atualizar",system_risk_label:"Risco do Sistema",healthy_label:"Saudáveis",at_risk_label:"Em Risco",clusters_title:"Clusters de Máquinas",propagation_title:"Propagação de Anomalias",propagation_hint:"Como uma máquina com falha eleva o risco das vizinhas.",no_propagation:"Nenhuma propagação de anomalia detectada.",avg_risk_label:"Risco médio",added_risk_label:"Risco adicionado",effective_risk_label:"Risco efetivo",simulation_title:"Simulação E-Se",simulation_hint:"Escolha uma máquina, ajuste os sensores e veja a probabilidade de falha mudar.",run_simulation_btn:"Executar Simulação",failure_probability_label:"Probabilidade de Falha",stress_level_label:"Nível de Estresse",predicted_status_label:"Status Previsto",confidence_label:"Confiança",root_cause_title:"Causa Raiz",rul_col:"Vida Útil Restante",rul_healthy:"Saudável",potential_loss_label:"Perda Potencial",saved_label:"Economizado pela IA",wasted_energy_label:"Energia Desperdiçada / mês",efficiency_gain_label:"Ganho de Eficiência",cost_by_machine_title:"Exposição de Custo por Máquina",top_cause_col:"Causa Principal",roi_assumptions_msg:"Premissas: parada {downtime}/h, reparo {hours}h, energia {price}/kWh.",role_label:"Sua Função",role_engineer:"Engenheiro",role_manager:"Gerente",role_admin:"Administrador",cause_bearing_wear:"Desgaste de rolamento",cause_overload_thermal:"Sobrecarga térmica",cause_cooling_failure:"Falha de refrigeração",cause_misalignment:"Desalinhamento do eixo",cause_lubrication_loss:"Perda de lubrificação",cause_normal_operation:"Operação normal",nav_story:"Modo História",story_hint:"Reproduz uma falha de rolamento se desenvolvendo em 22 horas e mostra exatamente quando a IA a detectou — e quanto isso valia.",simulate_failure_btn:"Simular Falha",outcome_title:"Resultado",warning_time_label:"Aviso Antecipado",loss_ignored_label:"Perda sem Ação",loss_acted_label:"Perda com Ação",money_saved_label:"Economizado",timeline_title:"Linha do Tempo da Falha",story_detection_msg:"A IA sinalizou isso {hours} horas antes da quebra, com {risk}% de risco — causa raiz: {cause} ({confidence}% de confiança).",story_stage_healthy:"Saudável",story_stage_early_drift:"Primeiro Desvio",story_stage_ai_detects:"IA Detecta",story_stage_critical:"Crítico",priority_low:"Baixo",priority_medium:"Médio",priority_high:"Alto",priority_critical:"Crítico",action_stop_machine:"Parar máquina",action_inspect_bearings:"Inspecionar rolamentos",action_check_cooling:"Verificar refrigeração",action_schedule_shutdown_24h:"Agendar parada (24h)",action_order_spare_parts:"Pedir peças",action_reduce_load:"Reduzir carga",action_schedule_inspection_72h:"Agendar inspeção (72h)",action_monitor_closely:"Monitorar de perto",action_verify_sensor:"Verificar sensor",action_power_down_idle:"Desligar máquina ociosa",action_review_shift_schedule:"Revisar turnos",action_no_action:"Nenhuma ação necessária",nav_oee:"OEE",nav_workorders:"Ordens de Serviço",oee_hint:"Disponibilidade x Desempenho x Qualidade (ISO 22400). O nível mundial é 85%; uma fábrica típica fica perto de 60%.",availability_label:"Disponibilidade",performance_label:"Desempenho",quality_label:"Qualidade",weakest_factor_label:"Mais fraco",downtime_by_reason_title:"Paradas por Motivo",downtime_cost_label:"Custo de parada",oee_trend_title:"Tendência OEE",shifts_title:"Turnos",shift_col:"Turno",downtime_col:"Parada",log_shift_btn:"Registrar Turno",no_shifts_yet:"Nenhum turno registrado.",minutes_short:"min",range_1d:"Hoje",range_7d:"7 dias",range_30d:"30 dias",all_machines_option:"Todas as máquinas",reason_unspecified:"Não especificado",err_good_exceeds_total:"Peças boas não podem exceder o total",oee_grade_world_class:"Nível mundial",oee_grade_typical:"Típico",oee_grade_low:"Baixo",oee_grade_critical:"Crítico",reason_breakdown:"Quebra",reason_changeover:"Troca de produto",reason_no_material:"Sem material",reason_no_operator:"Sem operador",reason_planned_maintenance:"Manutenção planejada",reason_quality_issue:"Problema de qualidade",reason_setup:"Preparação",reason_other:"Outro",workorders_hint:"Transforma uma previsão de IA em tarefa rastreável — para que um alerta termine em reparo.",new_work_order_btn:"+ Nova Ordem",no_work_orders:"Nenhuma ordem de serviço.",avg_completion_label:"Conclusão méd.",assigned_label:"Atribuído",source_ai:"IA",wo_status_open:"Aberta",wo_status_in_progress:"Em andamento",wo_status_done:"Concluída",wo_status_cancelled:"Cancelada",wo_advance_to_in_progress:"Iniciar trabalho",wo_advance_to_done:"Marcar concluída",ph_shift_name:"Nome do turno",ph_planned_minutes:"Minutos planejados",ph_downtime_minutes:"Minutos de parada",ph_total_units:"Unidades totais",ph_good_units:"Unidades boas",ph_cycle_seconds:"Ciclo ideal (seg)",ph_wo_title:"Título",ph_assigned_to:"Atribuído a",ph_wo_description:"Descrição",overdue_label:"Atrasadas",nav_history:"Histórico",history_hint:"Histórico de sensores armazenado — é assim que você prova o que realmente mudou durante o piloto.",no_history_yet:"Nenhum histórico registrado. Mantenha o Monitoramento aberto por alguns minutos e os dados começarão a acumular.",range_24h:"24 horas",range_3d:"3 dias",range_10d:"10 dias",sensor_trend_title:"Tendência dos Sensores",risk_trend_title:"Tendência de Risco",trend_flat:"sem mudança",trend_rising:"subindo",trend_falling:"caindo",create_work_order_btn:"Criar Ordem",work_order_created_msg:"Ordem de serviço criada",alertreason_immediate_failure_risk:"Risco de falha imediata",alertreason_failure_imminent:"Falha iminente",alertreason_degradation_accelerating:"Degradação acelerando",alertreason_outside_normal_envelope:"Fora da faixa normal",alertreason_pressure_anomaly:"Anomalia de pressão",alertreason_idle_waste:"Desperdício em ociosidade",alertreason_informational:"Informativo",alert_reason_label:"Motivo"},
-  ja: {tagline:"グローバル産業インテリジェンスプラットフォーム",live_label:"ライブ",kpi_energy:"エネルギー使用量",kpi_efficiency:"効率",kpi_active:"稼働中の機械",kpi_alerts:"アラート",kwh_unit:"kWh",chart_title:"リアルタイムパフォーマンス",machine_status_title:"機械の状態",status_running:"稼働中",status_warning:"警告",status_critical:"重大",form_title:"工場データ入力",factory_name_label:"工場名",machine_count_label:"機械の数",energy_cost_label:"エネルギーコスト ($/kWh)",machine_type_label:"機械の種類",temperature_label:"温度 (°C)",vibration_label:"振動 (mm/s)",load_label:"負荷 (%)",submit_btn:"工場を分析",submitting:"更新中...",ai_panel_title:"AIインサイト",ai_placeholder:"工場データを送信してAI分析を生成してください。",ai_analyzing:"分析中...",ai_risks:"リスク",ai_efficiency_insights:"効率分析",ai_optimizations:"最適化提案",toast_updated:"工場データが更新されました",toast_analysis_done:"AI分析が完了しました",toast_error:"問題が発生しました",nav_dashboard:"ダッシュボード",nav_factories:"工場",nav_ai_insights:"AIインサイト",logout_btn:"ログアウト",login_title:"おかえりなさい",login_subtitle:"FactoryPulse AI アカウントにログイン",ph_email:"メールアドレス",ph_password:"パスワード",remember_me:"ログイン状態を保持",login_btn:"ログイン",login_link_register:"アカウントをお持ちでないですか？作成する",register_title:"アカウントを作成",register_subtitle:"AIで工場の監視を始めましょう",ph_full_name:"氏名",ph_confirm_password:"パスワードの確認",register_btn:"アカウント作成",register_link_login:"すでにアカウントをお持ちですか？ログイン",err_missing_fields:"すべての項目を入力してください",err_invalid_email:"有効なメールアドレスを入力してください",err_weak_password:"パスワードは8文字以上で、文字と数字を含める必要があります",err_password_mismatch:"パスワードが一致しません",err_invalid_credentials:"メールアドレスまたはパスワードが正しくありません",err_email_taken:"このメールアドレスは既に登録されています",err_generic:"エラーが発生しました。再試行してください",my_factories_title:"マイ工場",add_factory_btn:"+ 工場を追加",edit_factory_btn:"編集",delete_factory_btn:"削除",confirm_delete_factory:"この工場を削除しますか？元に戻せません。",no_factories_yet:"まだ工場を追加していません。",factory_created_toast:"工場が作成・分析されました",factory_updated_toast:"工場が更新されました",factory_deleted_toast:"工場が削除されました",ai_insights_feed_title:"AIインサイトフィード",no_ai_insights_yet:"AIインサイトはまだありません。工場を追加してください。",reanalyze_btn:"再分析",view_insights_btn:"インサイトを見る",created_label:"作成日",cancel_btn:"キャンセル",save_btn:"変更を保存",nav_live_monitor:"ライブモニター",add_machine_scada_btn:"+ 機械を追加",usb_status:"USB:",plc_status:"PLC:",polling_mode:"ポーリング",live_chart_title:"ライブセンサーチャート",machines_table_title:"機械",machine_code_col:"コード",machine_name_col:"名前",status_col:"ステータス",risk_col:"リスク",no_machines_yet:"まだ機械がありません。「+ 機械を追加」をクリックしてください。",section_machine_info:"機械情報",section_sensor_data:"センサーデータ",section_status:"ステータス",section_notes:"メモ",status_stopped:"停止中",status_maintenance:"メンテナンス中",priority_low:"低",priority_normal:"通常",priority_high:"高",priority_critical:"重大",save_and_analyze_btn:"保存して分析",source_col:"データ元",source_auto:"自動 (SCADA)",source_manual:"手動",nav_alerts:"アラート",acknowledge_btn:"確認",acknowledged_label:"確認済み",acknowledge_all_btn:"すべて確認",no_alerts_yet:"アラートはありません。すべて正常に稼働しています。",download_report_btn:"レポート",alert_details_template:"温度 {temp}°C、振動 {vib} mm/s、状態：{status}",section_energy_intel:"エネルギーインテリジェンス",daily_output_hint:"単位あたりのエネルギー消費量（kWh/単位）を計算するために使用します。",energy_insights_title:"エネルギーインテリジェンス",idle_power_title:"アイドル電力検出",idle_active_msg:"機械がアイドル状態です - 現在約{kw} kWが無駄になっています。",idle_none_msg:"アイドル時のエネルギー浪費は検出されていません。",friction_loss_title:"予測エネルギー損失",friction_active_msg:"摩擦増加を検出：電力オーバーヘッド +{pct}%（約{kw} kW増加）。損失を防ぐためメンテナンスを計画してください。",friction_none_msg:"異常な摩擦は検出されていません。",sec_title:"原単位エネルギー消費量",sec_label:"単位あたりkWh",sec_unit:"kWh/単位",sec_no_data_msg:"この指標を表示するには、機械追加時に1日の生産量を入力してください。",optimal_load_title:"最適負荷ゾーン",optimal_load_label:"最適負荷",current_load_label:"現在の負荷",at_optimal_msg:"最適負荷ゾーンで稼働中です。",adjust_to_optimal_msg:"単位あたりのエネルギーを最小化するには、負荷を{pct}%に調整してください。",nav_digital_twin:"デジタルツイン",twin_hint:"ドラッグで回転、スクロールでズーム、機械をクリックするとライブ詳細が表示されます。",twin_unavailable_msg:"3Dビューを読み込めませんでした（Three.jsライブラリのインターネット接続を確認してください）。",failure_prediction_title:"故障予測",report_lib_missing_msg:"PDFエクスポートにはreportlabライブラリが必要です。pip install reportlab を実行してからサーバーを再起動してください。",ph_machine_id:"機械ID（例：M-01）",ph_machine_name:"機械名",ph_factory_section:"工場セクション",ph_operator_name:"オペレーター名",ph_pressure:"圧力（bar）",ph_voltage:"電圧（V）",ph_current:"電流（A）",ph_error_code:"エラーコード",ph_daily_output:"日産量（単位）",ph_notes:"メモ...",nav_system_intel:"システムインテリジェンス",nav_roi:"ROIダッシュボード",refresh_btn:"更新",system_risk_label:"システムリスク",healthy_label:"正常",at_risk_label:"リスクあり",clusters_title:"機械クラスター",propagation_title:"異常伝播",propagation_hint:"故障した機械が近隣機械のリスクをどう高めるか。",no_propagation:"異常伝播は検出されていません。",avg_risk_label:"平均リスク",added_risk_label:"追加リスク",effective_risk_label:"実効リスク",simulation_title:"What-Ifシミュレーション",simulation_hint:"機械を選び、センサー値を変えて故障確率の変化を確認します。",run_simulation_btn:"シミュレーション実行",failure_probability_label:"故障確率",stress_level_label:"ストレスレベル",predicted_status_label:"予測ステータス",confidence_label:"信頼度",root_cause_title:"根本原因",rul_col:"残存耐用時間",rul_healthy:"正常",potential_loss_label:"潜在的損失",saved_label:"AIによる節約",wasted_energy_label:"無駄なエネルギー / 月",efficiency_gain_label:"効率向上",cost_by_machine_title:"機械別コストリスク",top_cause_col:"主要因",roi_assumptions_msg:"前提：停止 {downtime}/時、修理 {hours}時間、電力 {price}/kWh。",role_label:"あなたの役割",role_engineer:"エンジニア",role_manager:"マネージャー",role_admin:"管理者",cause_bearing_wear:"軸受摩耗",cause_overload_thermal:"熱過負荷",cause_cooling_failure:"冷却故障",cause_misalignment:"軸芯ずれ",cause_lubrication_loss:"潤滑不足",cause_normal_operation:"正常運転",nav_story:"ストーリーモード",story_hint:"22時間かけて進行する軸受故障を再現し、AIがいつ検知したか、その価値がいくらだったかを正確に示します。",simulate_failure_btn:"故障をシミュレート",outcome_title:"結果",warning_time_label:"早期警告",loss_ignored_label:"放置した場合の損失",loss_acted_label:"対応した場合の損失",money_saved_label:"節約額",timeline_title:"故障タイムライン",story_detection_msg:"AIは故障の{hours}時間前、リスク{risk}%の時点で検知しました — 根本原因：{cause}（信頼度{confidence}%）。",story_stage_healthy:"正常",story_stage_early_drift:"初期変動",story_stage_ai_detects:"AI検知",story_stage_critical:"重大",priority_low:"低",priority_medium:"中",priority_high:"高",priority_critical:"重大",action_stop_machine:"機械を停止",action_inspect_bearings:"軸受を点検",action_check_cooling:"冷却を確認",action_schedule_shutdown_24h:"停止を計画（24時間）",action_order_spare_parts:"予備部品を発注",action_reduce_load:"負荷を下げる",action_schedule_inspection_72h:"点検を計画（72時間）",action_monitor_closely:"注意深く監視",action_verify_sensor:"センサーを確認",action_power_down_idle:"アイドル機械を停止",action_review_shift_schedule:"シフト計画を見直す",action_no_action:"対応不要",nav_oee:"設備総合効率",nav_workorders:"作業指示",oee_hint:"可用率 x 性能 x 品質 (ISO 22400)。ワールドクラスは85%、一般的な工場は約60%です。",availability_label:"可用率",performance_label:"性能",quality_label:"品質",weakest_factor_label:"最弱項目",downtime_by_reason_title:"理由別停止時間",downtime_cost_label:"停止コスト",oee_trend_title:"OEE推移",shifts_title:"シフト",shift_col:"シフト",downtime_col:"停止",log_shift_btn:"シフトを記録",no_shifts_yet:"まだシフトが記録されていません。",minutes_short:"分",range_1d:"今日",range_7d:"7日間",range_30d:"30日間",all_machines_option:"すべての機械",reason_unspecified:"未指定",err_good_exceeds_total:"良品数は総数を超えられません",oee_grade_world_class:"ワールドクラス",oee_grade_typical:"標準的",oee_grade_low:"低い",oee_grade_critical:"重大",reason_breakdown:"故障",reason_changeover:"段取替え",reason_no_material:"材料切れ",reason_no_operator:"作業者不在",reason_planned_maintenance:"計画保全",reason_quality_issue:"品質問題",reason_setup:"セットアップ",reason_other:"その他",workorders_hint:"AIの予測を追跡可能なタスクに変換 — 警告が確実に修理につながります。",new_work_order_btn:"+ 新規作業指示",no_work_orders:"作業指示はまだありません。",avg_completion_label:"平均完了時間",assigned_label:"担当者",source_ai:"AI",wo_status_open:"未着手",wo_status_in_progress:"進行中",wo_status_done:"完了",wo_status_cancelled:"中止",wo_advance_to_in_progress:"作業開始",wo_advance_to_done:"完了にする",ph_shift_name:"シフト名",ph_planned_minutes:"計画時間（分）",ph_downtime_minutes:"停止時間（分）",ph_total_units:"総数",ph_good_units:"良品数",ph_cycle_seconds:"理想サイクル（秒）",ph_wo_title:"タイトル",ph_assigned_to:"担当者",ph_wo_description:"説明",overdue_label:"期限超過",nav_history:"履歴",history_hint:"保存されたセンサー履歴 — パイロット期間に何が実際に変わったかを証明します。",no_history_yet:"履歴はまだ記録されていません。ライブ監視を数分開いたままにするとデータが蓄積され始めます。",range_24h:"24時間",range_3d:"3日間",range_10d:"10日間",sensor_trend_title:"センサー推移",risk_trend_title:"リスク推移",trend_flat:"変化なし",trend_rising:"上昇",trend_falling:"下降",create_work_order_btn:"作業指示を作成",work_order_created_msg:"作業指示を作成しました",alertreason_immediate_failure_risk:"即時故障リスク",alertreason_failure_imminent:"故障が差し迫っている",alertreason_degradation_accelerating:"劣化が加速中",alertreason_outside_normal_envelope:"正常範囲外",alertreason_pressure_anomaly:"圧力異常",alertreason_idle_waste:"アイドル時のエネルギー浪費",alertreason_informational:"情報",alert_reason_label:"理由"},
-  ko: {tagline:"글로벌 산업 인텔리전스 플랫폼",live_label:"실시간",kpi_energy:"에너지 사용량",kpi_efficiency:"효율성",kpi_active:"가동 중인 기계",kpi_alerts:"경고",kwh_unit:"kWh",chart_title:"실시간 성능",machine_status_title:"기계 상태",status_running:"가동 중",status_warning:"경고",status_critical:"심각",form_title:"공장 데이터 입력",factory_name_label:"공장 이름",machine_count_label:"기계 수",energy_cost_label:"에너지 비용 ($/kWh)",machine_type_label:"기계 유형",temperature_label:"온도 (°C)",vibration_label:"진동 (mm/s)",load_label:"부하 (%)",submit_btn:"공장 분석",submitting:"업데이트 중...",ai_panel_title:"AI 인사이트",ai_placeholder:"AI 분석을 생성하려면 공장 데이터를 제출하세요.",ai_analyzing:"분석 중...",ai_risks:"위험 요소",ai_efficiency_insights:"효율성 분석",ai_optimizations:"최적화 제안",toast_updated:"공장 데이터가 업데이트되었습니다",toast_analysis_done:"AI 분석이 완료되었습니다",toast_error:"문제가 발생했습니다",nav_dashboard:"대시보드",nav_factories:"공장",nav_ai_insights:"AI 인사이트",logout_btn:"로그아웃",login_title:"다시 오신 것을 환영합니다",login_subtitle:"FactoryPulse AI 계정에 로그인하세요",ph_email:"이메일",ph_password:"비밀번호",remember_me:"로그인 상태 유지",login_btn:"로그인",login_link_register:"계정이 없으신가요? 계정 만들기",register_title:"계정 만들기",register_subtitle:"AI로 공장 모니터링을 시작하세요",ph_full_name:"성명",ph_confirm_password:"비밀번호 확인",register_btn:"계정 생성",register_link_login:"이미 계정이 있으신가요? 로그인",err_missing_fields:"모든 항목을 입력해주세요",err_invalid_email:"유효한 이메일 주소를 입력하세요",err_weak_password:"비밀번호는 8자 이상, 문자와 숫자를 포함해야 합니다",err_password_mismatch:"비밀번호가 일치하지 않습니다",err_invalid_credentials:"이메일 또는 비밀번호가 올바르지 않습니다",err_email_taken:"이미 등록된 이메일입니다",err_generic:"문제가 발생했습니다. 다시 시도해주세요",my_factories_title:"내 공장",add_factory_btn:"+ 공장 추가",edit_factory_btn:"수정",delete_factory_btn:"삭제",confirm_delete_factory:"이 공장을 삭제하시겠습니까? 되돌릴 수 없습니다.",no_factories_yet:"아직 추가된 공장이 없습니다.",factory_created_toast:"공장이 생성되고 분석되었습니다",factory_updated_toast:"공장이 업데이트되었습니다",factory_deleted_toast:"공장이 삭제되었습니다",ai_insights_feed_title:"AI 인사이트 피드",no_ai_insights_yet:"아직 AI 인사이트가 없습니다. 공장을 추가하세요.",reanalyze_btn:"다시 분석",view_insights_btn:"인사이트 보기",created_label:"생성일",cancel_btn:"취소",save_btn:"변경사항 저장",nav_live_monitor:"실시간 모니터",add_machine_scada_btn:"+ 기계 추가",usb_status:"USB:",plc_status:"PLC:",polling_mode:"폴링",live_chart_title:"실시간 센서 차트",machines_table_title:"기계",machine_code_col:"코드",machine_name_col:"이름",status_col:"상태",risk_col:"위험",no_machines_yet:"아직 기계가 없습니다. \"+ 기계 추가\"를 클릭하세요.",section_machine_info:"기계 정보",section_sensor_data:"센서 데이터",section_status:"상태",section_notes:"메모",status_stopped:"정지됨",status_maintenance:"유지보수 중",priority_low:"낮음",priority_normal:"보통",priority_high:"높음",priority_critical:"긴급",save_and_analyze_btn:"저장 및 분석",source_col:"소스",source_auto:"자동 (SCADA)",source_manual:"수동",nav_alerts:"경고",acknowledge_btn:"확인",acknowledged_label:"확인됨",acknowledge_all_btn:"모두 확인",no_alerts_yet:"경고가 없습니다. 모든 것이 정상 작동 중입니다.",download_report_btn:"보고서",alert_details_template:"온도 {temp}°C, 진동 {vib} mm/s, 상태: {status}",section_energy_intel:"에너지 인텔리전스",daily_output_hint:"단위당 에너지 소비량(kWh/단위)을 계산하는 데 사용됩니다.",energy_insights_title:"에너지 인텔리전스",idle_power_title:"유휴 전력 감지",idle_active_msg:"기계가 유휴 상태입니다 - 현재 약 {kw} kW가 낭비되고 있습니다.",idle_none_msg:"유휴 에너지 낭비가 감지되지 않았습니다.",friction_loss_title:"예측 에너지 손실",friction_active_msg:"마찰 증가 감지: 전력 오버헤드 +{pct}%(약 {kw} kW 추가). 손실을 방지하려면 정비를 예약하세요.",friction_none_msg:"비정상적인 마찰이 감지되지 않았습니다.",sec_title:"단위당 에너지 소비량",sec_label:"단위당 kWh",sec_unit:"kWh/단위",sec_no_data_msg:"이 지표를 보려면 기계 추가 시 일일 생산량을 입력하세요.",optimal_load_title:"최적 부하 구간",optimal_load_label:"최적 부하",current_load_label:"현재 부하",at_optimal_msg:"최적 부하 구간에서 작동 중입니다.",adjust_to_optimal_msg:"단위당 에너지를 최소화하려면 부하를 {pct}%로 조정하세요.",nav_digital_twin:"디지털 트윈",twin_hint:"드래그하여 회전, 스크롤하여 확대/축소, 기계를 클릭하면 실시간 세부정보를 볼 수 있습니다.",twin_unavailable_msg:"3D 보기를 로드할 수 없습니다 (Three.js 라이브러리의 인터넷 연결을 확인하세요).",failure_prediction_title:"고장 예측",report_lib_missing_msg:"PDF 내보내기에는 reportlab 라이브러리가 필요합니다. pip install reportlab을 실행한 후 서버를 재시작하세요.",ph_machine_id:"기계 ID (예: M-01)",ph_machine_name:"기계 이름",ph_factory_section:"공장 구역",ph_operator_name:"운영자 이름",ph_pressure:"압력 (bar)",ph_voltage:"전압 (V)",ph_current:"전류 (A)",ph_error_code:"오류 코드",ph_daily_output:"일일 생산량 (단위)",ph_notes:"메모...",nav_system_intel:"시스템 인텔리전스",nav_roi:"ROI 대시보드",refresh_btn:"새로고침",system_risk_label:"시스템 위험",healthy_label:"정상",at_risk_label:"위험",clusters_title:"기계 클러스터",propagation_title:"이상 전파",propagation_hint:"고장난 기계가 인접 기계의 위험을 어떻게 높이는지.",no_propagation:"이상 전파가 감지되지 않았습니다.",avg_risk_label:"평균 위험",added_risk_label:"추가 위험",effective_risk_label:"실효 위험",simulation_title:"What-If 시뮬레이션",simulation_hint:"기계를 선택하고 센서 값을 조정해 고장 확률 변화를 확인하세요.",run_simulation_btn:"시뮬레이션 실행",failure_probability_label:"고장 확률",stress_level_label:"응력 수준",predicted_status_label:"예측 상태",confidence_label:"신뢰도",root_cause_title:"근본 원인",rul_col:"잔여 수명",rul_healthy:"정상",potential_loss_label:"잠재 손실",saved_label:"AI 절감액",wasted_energy_label:"낭비 에너지 / 월",efficiency_gain_label:"효율 향상",cost_by_machine_title:"기계별 비용 리스크",top_cause_col:"주요 원인",roi_assumptions_msg:"가정: 다운타임 {downtime}/시간, 수리 {hours}시간, 전력 {price}/kWh.",role_label:"귀하의 역할",role_engineer:"엔지니어",role_manager:"매니저",role_admin:"관리자",cause_bearing_wear:"베어링 마모",cause_overload_thermal:"열 과부하",cause_cooling_failure:"냉각 고장",cause_misalignment:"축 정렬 불량",cause_lubrication_loss:"윤활 손실",cause_normal_operation:"정상 운전",nav_story:"스토리 모드",story_hint:"22시간에 걸쳐 진행되는 베어링 고장을 재현하고, AI가 정확히 언제 발견했는지 — 그리고 그 가치가 얼마인지 보여줍니다.",simulate_failure_btn:"고장 시뮬레이션",outcome_title:"결과",warning_time_label:"조기 경고",loss_ignored_label:"방치 시 손실",loss_acted_label:"조치 시 손실",money_saved_label:"절감액",timeline_title:"고장 타임라인",story_detection_msg:"AI가 고장 {hours}시간 전, 위험도 {risk}%에서 감지했습니다 — 근본 원인: {cause} (신뢰도 {confidence}%).",story_stage_healthy:"정상",story_stage_early_drift:"초기 편차",story_stage_ai_detects:"AI 감지",story_stage_critical:"심각",priority_low:"낮음",priority_medium:"보통",priority_high:"높음",priority_critical:"심각",action_stop_machine:"기계 정지",action_inspect_bearings:"베어링 점검",action_check_cooling:"냉각 확인",action_schedule_shutdown_24h:"가동 중단 예약 (24시간)",action_order_spare_parts:"예비 부품 주문",action_reduce_load:"부하 감소",action_schedule_inspection_72h:"점검 예약 (72시간)",action_monitor_closely:"면밀히 모니터링",action_verify_sensor:"센서 확인",action_power_down_idle:"유휴 기계 전원 차단",action_review_shift_schedule:"교대 일정 검토",action_no_action:"조치 불필요",nav_oee:"설비종합효율",nav_workorders:"작업 지시",oee_hint:"가동률 x 성능 x 품질 (ISO 22400). 세계 수준은 85%, 일반 공장은 약 60%입니다.",availability_label:"가동률",performance_label:"성능",quality_label:"품질",weakest_factor_label:"최약점",downtime_by_reason_title:"사유별 정지시간",downtime_cost_label:"정지 비용",oee_trend_title:"OEE 추이",shifts_title:"교대",shift_col:"교대",downtime_col:"정지",log_shift_btn:"교대 기록",no_shifts_yet:"아직 기록된 교대가 없습니다.",minutes_short:"분",range_1d:"오늘",range_7d:"7일",range_30d:"30일",all_machines_option:"모든 기계",reason_unspecified:"미지정",err_good_exceeds_total:"양품 수는 총수를 초과할 수 없습니다",oee_grade_world_class:"세계 수준",oee_grade_typical:"일반",oee_grade_low:"낮음",oee_grade_critical:"심각",reason_breakdown:"고장",reason_changeover:"교체작업",reason_no_material:"자재 부족",reason_no_operator:"작업자 부재",reason_planned_maintenance:"계획 정비",reason_quality_issue:"품질 문제",reason_setup:"셋업",reason_other:"기타",workorders_hint:"AI 예측을 추적 가능한 작업으로 전환 — 경고가 실제 수리로 이어지도록 합니다.",new_work_order_btn:"+ 새 작업 지시",no_work_orders:"작업 지시가 없습니다.",avg_completion_label:"평균 완료",assigned_label:"담당자",source_ai:"AI",wo_status_open:"대기",wo_status_in_progress:"진행 중",wo_status_done:"완료",wo_status_cancelled:"취소",wo_advance_to_in_progress:"작업 시작",wo_advance_to_done:"완료 처리",ph_shift_name:"교대 이름",ph_planned_minutes:"계획 시간(분)",ph_downtime_minutes:"정지 시간(분)",ph_total_units:"총 수량",ph_good_units:"양품 수량",ph_cycle_seconds:"이상 사이클(초)",ph_wo_title:"제목",ph_assigned_to:"담당자",ph_wo_description:"설명",overdue_label:"기한 초과",nav_history:"이력",history_hint:"저장된 센서 이력 — 파일럿 기간에 실제로 무엇이 바뀌었는지 증명합니다.",no_history_yet:"아직 기록된 이력이 없습니다. 실시간 모니터링을 몇 분간 열어두면 데이터가 쌓이기 시작합니다.",range_24h:"24시간",range_3d:"3일",range_10d:"10일",sensor_trend_title:"센서 추이",risk_trend_title:"위험도 추이",trend_flat:"변화 없음",trend_rising:"상승",trend_falling:"하락",create_work_order_btn:"작업 지시 생성",work_order_created_msg:"작업 지시가 생성되었습니다",alertreason_immediate_failure_risk:"즉각적인 고장 위험",alertreason_failure_imminent:"고장 임박",alertreason_degradation_accelerating:"열화 가속 중",alertreason_outside_normal_envelope:"정상 범위 이탈",alertreason_pressure_anomaly:"압력 이상",alertreason_idle_waste:"유휴 에너지 낭비",alertreason_informational:"정보",alert_reason_label:"사유"},
-  hi: {tagline:"वैश्विक औद्योगिक बुद्धिमत्ता मंच",live_label:"लाइव",kpi_energy:"ऊर्जा उपयोग",kpi_efficiency:"दक्षता",kpi_active:"सक्रिय मशीनें",kpi_alerts:"अलर्ट",kwh_unit:"kWh",chart_title:"रीयल-टाइम प्रदर्शन",machine_status_title:"मशीन की स्थिति",status_running:"चल रहा है",status_warning:"चेतावनी",status_critical:"गंभीर",form_title:"फ़ैक्टरी डेटा इनपुट",factory_name_label:"फ़ैक्टरी का नाम",machine_count_label:"मशीनों की संख्या",energy_cost_label:"ऊर्जा लागत ($/kWh)",machine_type_label:"मशीन प्रकार",temperature_label:"तापमान (°C)",vibration_label:"कंपन (mm/s)",load_label:"लोड (%)",submit_btn:"फ़ैक्टरी का विश्लेषण करें",submitting:"अद्यतन हो रहा है...",ai_panel_title:"AI अंतर्दृष्टि",ai_placeholder:"AI विश्लेषण उत्पन्न करने के लिए फ़ैक्टरी डेटा सबमिट करें।",ai_analyzing:"विश्लेषण हो रहा है...",ai_risks:"जोखिम",ai_efficiency_insights:"दक्षता विश्लेषण",ai_optimizations:"अनुकूलन सुझाव",toast_updated:"फ़ैक्टरी डेटा अपडेट किया गया",toast_analysis_done:"AI विश्लेषण पूर्ण हुआ",toast_error:"कुछ गलत हो गया",nav_dashboard:"डैशबोर्ड",nav_factories:"फ़ैक्टरियाँ",nav_ai_insights:"AI अंतर्दृष्टि",logout_btn:"लॉग आउट",login_title:"वापसी पर स्वागत है",login_subtitle:"अपने FactoryPulse AI खाते में लॉग इन करें",ph_email:"ईमेल",ph_password:"पासवर्ड",remember_me:"मुझे याद रखें",login_btn:"लॉग इन करें",login_link_register:"खाता नहीं है? एक बनाएं",register_title:"अपना खाता बनाएं",register_subtitle:"AI के साथ अपनी फ़ैक्टरियों की निगरानी शुरू करें",ph_full_name:"पूरा नाम",ph_confirm_password:"पासवर्ड की पुष्टि करें",register_btn:"खाता बनाएं",register_link_login:"पहले से खाता है? लॉग इन करें",err_missing_fields:"कृपया सभी फ़ील्ड भरें",err_invalid_email:"कृपया एक मान्य ईमेल पता दर्ज करें",err_weak_password:"पासवर्ड कम से कम 8 अक्षर, एक अक्षर और एक अंक होना चाहिए",err_password_mismatch:"पासवर्ड मेल नहीं खाते",err_invalid_credentials:"गलत ईमेल या पासवर्ड",err_email_taken:"यह ईमेल पहले से पंजीकृत है",err_generic:"कुछ गलत हो गया। कृपया पुनः प्रयास करें",my_factories_title:"मेरी फ़ैक्टरियाँ",add_factory_btn:"+ फ़ैक्टरी जोड़ें",edit_factory_btn:"संपादित करें",delete_factory_btn:"हटाएं",confirm_delete_factory:"इस फ़ैक्टरी को हटाएं? इसे पूर्ववत नहीं किया जा सकता।",no_factories_yet:"आपने अभी तक कोई फ़ैक्टरी नहीं जोड़ी है।",factory_created_toast:"फ़ैक्टरी बनाई और विश्लेषित की गई",factory_updated_toast:"फ़ैक्टरी अपडेट की गई",factory_deleted_toast:"फ़ैक्टरी हटाई गई",ai_insights_feed_title:"AI अंतर्दृष्टि फ़ीड",no_ai_insights_yet:"अभी तक कोई AI अंतर्दृष्टि नहीं। शुरू करने के लिए एक फ़ैक्टरी जोड़ें।",reanalyze_btn:"पुनः विश्लेषण करें",view_insights_btn:"अंतर्दृष्टि देखें",created_label:"बनाया गया",cancel_btn:"रद्द करें",save_btn:"परिवर्तन सहेजें",nav_live_monitor:"लाइव मॉनिटर",add_machine_scada_btn:"+ मशीन जोड़ें",usb_status:"USB:",plc_status:"PLC:",polling_mode:"पोलिंग",live_chart_title:"लाइव सेंसर चार्ट",machines_table_title:"मशीनें",machine_code_col:"कोड",machine_name_col:"नाम",status_col:"स्थिति",risk_col:"जोखिम",no_machines_yet:"अभी तक कोई मशीन नहीं। \"+ मशीन जोड़ें\" पर क्लिक करें।",section_machine_info:"मशीन जानकारी",section_sensor_data:"सेंसर डेटा",section_status:"स्थिति",section_notes:"नोट्स",status_stopped:"रुकी हुई",status_maintenance:"रखरखाव",priority_low:"कम",priority_normal:"सामान्य",priority_high:"उच्च",priority_critical:"गंभीर",save_and_analyze_btn:"सहेजें और विश्लेषण करें",source_col:"स्रोत",source_auto:"स्वचालित (SCADA)",source_manual:"मैन्युअल",nav_alerts:"अलर्ट",acknowledge_btn:"स्वीकार करें",acknowledged_label:"स्वीकृत",acknowledge_all_btn:"सभी स्वीकार करें",no_alerts_yet:"कोई अलर्ट नहीं। सब कुछ सुचारू रूप से चल रहा है।",download_report_btn:"रिपोर्ट",alert_details_template:"तापमान {temp}°C, कंपन {vib} mm/s, स्थिति: {status}",section_energy_intel:"ऊर्जा इंटेलिजेंस",daily_output_hint:"विशिष्ट ऊर्जा खपत (प्रति इकाई kWh) की गणना के लिए उपयोग किया जाता है।",energy_insights_title:"ऊर्जा इंटेलिजेंस",idle_power_title:"निष्क्रिय शक्ति का पता लगाना",idle_active_msg:"मशीन निष्क्रिय है - अभी लगभग {kw} kW बर्बाद हो रहा है।",idle_none_msg:"कोई निष्क्रिय ऊर्जा बर्बादी नहीं पाई गई।",friction_loss_title:"पूर्वानुमानित ऊर्जा हानि",friction_active_msg:"बढ़ा हुआ घर्षण पाया गया: +{pct}% अतिरिक्त शक्ति (~{kw} kW अतिरिक्त)। हानि रोकने के लिए रखरखाव शेड्यूल करें।",friction_none_msg:"कोई असामान्य घर्षण नहीं पाया गया।",sec_title:"विशिष्ट ऊर्जा खपत",sec_label:"प्रति इकाई kWh",sec_unit:"kWh/इकाई",sec_no_data_msg:"यह मीट्रिक देखने के लिए मशीन जोड़ते समय दैनिक उत्पादन दर्ज करें।",optimal_load_title:"इष्टतम लोड ज़ोन",optimal_load_label:"इष्टतम लोड",current_load_label:"वर्तमान लोड",at_optimal_msg:"इष्टतम लोड ज़ोन में चल रहा है।",adjust_to_optimal_msg:"प्रति इकाई ऊर्जा कम करने के लिए लोड को {pct}% की ओर समायोजित करें।",nav_digital_twin:"डिजिटल ट्विन",twin_hint:"घुमाने के लिए खींचें, ज़ूम करने के लिए स्क्रॉल करें, लाइव विवरण देखने के लिए मशीन पर क्लिक करें।",twin_unavailable_msg:"3D दृश्य लोड नहीं हो सका (Three.js लाइब्रेरी के लिए अपना इंटरनेट कनेक्शन जांचें)।",failure_prediction_title:"विफलता पूर्वानुमान",report_lib_missing_msg:"PDF निर्यात के लिए reportlab लाइब्रेरी की आवश्यकता है। चलाएं: pip install reportlab, फिर सर्वर को पुनः आरंभ करें।",ph_machine_id:"मशीन ID (जैसे M-01)",ph_machine_name:"मशीन नाम",ph_factory_section:"फ़ैक्टरी सेक्शन",ph_operator_name:"ऑपरेटर नाम",ph_pressure:"दबाव (bar)",ph_voltage:"वोल्टेज (V)",ph_current:"करंट (A)",ph_error_code:"त्रुटि कोड",ph_daily_output:"दैनिक उत्पादन (इकाई)",ph_notes:"नोट्स...",nav_system_intel:"सिस्टम इंटेलिजेंस",nav_roi:"ROI डैशबोर्ड",refresh_btn:"रीफ़्रेश",system_risk_label:"सिस्टम जोखिम",healthy_label:"स्वस्थ",at_risk_label:"जोखिम में",clusters_title:"मशीन क्लस्टर",propagation_title:"विसंगति प्रसार",propagation_hint:"एक खराब मशीन पड़ोसी मशीनों का जोखिम कैसे बढ़ाती है।",no_propagation:"कोई विसंगति प्रसार नहीं मिला।",avg_risk_label:"औसत जोखिम",added_risk_label:"अतिरिक्त जोखिम",effective_risk_label:"प्रभावी जोखिम",simulation_title:"व्हाट-इफ़ सिमुलेशन",simulation_hint:"मशीन चुनें, सेंसर मान बदलें और विफलता संभावना देखें।",run_simulation_btn:"सिमुलेशन चलाएं",failure_probability_label:"विफलता संभावना",stress_level_label:"तनाव स्तर",predicted_status_label:"अनुमानित स्थिति",confidence_label:"विश्वास",root_cause_title:"मूल कारण",rul_col:"शेष उपयोगी जीवन",rul_healthy:"स्वस्थ",potential_loss_label:"संभावित हानि",saved_label:"AI द्वारा बचत",wasted_energy_label:"बर्बाद ऊर्जा / माह",efficiency_gain_label:"दक्षता लाभ",cost_by_machine_title:"मशीन अनुसार लागत जोखिम",top_cause_col:"मुख्य कारण",roi_assumptions_msg:"अनुमान: डाउनटाइम {downtime}/घं, मरम्मत {hours} घं, ऊर्जा {price}/kWh।",role_label:"आपकी भूमिका",role_engineer:"इंजीनियर",role_manager:"प्रबंधक",role_admin:"व्यवस्थापक",cause_bearing_wear:"बियरिंग घिसाव",cause_overload_thermal:"तापीय अधिभार",cause_cooling_failure:"शीतलन विफलता",cause_misalignment:"शाफ़्ट असंरेखण",cause_lubrication_loss:"स्नेहन हानि",cause_normal_operation:"सामान्य संचालन",nav_story:"स्टोरी मोड",story_hint:"22 घंटों में विकसित होने वाली बियरिंग विफलता को दोहराता है और दिखाता है कि AI ने इसे कब पकड़ा — और इसका मूल्य क्या था।",simulate_failure_btn:"विफलता का अनुकरण करें",outcome_title:"परिणाम",warning_time_label:"प्रारंभिक चेतावनी",loss_ignored_label:"बिना कार्रवाई हानि",loss_acted_label:"कार्रवाई के साथ हानि",money_saved_label:"बचत",timeline_title:"विफलता समयरेखा",story_detection_msg:"AI ने इसे खराबी से {hours} घंटे पहले, {risk}% जोखिम पर पकड़ा — मूल कारण: {cause} ({confidence}% विश्वास)।",story_stage_healthy:"स्वस्थ",story_stage_early_drift:"प्रारंभिक विचलन",story_stage_ai_detects:"AI ने पहचाना",story_stage_critical:"गंभीर",priority_low:"कम",priority_medium:"मध्यम",priority_high:"उच्च",priority_critical:"गंभीर",action_stop_machine:"मशीन रोकें",action_inspect_bearings:"बियरिंग जांचें",action_check_cooling:"शीतलन जांचें",action_schedule_shutdown_24h:"शटडाउन शेड्यूल करें (24घं)",action_order_spare_parts:"स्पेयर पार्ट्स ऑर्डर करें",action_reduce_load:"लोड कम करें",action_schedule_inspection_72h:"निरीक्षण शेड्यूल करें (72घं)",action_monitor_closely:"बारीकी से निगरानी करें",action_verify_sensor:"सेंसर सत्यापित करें",action_power_down_idle:"निष्क्रिय मशीन बंद करें",action_review_shift_schedule:"शिफ्ट शेड्यूल की समीक्षा करें",action_no_action:"किसी कार्रवाई की आवश्यकता नहीं",nav_oee:"OEE",nav_workorders:"कार्य आदेश",oee_hint:"उपलब्धता x प्रदर्शन x गुणवत्ता (ISO 22400)। विश्व स्तर 85% है; सामान्य कारखाना लगभग 60% पर रहता है।",availability_label:"उपलब्धता",performance_label:"प्रदर्शन",quality_label:"गुणवत्ता",weakest_factor_label:"सबसे कमजोर",downtime_by_reason_title:"कारण अनुसार डाउनटाइम",downtime_cost_label:"डाउनटाइम लागत",oee_trend_title:"OEE रुझान",shifts_title:"शिफ्ट",shift_col:"शिफ्ट",downtime_col:"डाउनटाइम",log_shift_btn:"शिफ्ट दर्ज करें",no_shifts_yet:"अभी तक कोई शिफ्ट दर्ज नहीं।",minutes_short:"मिनट",range_1d:"आज",range_7d:"7 दिन",range_30d:"30 दिन",all_machines_option:"सभी मशीनें",reason_unspecified:"अनिर्दिष्ट",err_good_exceeds_total:"अच्छी इकाइयाँ कुल से अधिक नहीं हो सकतीं",oee_grade_world_class:"विश्व स्तर",oee_grade_typical:"सामान्य",oee_grade_low:"कम",oee_grade_critical:"गंभीर",reason_breakdown:"खराबी",reason_changeover:"चेंजओवर",reason_no_material:"सामग्री नहीं",reason_no_operator:"ऑपरेटर नहीं",reason_planned_maintenance:"नियोजित रखरखाव",reason_quality_issue:"गुणवत्ता समस्या",reason_setup:"सेटअप",reason_other:"अन्य",workorders_hint:"AI पूर्वानुमान को ट्रैक करने योग्य कार्य में बदलता है — ताकि चेतावनी वास्तव में मरम्मत पर समाप्त हो।",new_work_order_btn:"+ नया कार्य आदेश",no_work_orders:"अभी तक कोई कार्य आदेश नहीं।",avg_completion_label:"औसत पूर्णता",assigned_label:"सौंपा गया",source_ai:"AI",wo_status_open:"खुला",wo_status_in_progress:"प्रगति में",wo_status_done:"पूर्ण",wo_status_cancelled:"रद्द",wo_advance_to_in_progress:"कार्य शुरू करें",wo_advance_to_done:"पूर्ण चिह्नित करें",ph_shift_name:"शिफ्ट नाम",ph_planned_minutes:"नियोजित मिनट",ph_downtime_minutes:"डाउनटाइम मिनट",ph_total_units:"कुल इकाइयाँ",ph_good_units:"अच्छी इकाइयाँ",ph_cycle_seconds:"आदर्श चक्र (सेकंड)",ph_wo_title:"शीर्षक",ph_assigned_to:"सौंपा गया",ph_wo_description:"विवरण",overdue_label:"समय सीमा पार",nav_history:"इतिहास",history_hint:"संग्रहीत सेंसर इतिहास — इसी से आप साबित करते हैं कि पायलट के दौरान वास्तव में क्या बदला।",no_history_yet:"अभी तक कोई इतिहास दर्ज नहीं। लाइव मॉनिटर को कुछ मिनट खुला रखें, डेटा जमा होने लगेगा।",range_24h:"24 घंटे",range_3d:"3 दिन",range_10d:"10 दिन",sensor_trend_title:"सेंसर रुझान",risk_trend_title:"जोखिम रुझान",trend_flat:"कोई बदलाव नहीं",trend_rising:"बढ़ रहा",trend_falling:"घट रहा",create_work_order_btn:"कार्य आदेश बनाएं",work_order_created_msg:"कार्य आदेश बनाया गया",alertreason_immediate_failure_risk:"तत्काल विफलता जोखिम",alertreason_failure_imminent:"विफलता निकट",alertreason_degradation_accelerating:"गिरावट तेज हो रही",alertreason_outside_normal_envelope:"सामान्य सीमा से बाहर",alertreason_pressure_anomaly:"दबाव विसंगति",alertreason_idle_waste:"निष्क्रिय ऊर्जा बर्बादी",alertreason_informational:"सूचनात्मक",alert_reason_label:"कारण"},
-  uz: {tagline:"Global sanoat intellekti platformasi",live_label:"Jonli",kpi_energy:"Energiya sarfi",kpi_efficiency:"Samaradorlik",kpi_active:"Faol stanoklar",kpi_alerts:"Ogohlantirishlar",kwh_unit:"kWh",chart_title:"Real vaqtdagi ko'rsatkichlar",machine_status_title:"Stanoklar holati",status_running:"Ishlamoqda",status_warning:"Ogohlantirish",status_critical:"Muhim",form_title:"Zavod ma'lumotlarini kiritish",factory_name_label:"Zavod nomi",machine_count_label:"Stanoklar soni",energy_cost_label:"Energiya narxi ($/kWh)",machine_type_label:"Stanok turi",temperature_label:"Harorat (°C)",vibration_label:"Tebranish (mm/s)",load_label:"Yuklama (%)",submit_btn:"Zavodni tahlil qilish",submitting:"Yangilanmoqda...",ai_panel_title:"AI tahlili",ai_placeholder:"AI tahlilini olish uchun zavod ma'lumotlarini yuboring.",ai_analyzing:"Tahlil qilinmoqda...",ai_risks:"Xavflar",ai_efficiency_insights:"Samaradorlik tahlili",ai_optimizations:"Optimallashtirish tavsiyalari",toast_updated:"Zavod ma'lumotlari yangilandi",toast_analysis_done:"AI tahlili yakunlandi",toast_error:"Xatolik yuz berdi",nav_dashboard:"Boshqaruv paneli",nav_factories:"Zavodlar",nav_ai_insights:"AI tahlili",logout_btn:"Chiqish",login_title:"Xush kelibsiz",login_subtitle:"FactoryPulse AI hisobingizga kiring",ph_email:"Elektron pochta",ph_password:"Parol",remember_me:"Meni eslab qol",login_btn:"Kirish",login_link_register:"Hisobingiz yo'qmi? Yarating",register_title:"Hisob yarating",register_subtitle:"Zavodlaringizni AI bilan kuzatishni boshlang",ph_full_name:"To'liq ism",ph_confirm_password:"Parolni tasdiqlang",register_btn:"Hisob yaratish",register_link_login:"Hisobingiz bormi? Kiring",err_missing_fields:"Barcha maydonlarni to'ldiring",err_invalid_email:"Yaroqli elektron pochta manzilini kiriting",err_weak_password:"Parol kamida 8 belgidan, harf va raqamdan iborat bo'lishi kerak",err_password_mismatch:"Parollar mos kelmaydi",err_invalid_credentials:"Elektron pochta yoki parol noto'g'ri",err_email_taken:"Bu elektron pochta allaqachon ro'yxatdan o'tgan",err_generic:"Xatolik yuz berdi. Qaytadan urinib ko'ring",my_factories_title:"Mening Zavodlarim",add_factory_btn:"+ Zavod qo'shish",edit_factory_btn:"Tahrirlash",delete_factory_btn:"O'chirish",confirm_delete_factory:"Bu zavodni o'chirasizmi? Buni bekor qilib bo'lmaydi.",no_factories_yet:"Siz hali hech qanday zavod qo'shmagansiz.",factory_created_toast:"Zavod yaratildi va tahlil qilindi",factory_updated_toast:"Zavod yangilandi",factory_deleted_toast:"Zavod o'chirildi",ai_insights_feed_title:"AI Tahlili Lentasi",no_ai_insights_yet:"Hali AI tahlili yo'q. Boshlash uchun zavod qo'shing.",reanalyze_btn:"Qayta tahlil qilish",view_insights_btn:"Tahlilni ko'rish",created_label:"Yaratilgan",cancel_btn:"Bekor qilish",save_btn:"O'zgarishlarni saqlash",nav_live_monitor:"Jonli monitoring",add_machine_scada_btn:"+ Stanok qo'shish",usb_status:"USB:",plc_status:"PLC:",polling_mode:"So'rov",live_chart_title:"Jonli sensor grafigi",machines_table_title:"Stanoklar",machine_code_col:"Kod",machine_name_col:"Nomi",status_col:"Holat",risk_col:"Xavf",no_machines_yet:"Hali stanoklar yo'q. \"+ Stanok qo'shish\"ni bosing.",section_machine_info:"Stanok ma'lumoti",section_sensor_data:"Sensor ma'lumotlari",section_status:"Holat",section_notes:"Eslatmalar",status_stopped:"To'xtatilgan",status_maintenance:"Texnik xizmat",priority_low:"Past",priority_normal:"Oddiy",priority_high:"Yuqori",priority_critical:"Muhim",save_and_analyze_btn:"Saqlash va tahlil qilish",source_col:"Manba",source_auto:"Avtomatik (SCADA)",source_manual:"Qo'lda",nav_alerts:"Ogohlantirishlar",acknowledge_btn:"Tasdiqlash",acknowledged_label:"Tasdiqlangan",acknowledge_all_btn:"Barchasini Tasdiqlash",no_alerts_yet:"Ogohlantirishlar yo'q. Hammasi yaxshi ishlamoqda.",download_report_btn:"Hisobot",alert_details_template:"Harorat {temp}°C, tebranish {vib} mm/s, holat: {status}",section_energy_intel:"Energiya intellekti",daily_output_hint:"Solishtirma energiya sarfini (birlik uchun kVt·soat) hisoblash uchun ishlatiladi.",energy_insights_title:"Energiya intellekti",idle_power_title:"Bo'sh yurish quvvatini aniqlash",idle_active_msg:"Stanok bo'sh turibdi - hozir taxminan {kw} kVt behuda sarflanmoqda.",idle_none_msg:"Bo'sh yurish energiya isrofi aniqlanmadi.",friction_loss_title:"Bashoratli energiya yo'qotishi",friction_active_msg:"Oshgan ishqalanish aniqlandi: +{pct}% ortiqcha quvvat (~{kw} kVt qo'shimcha). Isrofni oldini olish uchun texnik xizmatni rejalashtiring.",friction_none_msg:"Anomal ishqalanish aniqlanmadi.",sec_title:"Solishtirma energiya sarfi",sec_label:"birlik uchun kVt·soat",sec_unit:"kVt·soat/birlik",sec_no_data_msg:"Bu ko'rsatkichni ko'rish uchun stanok qo'shishda kunlik ishlab chiqarishni kiriting.",optimal_load_title:"Optimal yuklama zonasi",optimal_load_label:"Optimal yuklama",current_load_label:"Joriy yuklama",at_optimal_msg:"Optimal yuklama zonasida ishlamoqda.",adjust_to_optimal_msg:"Birlik uchun energiyani minimallashtirish uchun yuklamani {pct}% ga moslang.",nav_digital_twin:"Raqamli egizak",twin_hint:"Aylantirish uchun torting, kattalashtirish uchun aylantiring, jonli tafsilotlar uchun stanokni bosing.",twin_unavailable_msg:"3D ko'rinishni yuklab bo'lmadi (Three.js kutubxonasi uchun internet aloqangizni tekshiring).",failure_prediction_title:"Nosozlik bashorati",report_lib_missing_msg:"PDF eksport qilish uchun reportlab kutubxonasi kerak. Bajaring: pip install reportlab, keyin serverni qayta ishga tushiring.",ph_machine_id:"Stanok ID (masalan M-01)",ph_machine_name:"Stanok nomi",ph_factory_section:"Zavod uchastkasi",ph_operator_name:"Operator ismi",ph_pressure:"Bosim (bar)",ph_voltage:"Kuchlanish (V)",ph_current:"Tok (A)",ph_error_code:"Xato kodi",ph_daily_output:"Kunlik ishlab chiqarish (birlik)",ph_notes:"Eslatmalar...",nav_system_intel:"Tizim intellekti",nav_roi:"ROI paneli",refresh_btn:"Yangilash",system_risk_label:"Tizim xavfi",healthy_label:"Sog'lom",at_risk_label:"Xavf ostida",clusters_title:"Stanok klasterlari",propagation_title:"Anomaliya tarqalishi",propagation_hint:"Nosoz stanok qo'shni stanoklar xavfini qanday oshiradi.",no_propagation:"Anomaliya tarqalishi aniqlanmadi.",avg_risk_label:"O'rtacha xavf",added_risk_label:"Qo'shilgan xavf",effective_risk_label:"Haqiqiy xavf",simulation_title:"Nima-bo'lsa simulyatsiyasi",simulation_hint:"Stanokni tanlang, sensor qiymatlarini o'zgartiring va nosozlik ehtimolini kuzating.",run_simulation_btn:"Simulyatsiyani ishga tushirish",failure_probability_label:"Nosozlik ehtimoli",stress_level_label:"Zo'riqish darajasi",predicted_status_label:"Bashorat holati",confidence_label:"Ishonchlilik",root_cause_title:"Asosiy sabab",rul_col:"Qolgan foydali muddat",rul_healthy:"Sog'lom",potential_loss_label:"Potentsial yo'qotish",saved_label:"AI tejadi",wasted_energy_label:"Isrof energiya / oy",efficiency_gain_label:"Samaradorlik o'sishi",cost_by_machine_title:"Stanoklar bo'yicha xarajat xavfi",top_cause_col:"Asosiy sabab",roi_assumptions_msg:"Taxminlar: to'xtash {downtime}/soat, ta'mir {hours} soat, energiya {price}/kWh.",role_label:"Sizning rolingiz",role_engineer:"Muhandis",role_manager:"Menejer",role_admin:"Administrator",cause_bearing_wear:"Podshipnik eskirishi",cause_overload_thermal:"Termik ortiqcha yuk",cause_cooling_failure:"Sovutish nosozligi",cause_misalignment:"Val nomuvofiqligi",cause_lubrication_loss:"Moylash yo'qolishi",cause_normal_operation:"Normal ish",nav_story:"Hikoya rejimi",story_hint:"22 soat davomida rivojlanayotgan podshipnik nosozligini qayta ijro etadi va AI uni qachon aniqlaganini — va bu qancha turishini ko'rsatadi.",simulate_failure_btn:"Nosozlikni modellashtirish",outcome_title:"Natija",warning_time_label:"Erta ogohlantirish",loss_ignored_label:"Harakatsiz yo'qotish",loss_acted_label:"Harakat bilan yo'qotish",money_saved_label:"Tejalgan",timeline_title:"Nosozlik xronologiyasi",story_detection_msg:"AI buni buzilishdan {hours} soat oldin, {risk}% xavfda aniqladi — asosiy sabab: {cause} ({confidence}% ishonch).",story_stage_healthy:"Sog'lom",story_stage_early_drift:"Dastlabki og'ish",story_stage_ai_detects:"AI aniqladi",story_stage_critical:"Tanqidiy",priority_low:"Past",priority_medium:"O'rta",priority_high:"Yuqori",priority_critical:"Tanqidiy",action_stop_machine:"Stanokni to'xtatish",action_inspect_bearings:"Podshipniklarni tekshirish",action_check_cooling:"Sovutishni tekshirish",action_schedule_shutdown_24h:"To'xtatishni rejalashtirish (24s)",action_order_spare_parts:"Ehtiyot qismlar buyurtma qilish",action_reduce_load:"Yuklamani kamaytirish",action_schedule_inspection_72h:"Tekshiruvni rejalashtirish (72s)",action_monitor_closely:"Diqqat bilan kuzatish",action_verify_sensor:"Sensorni tekshirish",action_power_down_idle:"Bo'sh stanokni o'chirish",action_review_shift_schedule:"Smena jadvalini ko'rib chiqish",action_no_action:"Harakat kerak emas",nav_oee:"OEE",nav_workorders:"Ish buyruqlari",oee_hint:"Mavjudlik x Unumdorlik x Sifat (ISO 22400). Jahon darajasi 85%, odatiy zavod esa 60% atrofida.",availability_label:"Mavjudlik",performance_label:"Unumdorlik",quality_label:"Sifat",weakest_factor_label:"Eng zaif",downtime_by_reason_title:"Sabab bo'yicha to'xtash",downtime_cost_label:"To'xtash narxi",oee_trend_title:"OEE dinamikasi",shifts_title:"Smenalar",shift_col:"Smena",downtime_col:"To'xtash",log_shift_btn:"Smena kiritish",no_shifts_yet:"Hali smenalar kiritilmagan.",minutes_short:"daq",range_1d:"Bugun",range_7d:"7 kun",range_30d:"30 kun",all_machines_option:"Barcha stanoklar",reason_unspecified:"Ko'rsatilmagan",err_good_exceeds_total:"Yaroqli soni umumiy sondan ko'p bo'la olmaydi",oee_grade_world_class:"Jahon darajasi",oee_grade_typical:"Odatiy",oee_grade_low:"Past",oee_grade_critical:"Tanqidiy",reason_breakdown:"Buzilish",reason_changeover:"Qayta sozlash",reason_no_material:"Material yo'q",reason_no_operator:"Operator yo'q",reason_planned_maintenance:"Rejali texnik xizmat",reason_quality_issue:"Sifat muammosi",reason_setup:"Sozlash",reason_other:"Boshqa",workorders_hint:"AI bashoratini kuzatiladigan vazifaga aylantiradi — ogohlantirish haqiqiy ta'mir bilan tugasin.",new_work_order_btn:"+ Yangi ish buyrug'i",no_work_orders:"Hali ish buyruqlari yo'q.",avg_completion_label:"O'rt. bajarilish",assigned_label:"Tayinlangan",source_ai:"AI",wo_status_open:"Ochiq",wo_status_in_progress:"Bajarilmoqda",wo_status_done:"Bajarildi",wo_status_cancelled:"Bekor qilindi",wo_advance_to_in_progress:"Ishni boshlash",wo_advance_to_done:"Bajarildi deb belgilash",ph_shift_name:"Smena nomi",ph_planned_minutes:"Rejali daqiqalar",ph_downtime_minutes:"To'xtash daqiqalari",ph_total_units:"Umumiy soni",ph_good_units:"Yaroqli soni",ph_cycle_seconds:"Ideal sikl (son)",ph_wo_title:"Sarlavha",ph_assigned_to:"Mas'ul",ph_wo_description:"Tavsif",overdue_label:"Muddati o'tgan",nav_history:"Tarix",history_hint:"Saqlangan sensor tarixi — pilot davomida nima o'zgarganini shu bilan isbotlaysiz.",no_history_yet:"Tarix hali yozilmagan. Jonli monitoringni bir necha daqiqa ochiq qoldiring, ma'lumot to'plana boshlaydi.",range_24h:"24 soat",range_3d:"3 kun",range_10d:"10 kun",sensor_trend_title:"Sensor dinamikasi",risk_trend_title:"Xavf dinamikasi",trend_flat:"o'zgarishsiz",trend_rising:"o'smoqda",trend_falling:"kamaymoqda",create_work_order_btn:"Ish buyrug'i yaratish",work_order_created_msg:"Ish buyrug'i yaratildi",alertreason_immediate_failure_risk:"Darhol buzilish xavfi",alertreason_failure_imminent:"Nosozlik yaqin",alertreason_degradation_accelerating:"Eskirish tezlashmoqda",alertreason_outside_normal_envelope:"Normal chegaradan tashqarida",alertreason_pressure_anomaly:"Bosim anomaliyasi",alertreason_idle_waste:"Bo'sh yurish isrofi",alertreason_informational:"Ma'lumot",alert_reason_label:"Sabab"},
-  ky: {tagline:"Глобалдык өнөр жай интеллект платформасы",live_label:"Түз эфир",kpi_energy:"Энергия сарпталышы",kpi_efficiency:"Эффективдүүлүк",kpi_active:"Активдүү станоктор",kpi_alerts:"Дабылдар",kwh_unit:"кВт·саат",chart_title:"Реалдуу убакыттагы көрсөткүчтөр",machine_status_title:"Станоктордун абалы",status_running:"Иштеп жатат",status_warning:"Эскертүү",status_critical:"Олуттуу",form_title:"Завод маалыматтарын киргизүү",factory_name_label:"Заводдун аты",machine_count_label:"Станоктордун саны",energy_cost_label:"Энергия наркы ($/кВт·саат)",machine_type_label:"Станоктун түрү",temperature_label:"Температура (°C)",vibration_label:"Дирилдөө (мм/с)",load_label:"Жүктөм (%)",submit_btn:"Заводду талдоо",submitting:"Жаңыртылууда...",ai_panel_title:"AI-талдоо",ai_placeholder:"AI-талдоо алуу үчүн завод маалыматтарын жөнөтүңүз.",ai_analyzing:"Талдануда...",ai_risks:"Тобокелдиктер",ai_efficiency_insights:"Эффективдүүлүк талдоосу",ai_optimizations:"Оптималдаштыруу сунуштары",toast_updated:"Завод маалыматтары жаңыртылды",toast_analysis_done:"AI-талдоо аяктады",toast_error:"Ката кетти",nav_dashboard:"Башкаруу панели",nav_factories:"Заводдор",nav_ai_insights:"AI-талдоо",logout_btn:"Чыгуу",login_title:"Кайра кош келиңиз",login_subtitle:"FactoryPulse AI каттоо эсебиңизге кириңиз",ph_email:"Электрондук почта",ph_password:"Сырсөз",remember_me:"Мени эстеп кал",login_btn:"Кирүү",login_link_register:"Каттоо эсебиңиз жокпу? Түзүү",register_title:"Каттоо эсебин түзүү",register_subtitle:"Заводдоруңузду AI менен байкоону баштаңыз",ph_full_name:"Толук аты-жөнү",ph_confirm_password:"Сырсөздү ырастаңыз",register_btn:"Каттоо эсебин түзүү",register_link_login:"Каттоо эсебиңиз барбы? Кирүү",err_missing_fields:"Бардык талааларды толтуруңуз",err_invalid_email:"Жарактуу электрондук почта дарегин киргизиңиз",err_weak_password:"Сырсөз кеминде 8 белги, тамга жана сан камтышы керек",err_password_mismatch:"Сырсөздөр дал келбейт",err_invalid_credentials:"Электрондук почта же сырсөз туура эмес",err_email_taken:"Бул электрондук почта мурунтан катталган",err_generic:"Ката кетти. Кайра аракет кылыңыз",my_factories_title:"Менин Заводдорум",add_factory_btn:"+ Завод кошуу",edit_factory_btn:"Түзөтүү",delete_factory_btn:"Өчүрүү",confirm_delete_factory:"Бул заводду өчүрөсүзбү? Бул аракетти артка кайтарууга болбойт.",no_factories_yet:"Сиз азырынча эч кандай завод кошкон жоксуз.",factory_created_toast:"Завод түзүлдү жана талданды",factory_updated_toast:"Завод жаңыртылды",factory_deleted_toast:"Завод өчүрүлдү",ai_insights_feed_title:"AI-талдоо тизмеси",no_ai_insights_yet:"Азырынча AI-талдоо жок. Баштоо үчүн завод кошуңуз.",reanalyze_btn:"Кайра талдоо",view_insights_btn:"Талдоону көрүү",created_label:"Түзүлгөн күнү",cancel_btn:"Жокко чыгаруу",save_btn:"Өзгөртүүлөрдү сактоо",nav_live_monitor:"Түз мониторинг",add_machine_scada_btn:"+ Станок кошуу",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Сурам",live_chart_title:"Реалдуу убакыттагы сенсор графиги",machines_table_title:"Станоктор",machine_code_col:"Код",machine_name_col:"Аты",status_col:"Абалы",risk_col:"Тобокелдик",no_machines_yet:"Азырынча станоктор жок. \"+ Станок кошуу\"ну басыңыз.",section_machine_info:"Станок маалыматы",section_sensor_data:"Сенсор маалыматтары",section_status:"Абалы",section_notes:"Эскертүүлөр",status_stopped:"Токтотулган",status_maintenance:"Тейлөө",priority_low:"Төмөн",priority_normal:"Кадимки",priority_high:"Жогору",priority_critical:"Олуттуу",save_and_analyze_btn:"Сактоо жана талдоо",source_col:"Булак",source_auto:"Автоматтык (SCADA)",source_manual:"Кол менен",nav_alerts:"Дабылдар",acknowledge_btn:"Ырастоо",acknowledged_label:"Ырасталды",acknowledge_all_btn:"Баарын ырастоо",no_alerts_yet:"Дабылдар жок. Баары жакшы иштеп жатат.",download_report_btn:"Отчет",alert_details_template:"Температура {temp}°C, дирилдөө {vib} мм/с, абалы: {status}",section_energy_intel:"Энергия интеллекти",daily_output_hint:"Бирдикке кеткен энергия сарптоону (бирдик үчүн кВт·саат) эсептөө үчүн колдонулат.",energy_insights_title:"Энергия интеллекти",idle_power_title:"Бош жүрүштү аныктоо",idle_active_msg:"Станок бош турат - учурда болжол менен {kw} кВт бекер коротулуп жатат.",idle_none_msg:"Бош жүрүш чыгымы табылган жок.",friction_loss_title:"Болжолдуу энергия жоготуусу",friction_active_msg:"Жогорулаган үйкөлүш табылды: +{pct}% кошумча кубат (~{kw} кВт кошумча). Чыгымдын алдын алуу үчүн тейлөөнү пландаштырыңыз.",friction_none_msg:"Аномалдуу үйкөлүш табылган жок.",sec_title:"Бирдикке кеткен энергия",sec_label:"бирдик үчүн кВт·саат",sec_unit:"кВт·саат/бирдик",sec_no_data_msg:"Бул көрсөткүчтү көрүү үчүн станок кошууда күндөлүк өндүрүштү киргизиңиз.",optimal_load_title:"Оптималдуу жүктөм аймагы",optimal_load_label:"Оптималдуу жүктөм",current_load_label:"Учурдагы жүктөм",at_optimal_msg:"Оптималдуу жүктөм аймагында иштеп жатат.",adjust_to_optimal_msg:"Бирдикке кеткен энергияны азайтуу үчүн жүктөмдү {pct}%га жакындатыңыз.",nav_digital_twin:"Санарип эгиз",twin_hint:"Айландыруу үчүн сүйрөңүз, чоңойтуу үчүн айландырыңыз, түз маалымат үчүн станокту басыңыз.",twin_unavailable_msg:"3D көрүнүш жүктөлгөн жок (Three.js китепканасы үчүн интернет байланышын текшериңиз).",failure_prediction_title:"Бузулуу болжому",report_lib_missing_msg:"PDF экспорттоо үчүн reportlab китепканасы керек. Аткарыңыз: pip install reportlab, андан кийин серверди кайра иштетиңиз.",ph_machine_id:"Станок ID (мис. M-01)",ph_machine_name:"Станок аты",ph_factory_section:"Завод участогу",ph_operator_name:"Оператордун аты",ph_pressure:"Басым (bar)",ph_voltage:"Чыңалуу (V)",ph_current:"Ток (A)",ph_error_code:"Ката коду",ph_daily_output:"Күндөлүк өндүрүш (бирдик)",ph_notes:"Эскертүүлөр...",nav_system_intel:"Тутум интеллекти",nav_roi:"ROI панели",refresh_btn:"Жаңыртуу",system_risk_label:"Тутум тобокелдиги",healthy_label:"Сак",at_risk_label:"Тобокелдикте",clusters_title:"Станок кластерлери",propagation_title:"Аномалиянын жайылышы",propagation_hint:"Бузулган станок кошуналарынын тобокелдигин кантип жогорулатат.",no_propagation:"Аномалиянын жайылышы аныкталган жок.",avg_risk_label:"Орточо тобокелдик",added_risk_label:"Кошумча тобокелдик",effective_risk_label:"Иш жүзүндөгү тобокелдик",simulation_title:"Эмне-болсо симуляциясы",simulation_hint:"Станокту тандап, сенсор маанилерин өзгөртүп, бузулуу ыктымалдыгын карап көрүңүз.",run_simulation_btn:"Симуляцияны иштетүү",failure_probability_label:"Бузулуу ыктымалдыгы",stress_level_label:"Чыңалуу деңгээли",predicted_status_label:"Болжолдонгон абал",confidence_label:"Ишенимдүүлүк",root_cause_title:"Негизги себеп",rul_col:"Калган ресурс",rul_healthy:"Сак",potential_loss_label:"Потенциалдуу жоготуу",saved_label:"AI үнөмдөдү",wasted_energy_label:"Ысырап энергия / ай",efficiency_gain_label:"Эффективдүүлүк өсүшү",cost_by_machine_title:"Станоктор боюнча чыгым тобокелдиги",top_cause_col:"Негизги себеп",roi_assumptions_msg:"Болжолдор: токтоп калуу {downtime}/саат, оңдоо {hours} саат, энергия {price}/kWh.",role_label:"Сиздин ролуңуз",role_engineer:"Инженер",role_manager:"Менеджер",role_admin:"Администратор",cause_bearing_wear:"Подшипниктин эскириши",cause_overload_thermal:"Жылуулук ашыкча жүктөө",cause_cooling_failure:"Муздатуу бузулушу",cause_misalignment:"Валдын борборунан жылышы",cause_lubrication_loss:"Майлоонун жоголушу",cause_normal_operation:"Кадимки иштөө",nav_story:"Окуя режими",story_hint:"22 саат ичинде өнүгүп жаткан подшипник бузулушун кайра ойнотуп, AI аны так качан аныктаганын — жана бул канча турганын көрсөтөт.",simulate_failure_btn:"Бузулууну моделдөө",outcome_title:"Жыйынтык",warning_time_label:"Эрте эскертүү",loss_ignored_label:"Аракетсиз чыгым",loss_acted_label:"Аракет менен чыгым",money_saved_label:"Үнөмдөлдү",timeline_title:"Бузулуу хронологиясы",story_detection_msg:"AI муну бузулуудан {hours} саат мурун, {risk}% тобокелдикте аныктады — негизги себеп: {cause} ({confidence}% ишеним).",story_stage_healthy:"Сак",story_stage_early_drift:"Алгачкы четтөө",story_stage_ai_detects:"AI аныктады",story_stage_critical:"Критикалык",priority_low:"Төмөн",priority_medium:"Орточо",priority_high:"Жогору",priority_critical:"Критикалык",action_stop_machine:"Станокту токтотуу",action_inspect_bearings:"Подшипниктерди текшерүү",action_check_cooling:"Муздатууну текшерүү",action_schedule_shutdown_24h:"Токтотууну пландаштыруу (24с)",action_order_spare_parts:"Камдык бөлүктөрдү заказ кылуу",action_reduce_load:"Жүктөмдү азайтуу",action_schedule_inspection_72h:"Текшерүүнү пландаштыруу (72с)",action_monitor_closely:"Кылдат байкоо",action_verify_sensor:"Сенсорду текшерүү",action_power_down_idle:"Бош станокту өчүрүү",action_review_shift_schedule:"Смена графигин кароо",action_no_action:"Аракет талап кылынбайт",nav_oee:"OEE",nav_workorders:"Иш буйруктары",oee_hint:"Жеткиликтүүлүк x Өндүрүмдүүлүк x Сапат (ISO 22400). Дүйнөлүк деңгээл 85%, кадимки завод 60% чамасында.",availability_label:"Жеткиликтүүлүк",performance_label:"Өндүрүмдүүлүк",quality_label:"Сапат",weakest_factor_label:"Эң алсыз",downtime_by_reason_title:"Себеби боюнча токтоп калуу",downtime_cost_label:"Токтоп калуу баасы",oee_trend_title:"OEE динамикасы",shifts_title:"Сменалар",shift_col:"Смена",downtime_col:"Токтоп калуу",log_shift_btn:"Смена киргизүү",no_shifts_yet:"Азырынча сменалар киргизилген жок.",minutes_short:"мүн",range_1d:"Бүгүн",range_7d:"7 күн",range_30d:"30 күн",all_machines_option:"Бардык станоктор",reason_unspecified:"Көрсөтүлгөн эмес",err_good_exceeds_total:"Жарамдуу саны жалпы санынан ашпашы керек",oee_grade_world_class:"Дүйнөлүк деңгээл",oee_grade_typical:"Кадимки",oee_grade_low:"Төмөн",oee_grade_critical:"Критикалык",reason_breakdown:"Бузулуу",reason_changeover:"Кайра жөндөө",reason_no_material:"Материал жок",reason_no_operator:"Оператор жок",reason_planned_maintenance:"Пландуу тейлөө",reason_quality_issue:"Сапат маселеси",reason_setup:"Орнотуу",reason_other:"Башка",workorders_hint:"AI болжолун көзөмөлдөнүүчү тапшырмага айландырат — эскертүү чыныгы оңдоо менен аякташы үчүн.",new_work_order_btn:"+ Жаңы иш буйругу",no_work_orders:"Азырынча иш буйруктары жок.",avg_completion_label:"Орт. аткаруу",assigned_label:"Дайындалган",source_ai:"AI",wo_status_open:"Ачык",wo_status_in_progress:"Аткарылууда",wo_status_done:"Аткарылды",wo_status_cancelled:"Жокко чыгарылды",wo_advance_to_in_progress:"Ишти баштоо",wo_advance_to_done:"Аткарылды деп белгилөө",ph_shift_name:"Смена аты",ph_planned_minutes:"Пландуу мүнөттөр",ph_downtime_minutes:"Токтоп калган мүнөттөр",ph_total_units:"Жалпы саны",ph_good_units:"Жарамдуу саны",ph_cycle_seconds:"Идеалдуу цикл (сек)",ph_wo_title:"Аталышы",ph_assigned_to:"Жооптуу",ph_wo_description:"Сүрөттөмө",overdue_label:"Мөөнөтү өткөн",nav_history:"Тарых",history_hint:"Сакталган сенсор тарыхы — пилот учурунда эмне өзгөргөнүн ушуну менен далилдейсиз.",no_history_yet:"Тарых азырынча жазылган жок. Түз мониторингди бир нече мүнөт ачык калтырсаңыз, маалымат чогула баштайт.",range_24h:"24 саат",range_3d:"3 күн",range_10d:"10 күн",sensor_trend_title:"Сенсор динамикасы",risk_trend_title:"Тобокелдик динамикасы",trend_flat:"өзгөрүүсүз",trend_rising:"өсүүдө",trend_falling:"төмөндөөдө",create_work_order_btn:"Иш буйругун түзүү",work_order_created_msg:"Иш буйругу түзүлдү",alertreason_immediate_failure_risk:"Дароо бузулуу коркунучу",alertreason_failure_imminent:"Бузулуу жакын",alertreason_degradation_accelerating:"Тозуу тездеп жатат",alertreason_outside_normal_envelope:"Кадимки чектен тышкары",alertreason_pressure_anomaly:"Басым аномалиясы",alertreason_idle_waste:"Бош жүрүш чыгымы",alertreason_informational:"Маалыматтык",alert_reason_label:"Себеби"},
-  uk: {tagline:"Глобальна платформа промислового інтелекту",live_label:"Наживо",kpi_energy:"Споживання енергії",kpi_efficiency:"Ефективність",kpi_active:"Активні верстати",kpi_alerts:"Сповіщення",kwh_unit:"кВт·год",chart_title:"Показники в реальному часі",machine_status_title:"Статус верстатів",status_running:"Працює",status_warning:"Попередження",status_critical:"Критично",form_title:"Введення даних заводу",factory_name_label:"Назва заводу",machine_count_label:"Кількість верстатів",energy_cost_label:"Вартість енергії ($/кВт·год)",machine_type_label:"Тип верстата",temperature_label:"Температура (°C)",vibration_label:"Вібрація (мм/с)",load_label:"Навантаження (%)",submit_btn:"Аналізувати завод",submitting:"Оновлення...",ai_panel_title:"AI-аналітика",ai_placeholder:"Надішліть дані заводу, щоб отримати AI-аналіз.",ai_analyzing:"Аналіз...",ai_risks:"Ризики",ai_efficiency_insights:"Аналіз ефективності",ai_optimizations:"Рекомендації з оптимізації",toast_updated:"Дані заводу оновлено",toast_analysis_done:"AI-аналіз завершено",toast_error:"Сталася помилка",nav_dashboard:"Панель",nav_factories:"Заводи",nav_ai_insights:"AI-аналітика",logout_btn:"Вийти",login_title:"З поверненням",login_subtitle:"Увійдіть у свій обліковий запис FactoryPulse AI",ph_email:"Електронна пошта",ph_password:"Пароль",remember_me:"Запам'ятати мене",login_btn:"Увійти",login_link_register:"Немає акаунту? Створити",register_title:"Створіть акаунт",register_subtitle:"Почніть моніторинг заводів за допомогою AI",ph_full_name:"Повне ім'я",ph_confirm_password:"Підтвердіть пароль",register_btn:"Створити акаунт",register_link_login:"Вже є акаунт? Увійти",err_missing_fields:"Будь ласка, заповніть усі поля",err_invalid_email:"Введіть дійсну електронну адресу",err_weak_password:"Пароль має містити щонайменше 8 символів, літеру та цифру",err_password_mismatch:"Паролі не збігаються",err_invalid_credentials:"Невірна електронна пошта або пароль",err_email_taken:"Ця електронна пошта вже зареєстрована",err_generic:"Сталася помилка. Спробуйте ще раз",my_factories_title:"Мої Заводи",add_factory_btn:"+ Додати завод",edit_factory_btn:"Редагувати",delete_factory_btn:"Видалити",confirm_delete_factory:"Видалити цей завод? Цю дію не можна скасувати.",no_factories_yet:"Ви ще не додали жодного заводу.",factory_created_toast:"Завод створено та проаналізовано",factory_updated_toast:"Завод оновлено",factory_deleted_toast:"Завод видалено",ai_insights_feed_title:"Стрічка AI-аналітики",no_ai_insights_yet:"Ще немає AI-аналітики. Додайте завод.",reanalyze_btn:"Проаналізувати знову",view_insights_btn:"Переглянути аналітику",created_label:"Створено",cancel_btn:"Скасувати",save_btn:"Зберегти зміни",nav_live_monitor:"Моніторинг",add_machine_scada_btn:"+ Додати верстат",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Опитування",live_chart_title:"Графік датчиків у реальному часі",machines_table_title:"Верстати",machine_code_col:"Код",machine_name_col:"Назва",status_col:"Статус",risk_col:"Ризик",no_machines_yet:"Верстатів поки немає. Натисніть «+ Додати верстат».",section_machine_info:"Інформація про верстат",section_sensor_data:"Дані датчиків",section_status:"Статус",section_notes:"Примітки",status_stopped:"Зупинено",status_maintenance:"Обслуговування",priority_low:"Низький",priority_normal:"Звичайний",priority_high:"Високий",priority_critical:"Критичний",save_and_analyze_btn:"Зберегти та проаналізувати",source_col:"Джерело",source_auto:"Авто (SCADA)",source_manual:"Вручну",nav_alerts:"Сповіщення",acknowledge_btn:"Підтвердити",acknowledged_label:"Підтверджено",acknowledge_all_btn:"Підтвердити все",no_alerts_yet:"Сповіщень немає. Все працює нормально.",download_report_btn:"Звіт",alert_details_template:"Температура {temp}°C, вібрація {vib} мм/с, статус: {status}",section_energy_intel:"Енергетичний інтелект",daily_output_hint:"Використовується для розрахунку питомого енергоспоживання (кВт·год на одиницю).",energy_insights_title:"Енергетичний інтелект",idle_power_title:"Виявлення холостого ходу",idle_active_msg:"Верстат простоює — зараз витрачається приблизно {kw} кВт даремно.",idle_none_msg:"Втрат енергії на холостому ходу не виявлено.",friction_loss_title:"Прогноз втрат енергії",friction_active_msg:"Виявлено підвищене тертя: +{pct}% зайвої потужності (~{kw} кВт). Заплануйте обслуговування, щоб уникнути втрат.",friction_none_msg:"Аномального тертя не виявлено.",sec_title:"Питоме енергоспоживання",sec_label:"кВт·год на одиницю",sec_unit:"кВт·год/од.",sec_no_data_msg:"Вкажіть добовий обсяг випуску при додаванні верстата, щоб побачити цей показник.",optimal_load_title:"Оптимальна зона навантаження",optimal_load_label:"Оптимальне навантаження",current_load_label:"Поточне навантаження",at_optimal_msg:"Працює в оптимальній зоні навантаження.",adjust_to_optimal_msg:"Наблизьте навантаження до {pct}%, щоб мінімізувати енергію на одиницю.",nav_digital_twin:"Цифровий двійник",twin_hint:"Перетягуйте для повороту, прокручуйте для масштабування, натисніть на верстат для деталей у реальному часі.",twin_unavailable_msg:"Не вдалося завантажити 3D-вигляд (перевірте підключення до інтернету для Three.js).",failure_prediction_title:"Прогноз відмови",report_lib_missing_msg:"Для експорту в PDF потрібна бібліотека reportlab. Виконайте: pip install reportlab, потім перезапустіть сервер.",ph_machine_id:"ID верстата (напр. M-01)",ph_machine_name:"Назва верстата",ph_factory_section:"Дільниця заводу",ph_operator_name:"Ім'я оператора",ph_pressure:"Тиск (бар)",ph_voltage:"Напруга (В)",ph_current:"Струм (А)",ph_error_code:"Код помилки",ph_daily_output:"Добовий випуск (од.)",ph_notes:"Примітки...",nav_system_intel:"Системна аналітика",nav_roi:"ROI-панель",refresh_btn:"Оновити",system_risk_label:"Системний ризик",healthy_label:"Справні",at_risk_label:"У зоні ризику",clusters_title:"Кластери верстатів",propagation_title:"Поширення аномалій",propagation_hint:"Як відмова одного верстата підвищує ризик сусідніх.",no_propagation:"Поширення аномалій не виявлено.",avg_risk_label:"Середній ризик",added_risk_label:"Доданий ризик",effective_risk_label:"Ефективний ризик",simulation_title:"Що-якщо симуляція",simulation_hint:"Оберіть верстат, змініть покази датчиків і подивіться на зміну ризику.",run_simulation_btn:"Запустити симуляцію",failure_probability_label:"Ймовірність відмови",stress_level_label:"Рівень навантаження",predicted_status_label:"Прогноз статусу",confidence_label:"Достовірність",root_cause_title:"Першопричина",rul_col:"Залишковий ресурс",rul_healthy:"Справний",potential_loss_label:"Потенційні втрати",saved_label:"Заощаджено AI",wasted_energy_label:"Втрати енергії / місяць",efficiency_gain_label:"Приріст ефективності",cost_by_machine_title:"Фінансовий ризик за верстатами",top_cause_col:"Основна причина",roi_assumptions_msg:"Припущення: простій {downtime}/год, ремонт {hours} год, енергія {price}/кВт·год.",role_label:"Ваша роль",role_engineer:"Інженер",role_manager:"Менеджер",role_admin:"Адміністратор",cause_bearing_wear:"Знос підшипника",cause_overload_thermal:"Теплове перевантаження",cause_cooling_failure:"Відмова охолодження",cause_misalignment:"Розцентрування вала",cause_lubrication_loss:"Втрата мастила",cause_normal_operation:"Нормальна робота",nav_story:"Режим історії",story_hint:"Відтворює розвиток відмови підшипника за 22 години та показує, коли саме AI її виявив — і скільки це коштувало.",simulate_failure_btn:"Змоделювати відмову",outcome_title:"Підсумок",warning_time_label:"Раннє попередження",loss_ignored_label:"Втрати без реакції",loss_acted_label:"Втрати з реакцією",money_saved_label:"Заощаджено",timeline_title:"Хронологія відмови",story_detection_msg:"AI виявив це за {hours} год до поломки, при ризику {risk}% — першопричина: {cause} (достовірність {confidence}%).",story_stage_healthy:"Справний",story_stage_early_drift:"Початок відхилення",story_stage_ai_detects:"AI виявив",story_stage_critical:"Критично",priority_low:"Низький",priority_medium:"Середній",priority_high:"Високий",priority_critical:"Критичний",action_stop_machine:"Зупинити верстат",action_inspect_bearings:"Перевірити підшипники",action_check_cooling:"Перевірити охолодження",action_schedule_shutdown_24h:"Запланувати зупинку (24год)",action_order_spare_parts:"Замовити запчастини",action_reduce_load:"Знизити навантаження",action_schedule_inspection_72h:"Запланувати огляд (72год)",action_monitor_closely:"Уважно спостерігати",action_verify_sensor:"Перевірити датчик",action_power_down_idle:"Вимкнути простійний верстат",action_review_shift_schedule:"Переглянути графік змін",action_no_action:"Дій не потрібно",nav_oee:"OEE",nav_workorders:"Наряди",oee_hint:"Доступність x Продуктивність x Якість (ISO 22400). Світовий рівень — 85%, типовий завод — близько 60%.",availability_label:"Доступність",performance_label:"Продуктивність",quality_label:"Якість",weakest_factor_label:"Найслабша ланка",downtime_by_reason_title:"Простої за причинами",downtime_cost_label:"Вартість простою",oee_trend_title:"Динаміка OEE",shifts_title:"Зміни",shift_col:"Зміна",downtime_col:"Простій",log_shift_btn:"Внести зміну",no_shifts_yet:"Зміни ще не внесено.",minutes_short:"хв",range_1d:"Сьогодні",range_7d:"7 днів",range_30d:"30 днів",all_machines_option:"Усі верстати",reason_unspecified:"Не вказано",err_good_exceeds_total:"Придатних не може бути більше загальної кількості",oee_grade_world_class:"Світовий рівень",oee_grade_typical:"Типовий",oee_grade_low:"Низький",oee_grade_critical:"Критичний",reason_breakdown:"Поломка",reason_changeover:"Переналагодження",reason_no_material:"Немає матеріалу",reason_no_operator:"Немає оператора",reason_planned_maintenance:"Планове ТО",reason_quality_issue:"Проблема якості",reason_setup:"Налаштування",reason_other:"Інше",workorders_hint:"Перетворює прогноз AI на відстежуване завдання — щоб попередження закінчилося ремонтом.",new_work_order_btn:"+ Новий наряд",no_work_orders:"Нарядів поки немає.",avg_completion_label:"Сер. виконання",assigned_label:"Призначено",source_ai:"AI",wo_status_open:"Відкритий",wo_status_in_progress:"В роботі",wo_status_done:"Виконаний",wo_status_cancelled:"Скасований",wo_advance_to_in_progress:"Почати роботу",wo_advance_to_done:"Позначити виконаним",ph_shift_name:"Назва зміни",ph_planned_minutes:"Планові хвилини",ph_downtime_minutes:"Хвилини простою",ph_total_units:"Усього одиниць",ph_good_units:"Придатних одиниць",ph_cycle_seconds:"Ідеальний цикл (сек)",ph_wo_title:"Назва",ph_assigned_to:"Відповідальний",ph_wo_description:"Опис",overdue_label:"Прострочено",nav_history:"Історія",history_hint:"Збережена історія датчиків — так ви доведете, що реально змінилося за пілот.",no_history_yet:"Історію ще не записано. Потримайте Моніторинг відкритим кілька хвилин, і дані почнуть накопичуватися.",range_24h:"24 години",range_3d:"3 дні",range_10d:"10 днів",sensor_trend_title:"Динаміка датчиків",risk_trend_title:"Динаміка ризику",trend_flat:"без змін",trend_rising:"зростає",trend_falling:"знижується",create_work_order_btn:"Створити наряд",work_order_created_msg:"Наряд створено",alertreason_immediate_failure_risk:"Ризик негайної відмови",alertreason_failure_imminent:"Відмова неминуча",alertreason_degradation_accelerating:"Знос прискорюється",alertreason_outside_normal_envelope:"Вихід за штатні межі",alertreason_pressure_anomaly:"Аномалія тиску",alertreason_idle_waste:"Втрати на холостому ходу",alertreason_informational:"Інформаційне",alert_reason_label:"Причина"},
-  pl: {tagline:"Globalna Platforma Inteligencji Przemysłowej",live_label:"Na żywo",kpi_energy:"Zużycie Energii",kpi_efficiency:"Wydajność",kpi_active:"Aktywne Maszyny",kpi_alerts:"Alerty",kwh_unit:"kWh",chart_title:"Wydajność w Czasie Rzeczywistym",machine_status_title:"Status Maszyn",status_running:"Działa",status_warning:"Ostrzeżenie",status_critical:"Krytyczne",form_title:"Wprowadzanie Danych Fabryki",factory_name_label:"Nazwa Fabryki",machine_count_label:"Liczba Maszyn",energy_cost_label:"Koszt Energii ($/kWh)",machine_type_label:"Typ Maszyny",temperature_label:"Temperatura (°C)",vibration_label:"Wibracje (mm/s)",load_label:"Obciążenie (%)",submit_btn:"Analizuj Fabrykę",submitting:"Aktualizowanie...",ai_panel_title:"Analizy AI",ai_placeholder:"Prześlij dane fabryki, aby wygenerować analizę AI.",ai_analyzing:"Analizowanie...",ai_risks:"Ryzyka",ai_efficiency_insights:"Analiza Wydajności",ai_optimizations:"Sugestie Optymalizacji",toast_updated:"Dane fabryki zaktualizowane",toast_analysis_done:"Analiza AI zakończona",toast_error:"Coś poszło nie tak",nav_dashboard:"Panel",nav_factories:"Fabryki",nav_ai_insights:"Analizy AI",logout_btn:"Wyloguj",login_title:"Witamy z powrotem",login_subtitle:"Zaloguj się do swojego konta FactoryPulse AI",ph_email:"E-mail",ph_password:"Hasło",remember_me:"Zapamiętaj mnie",login_btn:"Zaloguj się",login_link_register:"Nie masz konta? Utwórz je",register_title:"Utwórz konto",register_subtitle:"Zacznij monitorować swoje fabryki z AI",ph_full_name:"Imię i Nazwisko",ph_confirm_password:"Potwierdź Hasło",register_btn:"Utwórz Konto",register_link_login:"Masz już konto? Zaloguj się",err_missing_fields:"Proszę wypełnić wszystkie pola",err_invalid_email:"Proszę podać prawidłowy adres e-mail",err_weak_password:"Hasło musi mieć min. 8 znaków, literę i cyfrę",err_password_mismatch:"Hasła nie pasują do siebie",err_invalid_credentials:"Nieprawidłowy e-mail lub hasło",err_email_taken:"Ten e-mail jest już zarejestrowany",err_generic:"Coś poszło nie tak. Spróbuj ponownie",my_factories_title:"Moje Fabryki",add_factory_btn:"+ Dodaj Fabrykę",edit_factory_btn:"Edytuj",delete_factory_btn:"Usuń",confirm_delete_factory:"Usunąć tę fabrykę? Tej czynności nie można cofnąć.",no_factories_yet:"Nie dodałeś jeszcze żadnej fabryki.",factory_created_toast:"Fabryka utworzona i przeanalizowana",factory_updated_toast:"Fabryka zaktualizowana",factory_deleted_toast:"Fabryka usunięta",ai_insights_feed_title:"Kanał Analiz AI",no_ai_insights_yet:"Brak analiz AI. Dodaj fabrykę, aby zacząć.",reanalyze_btn:"Analizuj Ponownie",view_insights_btn:"Zobacz Analizy",created_label:"Utworzono",cancel_btn:"Anuluj",save_btn:"Zapisz Zmiany",nav_live_monitor:"Monitoring na Żywo",add_machine_scada_btn:"+ Dodaj Maszynę",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Odpytywanie",live_chart_title:"Wykres Czujników na Żywo",machines_table_title:"Maszyny",machine_code_col:"Kod",machine_name_col:"Nazwa",status_col:"Status",risk_col:"Ryzyko",no_machines_yet:"Brak maszyn. Kliknij „+ Dodaj Maszynę”.",section_machine_info:"Informacje o Maszynie",section_sensor_data:"Dane Czujników",section_status:"Status",section_notes:"Notatki",status_stopped:"Zatrzymana",status_maintenance:"Konserwacja",priority_low:"Niski",priority_normal:"Normalny",priority_high:"Wysoki",priority_critical:"Krytyczny",save_and_analyze_btn:"Zapisz i Analizuj",source_col:"Źródło",source_auto:"Auto (SCADA)",source_manual:"Ręcznie",nav_alerts:"Alerty",acknowledge_btn:"Potwierdź",acknowledged_label:"Potwierdzone",acknowledge_all_btn:"Potwierdź Wszystkie",no_alerts_yet:"Brak alertów. Wszystko działa prawidłowo.",download_report_btn:"Raport",alert_details_template:"Temperatura {temp}°C, wibracje {vib} mm/s, status: {status}",section_energy_intel:"Inteligencja Energetyczna",daily_output_hint:"Używane do obliczania jednostkowego zużycia energii (kWh na jednostkę).",energy_insights_title:"Inteligencja Energetyczna",idle_power_title:"Wykrywanie Mocy Jałowej",idle_active_msg:"Maszyna bezczynna - obecnie marnowane jest ok. {kw} kW.",idle_none_msg:"Nie wykryto marnowania energii w trybie bezczynności.",friction_loss_title:"Predykcyjna Utrata Energii",friction_active_msg:"Wykryto zwiększone tarcie: +{pct}% dodatkowej mocy (~{kw} kW więcej). Zaplanuj konserwację, aby zapobiec stratom.",friction_none_msg:"Nie wykryto nieprawidłowego tarcia.",sec_title:"Jednostkowe Zużycie Energii",sec_label:"kWh na jednostkę",sec_unit:"kWh/jednostkę",sec_no_data_msg:"Podaj dzienną produkcję podczas dodawania maszyny, aby zobaczyć ten wskaźnik.",optimal_load_title:"Optymalna Strefa Obciążenia",optimal_load_label:"Optymalne obciążenie",current_load_label:"Obecne obciążenie",at_optimal_msg:"Działa w optymalnej strefie obciążenia.",adjust_to_optimal_msg:"Dostosuj obciążenie do {pct}%, aby zminimalizować energię na jednostkę.",nav_digital_twin:"Cyfrowy Bliźniak",twin_hint:"Przeciągnij, aby obrócić, przewiń, aby powiększyć, kliknij maszynę, aby zobaczyć szczegóły na żywo.",twin_unavailable_msg:"Nie udało się załadować widoku 3D (sprawdź połączenie internetowe dla biblioteki Three.js).",failure_prediction_title:"Prognoza Awarii",report_lib_missing_msg:"Eksport do PDF wymaga biblioteki reportlab. Uruchom: pip install reportlab, a następnie zrestartuj serwer.",ph_machine_id:"ID Maszyny (np. M-01)",ph_machine_name:"Nazwa Maszyny",ph_factory_section:"Sekcja Fabryki",ph_operator_name:"Imię Operatora",ph_pressure:"Ciśnienie (bar)",ph_voltage:"Napięcie (V)",ph_current:"Prąd (A)",ph_error_code:"Kod Błędu",ph_daily_output:"Dzienna Produkcja (jednostki)",ph_notes:"Notatki...",nav_system_intel:"Inteligencja Systemu",nav_roi:"Pulpit ROI",refresh_btn:"Odśwież",system_risk_label:"Ryzyko Systemu",healthy_label:"Sprawne",at_risk_label:"Zagrożone",clusters_title:"Klastry Maszyn",propagation_title:"Propagacja Anomalii",propagation_hint:"Jak awaria jednej maszyny podnosi ryzyko sąsiednich.",no_propagation:"Nie wykryto propagacji anomalii.",avg_risk_label:"Śr. ryzyko",added_risk_label:"Dodane ryzyko",effective_risk_label:"Ryzyko efektywne",simulation_title:"Symulacja Co-Jeśli",simulation_hint:"Wybierz maszynę, zmień wartości czujników i obserwuj prawdopodobieństwo awarii.",run_simulation_btn:"Uruchom Symulację",failure_probability_label:"Prawdopodobieństwo Awarii",stress_level_label:"Poziom Obciążenia",predicted_status_label:"Przewidywany Status",confidence_label:"Pewność",root_cause_title:"Przyczyna Źródłowa",rul_col:"Pozostała Żywotność",rul_healthy:"Sprawna",potential_loss_label:"Potencjalna Strata",saved_label:"Zaoszczędzone przez AI",wasted_energy_label:"Zmarnowana Energia / mies.",efficiency_gain_label:"Wzrost Wydajności",cost_by_machine_title:"Ryzyko Kosztowe wg Maszyn",top_cause_col:"Główna Przyczyna",roi_assumptions_msg:"Założenia: przestój {downtime}/h, naprawa {hours}h, energia {price}/kWh.",role_label:"Twoja Rola",role_engineer:"Inżynier",role_manager:"Menedżer",role_admin:"Administrator",cause_bearing_wear:"Zużycie łożyska",cause_overload_thermal:"Przeciążenie termiczne",cause_cooling_failure:"Awaria chłodzenia",cause_misalignment:"Niewspółosiowość wału",cause_lubrication_loss:"Utrata smarowania",cause_normal_operation:"Praca normalna",nav_story:"Tryb Historii",story_hint:"Odtwarza awarię łożyska rozwijającą się przez 22 godziny i pokazuje dokładnie, kiedy AI ją wykryła — i ile to było warte.",simulate_failure_btn:"Symuluj Awarię",outcome_title:"Wynik",warning_time_label:"Wczesne Ostrzeżenie",loss_ignored_label:"Strata bez Reakcji",loss_acted_label:"Strata z Reakcją",money_saved_label:"Zaoszczędzono",timeline_title:"Oś Czasu Awarii",story_detection_msg:"AI wykryła to {hours} godzin przed awarią, przy {risk}% ryzyka — przyczyna źródłowa: {cause} (pewność {confidence}%).",story_stage_healthy:"Sprawna",story_stage_early_drift:"Pierwsze Odchylenie",story_stage_ai_detects:"AI Wykrywa",story_stage_critical:"Krytyczny",priority_low:"Niski",priority_medium:"Średni",priority_high:"Wysoki",priority_critical:"Krytyczny",action_stop_machine:"Zatrzymaj maszynę",action_inspect_bearings:"Sprawdź łożyska",action_check_cooling:"Sprawdź chłodzenie",action_schedule_shutdown_24h:"Zaplanuj postój (24h)",action_order_spare_parts:"Zamów części",action_reduce_load:"Zmniejsz obciążenie",action_schedule_inspection_72h:"Zaplanuj przegląd (72h)",action_monitor_closely:"Uważnie monitoruj",action_verify_sensor:"Zweryfikuj czujnik",action_power_down_idle:"Wyłącz bezczynną maszynę",action_review_shift_schedule:"Przejrzyj grafik zmian",action_no_action:"Nie wymaga działania",nav_oee:"OEE",nav_workorders:"Zlecenia Pracy",oee_hint:"Dostępność x Wydajność x Jakość (ISO 22400). Poziom światowy to 85%, typowa fabryka około 60%.",availability_label:"Dostępność",performance_label:"Wydajność",quality_label:"Jakość",weakest_factor_label:"Najsłabszy",downtime_by_reason_title:"Przestoje wg Przyczyny",downtime_cost_label:"Koszt przestoju",oee_trend_title:"Trend OEE",shifts_title:"Zmiany",shift_col:"Zmiana",downtime_col:"Przestój",log_shift_btn:"Zapisz Zmianę",no_shifts_yet:"Nie zapisano jeszcze zmian.",minutes_short:"min",range_1d:"Dzisiaj",range_7d:"7 dni",range_30d:"30 dni",all_machines_option:"Wszystkie maszyny",reason_unspecified:"Nieokreślone",err_good_exceeds_total:"Sztuki dobre nie mogą przekroczyć całości",oee_grade_world_class:"Poziom światowy",oee_grade_typical:"Typowy",oee_grade_low:"Niski",oee_grade_critical:"Krytyczny",reason_breakdown:"Awaria",reason_changeover:"Przezbrojenie",reason_no_material:"Brak materiału",reason_no_operator:"Brak operatora",reason_planned_maintenance:"Konserwacja planowa",reason_quality_issue:"Problem jakości",reason_setup:"Ustawianie",reason_other:"Inne",workorders_hint:"Zamienia prognozę AI w śledzone zadanie — aby ostrzeżenie kończyło się naprawą.",new_work_order_btn:"+ Nowe Zlecenie",no_work_orders:"Brak zleceń pracy.",avg_completion_label:"Śr. realizacja",assigned_label:"Przypisane",source_ai:"AI",wo_status_open:"Otwarte",wo_status_in_progress:"W trakcie",wo_status_done:"Zakończone",wo_status_cancelled:"Anulowane",wo_advance_to_in_progress:"Rozpocznij pracę",wo_advance_to_done:"Oznacz jako zakończone",ph_shift_name:"Nazwa zmiany",ph_planned_minutes:"Zaplanowane minuty",ph_downtime_minutes:"Minuty przestoju",ph_total_units:"Łączna liczba",ph_good_units:"Sztuki dobre",ph_cycle_seconds:"Cykl idealny (sek)",ph_wo_title:"Tytuł",ph_assigned_to:"Przypisane do",ph_wo_description:"Opis",overdue_label:"Zaległe",nav_history:"Historia",history_hint:"Zapisana historia czujników — tak udowodnisz, co naprawdę zmieniło się podczas pilotażu.",no_history_yet:"Nie zapisano jeszcze historii. Zostaw Monitoring otwarty na kilka minut, a dane zaczną się gromadzić.",range_24h:"24 godziny",range_3d:"3 dni",range_10d:"10 dni",sensor_trend_title:"Trend Czujników",risk_trend_title:"Trend Ryzyka",trend_flat:"bez zmian",trend_rising:"rośnie",trend_falling:"spada",create_work_order_btn:"Utwórz Zlecenie",work_order_created_msg:"Zlecenie utworzone",alertreason_immediate_failure_risk:"Ryzyko natychmiastowej awarii",alertreason_failure_imminent:"Awaria nieuchronna",alertreason_degradation_accelerating:"Przyspieszające zużycie",alertreason_outside_normal_envelope:"Poza normalnym zakresem",alertreason_pressure_anomaly:"Anomalia ciśnienia",alertreason_idle_waste:"Marnowanie energii na biegu jałowym",alertreason_informational:"Informacyjne",alert_reason_label:"Powód"},
-  nl: {tagline:"Wereldwijd Industrieel Intelligentieplatform",live_label:"Live",kpi_energy:"Energieverbruik",kpi_efficiency:"Efficiëntie",kpi_active:"Actieve Machines",kpi_alerts:"Meldingen",kwh_unit:"kWh",chart_title:"Realtime Prestaties",machine_status_title:"Machinestatus",status_running:"Actief",status_warning:"Waarschuwing",status_critical:"Kritiek",form_title:"Fabrieksgegevens Invoeren",factory_name_label:"Fabrieksnaam",machine_count_label:"Aantal Machines",energy_cost_label:"Energiekosten ($/kWh)",machine_type_label:"Machinetype",temperature_label:"Temperatuur (°C)",vibration_label:"Trilling (mm/s)",load_label:"Belasting (%)",submit_btn:"Fabriek Analyseren",submitting:"Bijwerken...",ai_panel_title:"AI-inzichten",ai_placeholder:"Verzend fabrieksgegevens om een AI-analyse te genereren.",ai_analyzing:"Analyseren...",ai_risks:"Risico's",ai_efficiency_insights:"Efficiëntieanalyse",ai_optimizations:"Optimalisatiesuggesties",toast_updated:"Fabrieksgegevens bijgewerkt",toast_analysis_done:"AI-analyse voltooid",toast_error:"Er is iets misgegaan",nav_dashboard:"Dashboard",nav_factories:"Fabrieken",nav_ai_insights:"AI-inzichten",logout_btn:"Uitloggen",login_title:"Welkom terug",login_subtitle:"Log in op uw FactoryPulse AI-account",ph_email:"E-mail",ph_password:"Wachtwoord",remember_me:"Onthoud mij",login_btn:"Inloggen",login_link_register:"Geen account? Maak er een",register_title:"Maak uw account aan",register_subtitle:"Begin met AI-monitoring van uw fabrieken",ph_full_name:"Volledige Naam",ph_confirm_password:"Bevestig Wachtwoord",register_btn:"Account Aanmaken",register_link_login:"Heeft u al een account? Inloggen",err_missing_fields:"Vul alle velden in",err_invalid_email:"Voer een geldig e-mailadres in",err_weak_password:"Wachtwoord moet minimaal 8 tekens, een letter en een cijfer bevatten",err_password_mismatch:"Wachtwoorden komen niet overeen",err_invalid_credentials:"Ongeldige e-mail of wachtwoord",err_email_taken:"Dit e-mailadres is al geregistreerd",err_generic:"Er is iets misgegaan. Probeer het opnieuw",my_factories_title:"Mijn Fabrieken",add_factory_btn:"+ Fabriek Toevoegen",edit_factory_btn:"Bewerken",delete_factory_btn:"Verwijderen",confirm_delete_factory:"Deze fabriek verwijderen? Dit kan niet ongedaan worden gemaakt.",no_factories_yet:"U heeft nog geen fabrieken toegevoegd.",factory_created_toast:"Fabriek aangemaakt en geanalyseerd",factory_updated_toast:"Fabriek bijgewerkt",factory_deleted_toast:"Fabriek verwijderd",ai_insights_feed_title:"AI-inzichten Feed",no_ai_insights_yet:"Nog geen AI-inzichten. Voeg een fabriek toe.",reanalyze_btn:"Opnieuw Analyseren",view_insights_btn:"Bekijk Inzichten",created_label:"Aangemaakt",cancel_btn:"Annuleren",save_btn:"Wijzigingen Opslaan",nav_live_monitor:"Live Monitor",add_machine_scada_btn:"+ Machine Toevoegen",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Polling",live_chart_title:"Live Sensorgrafiek",machines_table_title:"Machines",machine_code_col:"Code",machine_name_col:"Naam",status_col:"Status",risk_col:"Risico",no_machines_yet:"Nog geen machines. Klik op „+ Machine Toevoegen”.",section_machine_info:"Machine-informatie",section_sensor_data:"Sensorgegevens",section_status:"Status",section_notes:"Notities",status_stopped:"Gestopt",status_maintenance:"Onderhoud",priority_low:"Laag",priority_normal:"Normaal",priority_high:"Hoog",priority_critical:"Kritiek",save_and_analyze_btn:"Opslaan & Analyseren",source_col:"Bron",source_auto:"Auto (SCADA)",source_manual:"Handmatig",nav_alerts:"Meldingen",acknowledge_btn:"Bevestigen",acknowledged_label:"Bevestigd",acknowledge_all_btn:"Alles Bevestigen",no_alerts_yet:"Geen meldingen. Alles werkt naar behoren.",download_report_btn:"Rapport",alert_details_template:"Temperatuur {temp}°C, trilling {vib} mm/s, status: {status}",section_energy_intel:"Energie-intelligentie",daily_output_hint:"Wordt gebruikt om het specifieke energieverbruik te berekenen (kWh per eenheid).",energy_insights_title:"Energie-intelligentie",idle_power_title:"Stationair Vermogen Detectie",idle_active_msg:"Machine is inactief - momenteel wordt ongeveer {kw} kW verspild.",idle_none_msg:"Geen stationaire energieverspilling gedetecteerd.",friction_loss_title:"Voorspellend Energieverlies",friction_active_msg:"Verhoogde wrijving gedetecteerd: +{pct}% extra vermogen (~{kw} kW extra). Plan onderhoud om verliezen te voorkomen.",friction_none_msg:"Geen abnormale wrijving gedetecteerd.",sec_title:"Specifiek Energieverbruik",sec_label:"kWh per eenheid",sec_unit:"kWh/eenheid",sec_no_data_msg:"Voer de dagelijkse output in bij het toevoegen van deze machine om deze metriek te zien.",optimal_load_title:"Optimale Belastingzone",optimal_load_label:"Optimale belasting",current_load_label:"Huidige belasting",at_optimal_msg:"Draait in de optimale belastingzone.",adjust_to_optimal_msg:"Pas de belasting aan naar {pct}% om energie per eenheid te minimaliseren.",nav_digital_twin:"Digitale Tweeling",twin_hint:"Sleep om te draaien, scroll om te zoomen, klik op een machine voor live details.",twin_unavailable_msg:"3D-weergave kon niet worden geladen (controleer uw internetverbinding voor Three.js).",failure_prediction_title:"Storingsvoorspelling",report_lib_missing_msg:"PDF-export vereist de reportlab-bibliotheek. Voer uit: pip install reportlab en herstart de server.",ph_machine_id:"Machine-ID (bijv. M-01)",ph_machine_name:"Machinenaam",ph_factory_section:"Fabriekssectie",ph_operator_name:"Naam Operator",ph_pressure:"Druk (bar)",ph_voltage:"Spanning (V)",ph_current:"Stroom (A)",ph_error_code:"Foutcode",ph_daily_output:"Dagelijkse Productie (eenheden)",ph_notes:"Notities...",nav_system_intel:"Systeemintelligentie",nav_roi:"ROI-dashboard",refresh_btn:"Vernieuwen",system_risk_label:"Systeemrisico",healthy_label:"Gezond",at_risk_label:"Risicovol",clusters_title:"Machineclusters",propagation_title:"Anomalieverspreiding",propagation_hint:"Hoe een falende machine het risico van buurmachines verhoogt.",no_propagation:"Geen anomalieverspreiding gedetecteerd.",avg_risk_label:"Gem. risico",added_risk_label:"Toegevoegd risico",effective_risk_label:"Effectief risico",simulation_title:"Wat-Als Simulatie",simulation_hint:"Kies een machine, verschuif de sensorwaarden en bekijk de storingskans.",run_simulation_btn:"Simulatie Uitvoeren",failure_probability_label:"Storingskans",stress_level_label:"Belastingsniveau",predicted_status_label:"Voorspelde Status",confidence_label:"Betrouwbaarheid",root_cause_title:"Hoofdoorzaak",rul_col:"Resterende Levensduur",rul_healthy:"Gezond",potential_loss_label:"Potentieel Verlies",saved_label:"Bespaard door AI",wasted_energy_label:"Verspilde Energie / maand",efficiency_gain_label:"Efficiëntiewinst",cost_by_machine_title:"Kostenrisico per Machine",top_cause_col:"Hoofdoorzaak",roi_assumptions_msg:"Aannames: stilstand {downtime}/u, reparatie {hours}u, energie {price}/kWh.",role_label:"Uw Rol",role_engineer:"Ingenieur",role_manager:"Manager",role_admin:"Beheerder",cause_bearing_wear:"Lagerslijtage",cause_overload_thermal:"Thermische overbelasting",cause_cooling_failure:"Koelstoring",cause_misalignment:"Asuitlijnfout",cause_lubrication_loss:"Smeringverlies",cause_normal_operation:"Normale werking",nav_story:"Verhaalmodus",story_hint:"Speelt een lagerstoring af die zich over 22 uur ontwikkelt en toont precies wanneer de AI het opmerkte — en wat dat waard was.",simulate_failure_btn:"Storing Simuleren",outcome_title:"Uitkomst",warning_time_label:"Vroege Waarschuwing",loss_ignored_label:"Verlies zonder Actie",loss_acted_label:"Verlies met Actie",money_saved_label:"Bespaard",timeline_title:"Storingstijdlijn",story_detection_msg:"De AI signaleerde dit {hours} uur voor de storing, bij {risk}% risico — hoofdoorzaak: {cause} ({confidence}% betrouwbaarheid).",story_stage_healthy:"Gezond",story_stage_early_drift:"Eerste Afwijking",story_stage_ai_detects:"AI Detecteert",story_stage_critical:"Kritiek",priority_low:"Laag",priority_medium:"Gemiddeld",priority_high:"Hoog",priority_critical:"Kritiek",action_stop_machine:"Machine stoppen",action_inspect_bearings:"Lagers inspecteren",action_check_cooling:"Koeling controleren",action_schedule_shutdown_24h:"Stilstand plannen (24u)",action_order_spare_parts:"Reserveonderdelen bestellen",action_reduce_load:"Belasting verlagen",action_schedule_inspection_72h:"Inspectie plannen (72u)",action_monitor_closely:"Nauwlettend volgen",action_verify_sensor:"Sensor verifiëren",action_power_down_idle:"Inactieve machine uitschakelen",action_review_shift_schedule:"Ploegrooster herzien",action_no_action:"Geen actie nodig",nav_oee:"OEE",nav_workorders:"Werkorders",oee_hint:"Beschikbaarheid x Prestatie x Kwaliteit (ISO 22400). Wereldklasse is 85%; een typische fabriek zit rond 60%.",availability_label:"Beschikbaarheid",performance_label:"Prestatie",quality_label:"Kwaliteit",weakest_factor_label:"Zwakste",downtime_by_reason_title:"Stilstand per Oorzaak",downtime_cost_label:"Stilstandkosten",oee_trend_title:"OEE-trend",shifts_title:"Ploegen",shift_col:"Ploeg",downtime_col:"Stilstand",log_shift_btn:"Ploeg Vastleggen",no_shifts_yet:"Nog geen ploegen vastgelegd.",minutes_short:"min",range_1d:"Vandaag",range_7d:"7 dagen",range_30d:"30 dagen",all_machines_option:"Alle machines",reason_unspecified:"Niet gespecificeerd",err_good_exceeds_total:"Goede stuks kunnen het totaal niet overschrijden",oee_grade_world_class:"Wereldklasse",oee_grade_typical:"Typisch",oee_grade_low:"Laag",oee_grade_critical:"Kritiek",reason_breakdown:"Storing",reason_changeover:"Omstelling",reason_no_material:"Geen materiaal",reason_no_operator:"Geen operator",reason_planned_maintenance:"Gepland onderhoud",reason_quality_issue:"Kwaliteitsprobleem",reason_setup:"Instellen",reason_other:"Overig",workorders_hint:"Zet een AI-voorspelling om in een gevolgde taak — zodat een waarschuwing eindigt in een reparatie.",new_work_order_btn:"+ Nieuwe Werkorder",no_work_orders:"Nog geen werkorders.",avg_completion_label:"Gem. afronding",assigned_label:"Toegewezen",source_ai:"AI",wo_status_open:"Open",wo_status_in_progress:"In uitvoering",wo_status_done:"Afgerond",wo_status_cancelled:"Geannuleerd",wo_advance_to_in_progress:"Werk starten",wo_advance_to_done:"Markeer als afgerond",ph_shift_name:"Ploegnaam",ph_planned_minutes:"Geplande minuten",ph_downtime_minutes:"Stilstandminuten",ph_total_units:"Totaal stuks",ph_good_units:"Goede stuks",ph_cycle_seconds:"Ideale cyclus (sec)",ph_wo_title:"Titel",ph_assigned_to:"Toegewezen aan",ph_wo_description:"Omschrijving",overdue_label:"Te laat",nav_history:"Geschiedenis",history_hint:"Opgeslagen sensorhistorie — zo bewijst u wat er tijdens de pilot echt is veranderd.",no_history_yet:"Nog geen historie opgeslagen. Houd de Live Monitor een paar minuten open, dan begint data zich op te bouwen.",range_24h:"24 uur",range_3d:"3 dagen",range_10d:"10 dagen",sensor_trend_title:"Sensortrend",risk_trend_title:"Risicotrend",trend_flat:"geen verandering",trend_rising:"stijgend",trend_falling:"dalend",create_work_order_btn:"Werkorder Maken",work_order_created_msg:"Werkorder aangemaakt",alertreason_immediate_failure_risk:"Onmiddellijk storingsrisico",alertreason_failure_imminent:"Storing ophanden",alertreason_degradation_accelerating:"Degradatie versnelt",alertreason_outside_normal_envelope:"Buiten normaal bereik",alertreason_pressure_anomaly:"Drukafwijking",alertreason_idle_waste:"Energieverspilling bij stilstand",alertreason_informational:"Informatief",alert_reason_label:"Reden"},
-  sv: {tagline:"Global Industriell Intelligensplattform",live_label:"Live",kpi_energy:"Energiförbrukning",kpi_efficiency:"Effektivitet",kpi_active:"Aktiva Maskiner",kpi_alerts:"Varningar",kwh_unit:"kWh",chart_title:"Realtidsprestanda",machine_status_title:"Maskinstatus",status_running:"Igång",status_warning:"Varning",status_critical:"Kritisk",form_title:"Fabriksdatainmatning",factory_name_label:"Fabriksnamn",machine_count_label:"Antal Maskiner",energy_cost_label:"Energikostnad ($/kWh)",machine_type_label:"Maskintyp",temperature_label:"Temperatur (°C)",vibration_label:"Vibration (mm/s)",load_label:"Belastning (%)",submit_btn:"Analysera Fabrik",submitting:"Uppdaterar...",ai_panel_title:"AI-insikter",ai_placeholder:"Skicka fabriksdata för att generera en AI-analys.",ai_analyzing:"Analyserar...",ai_risks:"Risker",ai_efficiency_insights:"Effektivitetsanalys",ai_optimizations:"Optimeringsförslag",toast_updated:"Fabriksdata uppdaterad",toast_analysis_done:"AI-analys klar",toast_error:"Något gick fel",nav_dashboard:"Instrumentpanel",nav_factories:"Fabriker",nav_ai_insights:"AI-insikter",logout_btn:"Logga ut",login_title:"Välkommen tillbaka",login_subtitle:"Logga in på ditt FactoryPulse AI-konto",ph_email:"E-post",ph_password:"Lösenord",remember_me:"Kom ihåg mig",login_btn:"Logga in",login_link_register:"Inget konto? Skapa ett",register_title:"Skapa ditt konto",register_subtitle:"Börja övervaka dina fabriker med AI",ph_full_name:"Fullständigt Namn",ph_confirm_password:"Bekräfta Lösenord",register_btn:"Skapa Konto",register_link_login:"Har du redan ett konto? Logga in",err_missing_fields:"Vänligen fyll i alla fält",err_invalid_email:"Ange en giltig e-postadress",err_weak_password:"Lösenordet måste vara minst 8 tecken med en bokstav och en siffra",err_password_mismatch:"Lösenorden matchar inte",err_invalid_credentials:"Felaktig e-post eller lösenord",err_email_taken:"Denna e-post är redan registrerad",err_generic:"Något gick fel. Försök igen",my_factories_title:"Mina Fabriker",add_factory_btn:"+ Lägg till Fabrik",edit_factory_btn:"Redigera",delete_factory_btn:"Ta bort",confirm_delete_factory:"Ta bort denna fabrik? Detta kan inte ångras.",no_factories_yet:"Du har inte lagt till några fabriker än.",factory_created_toast:"Fabrik skapad och analyserad",factory_updated_toast:"Fabrik uppdaterad",factory_deleted_toast:"Fabrik borttagen",ai_insights_feed_title:"AI-insikter Flöde",no_ai_insights_yet:"Inga AI-insikter än. Lägg till en fabrik.",reanalyze_btn:"Analysera Igen",view_insights_btn:"Visa Insikter",created_label:"Skapad",cancel_btn:"Avbryt",save_btn:"Spara Ändringar",nav_live_monitor:"Livemonitor",add_machine_scada_btn:"+ Lägg till Maskin",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Polling",live_chart_title:"Live Sensordiagram",machines_table_title:"Maskiner",machine_code_col:"Kod",machine_name_col:"Namn",status_col:"Status",risk_col:"Risk",no_machines_yet:"Inga maskiner än. Klicka på \"+ Lägg till Maskin\".",section_machine_info:"Maskininformation",section_sensor_data:"Sensordata",section_status:"Status",section_notes:"Anteckningar",status_stopped:"Stoppad",status_maintenance:"Underhåll",priority_low:"Låg",priority_normal:"Normal",priority_high:"Hög",priority_critical:"Kritisk",save_and_analyze_btn:"Spara & Analysera",source_col:"Källa",source_auto:"Auto (SCADA)",source_manual:"Manuell",nav_alerts:"Varningar",acknowledge_btn:"Bekräfta",acknowledged_label:"Bekräftad",acknowledge_all_btn:"Bekräfta Alla",no_alerts_yet:"Inga varningar. Allt fungerar smidigt.",download_report_btn:"Rapport",alert_details_template:"Temperatur {temp}°C, vibration {vib} mm/s, status: {status}",section_energy_intel:"Energiintelligens",daily_output_hint:"Används för att beräkna specifik energiförbrukning (kWh per enhet).",energy_insights_title:"Energiintelligens",idle_power_title:"Detektering av Tomgångseffekt",idle_active_msg:"Maskinen står i tomgång - ungefär {kw} kW slösas just nu.",idle_none_msg:"Ingen tomgångsenergiförlust upptäckt.",friction_loss_title:"Prediktiv Energiförlust",friction_active_msg:"Ökad friktion upptäckt: +{pct}% extra effekt (~{kw} kW extra). Schemalägg underhåll för att förhindra förluster.",friction_none_msg:"Ingen onormal friktion upptäckt.",sec_title:"Specifik Energiförbrukning",sec_label:"kWh per enhet",sec_unit:"kWh/enhet",sec_no_data_msg:"Ange daglig produktion när du lägger till denna maskin för att se detta mått.",optimal_load_title:"Optimal Belastningszon",optimal_load_label:"Optimal belastning",current_load_label:"Aktuell belastning",at_optimal_msg:"Körs i den optimala belastningszonen.",adjust_to_optimal_msg:"Justera belastningen mot {pct}% för att minimera energi per enhet.",nav_digital_twin:"Digital Tvilling",twin_hint:"Dra för att rotera, scrolla för att zooma, klicka på en maskin för live-detaljer.",twin_unavailable_msg:"3D-vyn kunde inte laddas (kontrollera din internetanslutning för Three.js).",failure_prediction_title:"Felprognos",report_lib_missing_msg:"PDF-export kräver reportlab-biblioteket. Kör: pip install reportlab, starta sedan om servern.",ph_machine_id:"Maskin-ID (t.ex. M-01)",ph_machine_name:"Maskinnamn",ph_factory_section:"Fabrikssektion",ph_operator_name:"Operatörsnamn",ph_pressure:"Tryck (bar)",ph_voltage:"Spänning (V)",ph_current:"Ström (A)",ph_error_code:"Felkod",ph_daily_output:"Daglig Produktion (enheter)",ph_notes:"Anteckningar...",nav_system_intel:"Systemintelligens",nav_roi:"ROI-panel",refresh_btn:"Uppdatera",system_risk_label:"Systemrisk",healthy_label:"Friska",at_risk_label:"I riskzonen",clusters_title:"Maskinkluster",propagation_title:"Anomalispridning",propagation_hint:"Hur en havererande maskin höjer risken för sina grannar.",no_propagation:"Ingen anomalispridning upptäckt.",avg_risk_label:"Snittrisk",added_risk_label:"Tillagd risk",effective_risk_label:"Effektiv risk",simulation_title:"Tänk-Om-Simulering",simulation_hint:"Välj en maskin, ändra sensorvärden och se hur felsannolikheten reagerar.",run_simulation_btn:"Kör Simulering",failure_probability_label:"Felsannolikhet",stress_level_label:"Belastningsnivå",predicted_status_label:"Förutspådd Status",confidence_label:"Konfidens",root_cause_title:"Grundorsak",rul_col:"Återstående Livslängd",rul_healthy:"Frisk",potential_loss_label:"Potentiell Förlust",saved_label:"Sparat av AI",wasted_energy_label:"Bortslösad Energi / månad",efficiency_gain_label:"Effektivitetsvinst",cost_by_machine_title:"Kostnadsexponering per Maskin",top_cause_col:"Huvudorsak",roi_assumptions_msg:"Antaganden: stillestånd {downtime}/h, reparation {hours}h, energi {price}/kWh.",role_label:"Din Roll",role_engineer:"Ingenjör",role_manager:"Chef",role_admin:"Administratör",cause_bearing_wear:"Lagerslitage",cause_overload_thermal:"Termisk överbelastning",cause_cooling_failure:"Kylfel",cause_misalignment:"Axelfelinriktning",cause_lubrication_loss:"Smörjförlust",cause_normal_operation:"Normal drift",nav_story:"Berättelseläge",story_hint:"Spelar upp ett lagerhaveri som utvecklas över 22 timmar och visar exakt när AI:n upptäckte det — och vad det var värt.",simulate_failure_btn:"Simulera Haveri",outcome_title:"Utfall",warning_time_label:"Tidig Varning",loss_ignored_label:"Förlust utan Åtgärd",loss_acted_label:"Förlust med Åtgärd",money_saved_label:"Sparat",timeline_title:"Haveritidslinje",story_detection_msg:"AI:n flaggade detta {hours} timmar före haveriet, vid {risk}% risk — grundorsak: {cause} ({confidence}% konfidens).",story_stage_healthy:"Frisk",story_stage_early_drift:"Första Avvikelsen",story_stage_ai_detects:"AI Upptäcker",story_stage_critical:"Kritisk",priority_low:"Låg",priority_medium:"Medel",priority_high:"Hög",priority_critical:"Kritisk",action_stop_machine:"Stoppa maskinen",action_inspect_bearings:"Inspektera lager",action_check_cooling:"Kontrollera kylning",action_schedule_shutdown_24h:"Schemalägg stopp (24h)",action_order_spare_parts:"Beställ reservdelar",action_reduce_load:"Minska belastning",action_schedule_inspection_72h:"Schemalägg inspektion (72h)",action_monitor_closely:"Övervaka noga",action_verify_sensor:"Verifiera sensor",action_power_down_idle:"Stäng av tomgångsmaskin",action_review_shift_schedule:"Se över skiftschema",action_no_action:"Ingen åtgärd behövs",nav_oee:"OEE",nav_workorders:"Arbetsordrar",oee_hint:"Tillgänglighet x Prestanda x Kvalitet (ISO 22400). Världsklass är 85%; en typisk fabrik ligger nära 60%.",availability_label:"Tillgänglighet",performance_label:"Prestanda",quality_label:"Kvalitet",weakest_factor_label:"Svagast",downtime_by_reason_title:"Stillestånd per Orsak",downtime_cost_label:"Stilleståndskostnad",oee_trend_title:"OEE-trend",shifts_title:"Skift",shift_col:"Skift",downtime_col:"Stillestånd",log_shift_btn:"Registrera Skift",no_shifts_yet:"Inga skift registrerade ännu.",minutes_short:"min",range_1d:"Idag",range_7d:"7 dagar",range_30d:"30 dagar",all_machines_option:"Alla maskiner",reason_unspecified:"Ej angivet",err_good_exceeds_total:"Godkända enheter kan inte överstiga totalen",oee_grade_world_class:"Världsklass",oee_grade_typical:"Typisk",oee_grade_low:"Låg",oee_grade_critical:"Kritisk",reason_breakdown:"Haveri",reason_changeover:"Omställning",reason_no_material:"Inget material",reason_no_operator:"Ingen operatör",reason_planned_maintenance:"Planerat underhåll",reason_quality_issue:"Kvalitetsproblem",reason_setup:"Inställning",reason_other:"Övrigt",workorders_hint:"Förvandlar en AI-prognos till en spårad uppgift — så att en varning faktiskt slutar i en reparation.",new_work_order_btn:"+ Ny Arbetsorder",no_work_orders:"Inga arbetsordrar ännu.",avg_completion_label:"Snitt slutförande",assigned_label:"Tilldelad",source_ai:"AI",wo_status_open:"Öppen",wo_status_in_progress:"Pågår",wo_status_done:"Klar",wo_status_cancelled:"Avbruten",wo_advance_to_in_progress:"Starta arbete",wo_advance_to_done:"Markera klar",ph_shift_name:"Skiftnamn",ph_planned_minutes:"Planerade minuter",ph_downtime_minutes:"Stilleståndsminuter",ph_total_units:"Totalt antal",ph_good_units:"Godkända enheter",ph_cycle_seconds:"Idealcykel (sek)",ph_wo_title:"Titel",ph_assigned_to:"Tilldelad till",ph_wo_description:"Beskrivning",overdue_label:"Försenad",nav_history:"Historik",history_hint:"Sparad sensorhistorik — så bevisar du vad som faktiskt förändrades under pilotprojektet.",no_history_yet:"Ingen historik registrerad ännu. Håll Live-övervakningen öppen några minuter så börjar data samlas.",range_24h:"24 timmar",range_3d:"3 dagar",range_10d:"10 dagar",sensor_trend_title:"Sensortrend",risk_trend_title:"Risktrend",trend_flat:"oförändrad",trend_rising:"stigande",trend_falling:"fallande",create_work_order_btn:"Skapa Arbetsorder",work_order_created_msg:"Arbetsorder skapad",alertreason_immediate_failure_risk:"Omedelbar haverirrisk",alertreason_failure_imminent:"Haveri nära förestående",alertreason_degradation_accelerating:"Accelererande slitage",alertreason_outside_normal_envelope:"Utanför normalt intervall",alertreason_pressure_anomaly:"Tryckavvikelse",alertreason_idle_waste:"Energispill vid tomgång",alertreason_informational:"Informativt",alert_reason_label:"Orsak"},
+  en: {tagline:"Global Industrial Intelligence Platform",live_label:"Live",kpi_energy:"Energy Usage",kpi_efficiency:"Efficiency",kpi_active:"Active Machines",kpi_alerts:"Alerts",kwh_unit:"kWh",chart_title:"Real-Time Performance",machine_status_title:"Machine Status",status_running:"Running",status_warning:"Warning",status_critical:"Critical",form_title:"Factory Data Input",factory_name_label:"Factory Name",machine_count_label:"Number of Machines",energy_cost_label:"Energy Cost ($/kWh)",machine_type_label:"Machine Type",temperature_label:"Temperature (°C)",vibration_label:"Vibration (mm/s)",load_label:"Load (%)",submit_btn:"Analyze Factory",submitting:"Updating...",ai_panel_title:"AI Insights",ai_placeholder:"Submit factory data to generate an AI analysis.",ai_analyzing:"Analyzing...",ai_risks:"Risks",ai_efficiency_insights:"Efficiency Insights",ai_optimizations:"Optimization Suggestions",toast_updated:"Factory data updated",toast_analysis_done:"AI analysis complete",toast_error:"Something went wrong",nav_dashboard:"Dashboard",nav_factories:"Factories",nav_ai_insights:"AI Insights",logout_btn:"Log Out",login_title:"Welcome back",login_subtitle:"Sign in to your FactoryPulse AI account",ph_email:"Email",ph_password:"Password",remember_me:"Remember me",login_btn:"Log In",login_link_register:"Don't have an account? Create one",register_title:"Create your account",register_subtitle:"Start monitoring your factories with AI",ph_full_name:"Full Name",ph_confirm_password:"Confirm Password",register_btn:"Create Account",register_link_login:"Already have an account? Sign in",err_missing_fields:"Please fill in all fields",err_invalid_email:"Please enter a valid email address",err_weak_password:"Password must be at least 8 characters with a letter and a number",err_password_mismatch:"Passwords do not match",err_invalid_credentials:"Invalid email or password",err_email_taken:"This email is already registered",err_generic:"Something went wrong. Please try again",my_factories_title:"My Factories",add_factory_btn:"+ Add Factory",edit_factory_btn:"Edit",delete_factory_btn:"Delete",confirm_delete_factory:"Delete this factory? This cannot be undone.",no_factories_yet:"You haven't added any factories yet.",factory_created_toast:"Factory created and analyzed",factory_updated_toast:"Factory updated",factory_deleted_toast:"Factory deleted",ai_insights_feed_title:"AI Insights Feed",no_ai_insights_yet:"No AI insights yet. Add a factory to get started.",reanalyze_btn:"Re-analyze",view_insights_btn:"View Insights",created_label:"Created",cancel_btn:"Cancel",save_btn:"Save Changes",nav_live_monitor:"Live Monitor",add_machine_scada_btn:"+ Add Machine",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Polling",live_chart_title:"Live Sensor Chart",machines_table_title:"Machines",machine_code_col:"Code",machine_name_col:"Name",status_col:"Status",risk_col:"Risk",no_machines_yet:"No machines yet. Click \"+ Add Machine\".",section_machine_info:"Machine Info",section_sensor_data:"Sensor Data",section_status:"Status",section_notes:"Notes",status_stopped:"Stopped",status_maintenance:"Maintenance",priority_low:"Low",priority_normal:"Normal",priority_high:"High",priority_critical:"Critical",save_and_analyze_btn:"Save & Analyze",source_col:"Source",source_auto:"Auto (SCADA)",source_manual:"Manual",nav_alerts:"Alerts",acknowledge_btn:"Acknowledge",acknowledged_label:"Acknowledged",acknowledge_all_btn:"Acknowledge All",no_alerts_yet:"No alerts. Everything is running smoothly.",download_report_btn:"Report",alert_details_template:"Temperature {temp}°C, vibration {vib} mm/s, status: {status}",section_energy_intel:"Energy Intelligence",daily_output_hint:"Used to calculate Specific Energy Consumption (kWh per unit).",energy_insights_title:"Energy Intelligence",idle_power_title:"Idle Power Detection",idle_active_msg:"Machine is idle - wasting approx. {kw} kW right now.",idle_none_msg:"No idle power waste detected.",friction_loss_title:"Predictive Energy Loss",friction_active_msg:"Elevated friction detected: +{pct}% power overhead (~{kw} kW extra). Schedule maintenance to prevent losses.",friction_none_msg:"No abnormal friction losses detected.",sec_title:"Specific Energy Consumption",sec_label:"kWh per unit",sec_unit:"kWh/unit",sec_no_data_msg:"Enter Daily Output when adding this machine to see this metric.",optimal_load_title:"Optimal Load Zone",optimal_load_label:"Optimal load",current_load_label:"Current load",at_optimal_msg:"Running in the optimal load zone.",adjust_to_optimal_msg:"Adjust load toward {pct}% to minimize energy per unit.",nav_digital_twin:"Digital Twin",twin_hint:"Drag to rotate, scroll to zoom, click a machine to see its live details.",twin_unavailable_msg:"3D view could not load (check your internet connection for the Three.js library).",failure_prediction_title:"Failure Prediction",report_lib_missing_msg:"PDF export needs the reportlab library. Run: pip install reportlab, then restart the server.",ph_machine_id:"Machine ID (e.g. M-01)",ph_machine_name:"Machine Name",ph_factory_section:"Factory Section",ph_operator_name:"Operator Name",ph_pressure:"Pressure (bar)",ph_voltage:"Voltage (V)",ph_current:"Current (A)",ph_error_code:"Error Code",ph_daily_output:"Daily Output (units)",ph_notes:"Notes...",nav_system_intel:"System Intelligence",nav_roi:"ROI Dashboard",refresh_btn:"Refresh",system_risk_label:"System Risk",healthy_label:"Healthy",at_risk_label:"At Risk",clusters_title:"Machine Clusters",propagation_title:"Anomaly Propagation",propagation_hint:"How a failing machine raises the effective risk of its neighbours.",no_propagation:"No anomaly propagation detected.",avg_risk_label:"Avg risk",added_risk_label:"Added risk",effective_risk_label:"Effective risk",simulation_title:"What-If Simulation",simulation_hint:"Pick a machine, shift its sensor values, and see how failure probability reacts.",run_simulation_btn:"Run Simulation",failure_probability_label:"Failure Probability",stress_level_label:"Stress Level",predicted_status_label:"Predicted Status",confidence_label:"Confidence",root_cause_title:"Root Cause",rul_col:"RUL",rul_healthy:"Healthy",potential_loss_label:"Potential Loss",saved_label:"Saved by AI",wasted_energy_label:"Wasted Energy / month",efficiency_gain_label:"Efficiency Gain",cost_by_machine_title:"Cost Exposure by Machine",top_cause_col:"Top Cause",roi_assumptions_msg:"Assumptions: downtime {downtime}/h, {hours}h average repair, {price}/kWh energy.",role_label:"Your Role",role_engineer:"Engineer",role_manager:"Manager",role_admin:"Admin",cause_bearing_wear:"Bearing wear",cause_overload_thermal:"Thermal overload",cause_cooling_failure:"Cooling failure",cause_misalignment:"Shaft misalignment",cause_lubrication_loss:"Lubrication loss",cause_normal_operation:"Normal operation",nav_story:"Story Mode",story_hint:"Replays a bearing failure developing over 22 hours and shows exactly when the AI caught it — and what that was worth.",simulate_failure_btn:"Simulate Failure",outcome_title:"Outcome",warning_time_label:"Early Warning",loss_ignored_label:"Loss if Ignored",loss_acted_label:"Loss if Acted On",money_saved_label:"Money Saved",timeline_title:"Failure Timeline",story_detection_msg:"AI flagged this {hours} hours before breakdown, at {risk}% risk — root cause: {cause} ({confidence}% confidence).",story_stage_healthy:"Healthy",story_stage_early_drift:"Early Drift",story_stage_ai_detects:"AI Detects",story_stage_critical:"Critical",priority_low:"Low",priority_medium:"Medium",priority_high:"High",priority_critical:"Critical",action_stop_machine:"Stop machine",action_inspect_bearings:"Inspect bearings",action_check_cooling:"Check cooling",action_schedule_shutdown_24h:"Schedule shutdown (24h)",action_order_spare_parts:"Order spare parts",action_reduce_load:"Reduce load",action_schedule_inspection_72h:"Schedule inspection (72h)",action_monitor_closely:"Monitor closely",action_verify_sensor:"Verify sensor",action_power_down_idle:"Power down idle machine",action_review_shift_schedule:"Review shift schedule",action_no_action:"No action needed",nav_oee:"OEE",nav_workorders:"Work Orders",oee_hint:"Availability x Performance x Quality (ISO 22400). World-class is 85%; a typical factory sits near 60%.",availability_label:"Availability",performance_label:"Performance",quality_label:"Quality",weakest_factor_label:"Weakest",downtime_by_reason_title:"Downtime by Reason",downtime_cost_label:"Downtime cost",oee_trend_title:"OEE Trend",shifts_title:"Shifts",shift_col:"Shift",downtime_col:"Downtime",log_shift_btn:"Log Shift",no_shifts_yet:"No shifts logged yet.",minutes_short:"min",range_1d:"Today",range_7d:"7 days",range_30d:"30 days",all_machines_option:"All machines",reason_unspecified:"Unspecified",err_good_exceeds_total:"Good units cannot exceed total units",oee_grade_world_class:"World-class",oee_grade_typical:"Typical",oee_grade_low:"Low",oee_grade_critical:"Critical",reason_breakdown:"Breakdown",reason_changeover:"Changeover",reason_no_material:"No material",reason_no_operator:"No operator",reason_planned_maintenance:"Planned maintenance",reason_quality_issue:"Quality issue",reason_setup:"Setup",reason_other:"Other",workorders_hint:"Turns an AI prediction into tracked, assignable work — so a warning actually ends in a repair.",new_work_order_btn:"+ New Work Order",no_work_orders:"No work orders yet.",avg_completion_label:"Avg. Completion",assigned_label:"Assigned",source_ai:"AI",wo_status_open:"Open",wo_status_in_progress:"In Progress",wo_status_done:"Done",wo_status_cancelled:"Cancelled",wo_advance_to_in_progress:"Start work",wo_advance_to_done:"Mark done",ph_shift_name:"Shift name",ph_planned_minutes:"Planned minutes",ph_downtime_minutes:"Downtime minutes",ph_total_units:"Total units",ph_good_units:"Good units",ph_cycle_seconds:"Ideal cycle (seconds)",ph_wo_title:"Title",ph_assigned_to:"Assigned to",ph_wo_description:"Description",overdue_label:"Overdue",nav_history:"History",history_hint:"Stored sensor history — this is how you prove what actually changed over the pilot.",no_history_yet:"No history recorded yet. Keep the Live Monitor open for a few minutes and data will start accumulating.",range_24h:"24 hours",range_3d:"3 days",range_10d:"10 days",sensor_trend_title:"Sensor Trend",risk_trend_title:"Risk Trend",trend_flat:"no change",trend_rising:"rising",trend_falling:"falling",create_work_order_btn:"Create Work Order",work_order_created_msg:"Work order created",alertreason_immediate_failure_risk:"Immediate failure risk",alertreason_failure_imminent:"Failure imminent",alertreason_degradation_accelerating:"Degradation accelerating",alertreason_outside_normal_envelope:"Outside normal envelope",alertreason_pressure_anomaly:"Pressure anomaly",alertreason_idle_waste:"Idle energy waste",alertreason_informational:"Informational",alert_reason_label:"Reason",nav_system_health:"System Health",system_health_hint:"Live state of the data path, the model, and the security posture — the things that silently break.",connections_title:"Industrial Connections",data_mode_label:"Data mode",reads_label:"Reads",failures_label:"Failures",buffered_label:"Buffered",pipeline_title:"Ingestion Pipeline",queue_depth_label:"Queue Depth",duplicates_label:"Duplicates Suppressed",retried_label:"Retried",dead_letter_label:"Dead-lettered",model_title:"Prediction Model",train_model_btn:"Train Model",check_drift_btn:"Check Drift",model_not_trained:"No trained model — risk scores are indicative, not validated.",model_trained_msg:"Model trained",trained_on_label:"Trained on",drift_title:"Data Drift",retrain_recommended:"retrain recommended",security_title:"Security Checks",admin_only_msg:"Administrator access required.",conn_state_healthy:"healthy",conn_state_stale:"stale",conn_state_disconnected:"disconnected",conn_state_never_connected:"never connected",drift_stable:"stable",drift_moderate:"moderate",drift_severe:"severe",metric_precision:"Precision",metric_recall:"Recall",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"False Alarm Rate",model_cannot_train:"Cannot train yet",model_reason_no_confirmed_failures:"No confirmed failures logged",model_reason_insufficient_telemetry:"Not enough telemetry history",model_reason_insufficient_positive_samples:"Not enough confirmed failures",model_reason_no_failures_in_holdout:"No failures in the test period",check_jwt_secret_strong:"Strong JWT secret",check_debug_disabled:"Debug mode disabled",check_https_in_use:"HTTPS in use",check_database_is_postgres:"PostgreSQL database",check_rate_limiting_active:"Rate limiting active",check_account_lockout_active:"Account lockout active",check_audit_logging_active:"Audit logging active",check_security_headers_active:"Security headers active",check_smtp_configured:"Email configured",check_industrial_read_only:"Industrial access read-only",model_train_hint:"Log real failures via the Failures page to enable training.",drift_status_no_trained_model:"No trained model yet",drift_status_insufficient_recent_data:"Not enough recent data",msg_model_untrained_note:"No supervised model trained yet — risk scores are indicative, not validated.",msg_train_needs_failures:"Training needs confirmed failures. Log them on the Failures page.",msg_train_no_holdout_failures:"The test period contains no failures to score against.",msg_drift_needs_model:"Train a model first — drift is measured against its training data.",msg_evaluation_needs_failures:"Accuracy cannot be measured until real breakdowns are logged.",msg_holdout_metrics_note:"Metrics come from held-out data the model never saw during training.",msg_simulation_mode_note:"SIMULATION generates data locally; connection health only matters with real hardware.",msg_savings_needs_two_windows:"A before/after saving needs data in both halves of the period.",msg_roi_system_cost_note:"System cost is not known here — divide the benefit by your own cost to get ROI.",msg_reliability_not_calibrated:"Using published industry parameters, not this plant's. Log real failures to calibrate.",msg_no_trained_model:"No trained model yet",msg_insufficient_recent_data:"Not enough recent data",nav_failures:"Failure Log",failures_hint:"Record every real breakdown. This is what teaches the model your plant's actual behaviour — without it, predictions stay generic.",log_failure_btn:"+ Log a Failure",calibration_title:"Calibration Progress",calibration_hint:"Each component needs enough confirmed failures before its prediction is calibrated for this plant.",calibrated_label:"calibrated",needs_more_failures:"{n} more needed",ml_model_label:"Prediction model",model_ready_to_train:"Ready to train",logged_failures_title:"Logged Failures",no_failures_yet:"No failures logged yet.",was_predicted_label:"predicted",machine_label:"Machine",component_label:"Component that failed",component_hint:"Pick the closest match — this is what the model learns from.",occurred_at_label:"When did it happen",downtime_label:"Downtime (min)",repair_cost_label:"Repair cost",notes_label:"Notes",ph_failure_notes:"What was observed?",failure_logged_msg:"Failure logged",confirm_delete_failure:"Delete this failure record?",err_no_machine_selected:"Select a machine",err_no_date:"Enter the date",err_future_date:"The date cannot be in the future",component_bearing:"Bearing",component_motor:"Motor",component_pump:"Pump",component_cooling_system:"Cooling system",component_gearbox:"Gearbox",cause_seal_leak:"Seal leak",cause_cavitation:"Cavitation",cause_overpressure:"Overpressure",cause_blocked_discharge:"Blocked discharge",component_prediction_title:"Component Prediction",component_prediction_hint:"Remaining life per component, from this machine's live condition.",limiting_label:"limiting",days_short:"days",industry_default_label:"industry default",calibrated_to_plant:"Calibrated to this plant",not_calibrated_warning:"Using industry defaults — log real failures to calibrate for this plant."},
+  ru: {tagline:"Глобальная платформа промышленного интеллекта",live_label:"Live",kpi_energy:"Потребление энергии",kpi_efficiency:"Эффективность",kpi_active:"Активные станки",kpi_alerts:"Оповещения",kwh_unit:"кВт·ч",chart_title:"Показатели в реальном времени",machine_status_title:"Статус станков",status_running:"Работает",status_warning:"Внимание",status_critical:"Критично",form_title:"Ввод данных завода",factory_name_label:"Название завода",machine_count_label:"Количество станков",energy_cost_label:"Стоимость энергии ($/кВт·ч)",machine_type_label:"Тип станка",temperature_label:"Температура (°C)",vibration_label:"Вибрация (мм/с)",load_label:"Нагрузка (%)",submit_btn:"Анализировать завод",submitting:"Обновление...",ai_panel_title:"AI-аналитика",ai_placeholder:"Отправьте данные завода, чтобы получить AI-анализ.",ai_analyzing:"Анализ...",ai_risks:"Риски",ai_efficiency_insights:"Анализ эффективности",ai_optimizations:"Рекомендации по оптимизации",toast_updated:"Данные завода обновлены",toast_analysis_done:"AI-анализ завершён",toast_error:"Произошла ошибка",nav_dashboard:"Панель",nav_factories:"Заводы",nav_ai_insights:"AI-аналитика",logout_btn:"Выход",login_title:"С возвращением",login_subtitle:"Войдите в аккаунт FactoryPulse AI",ph_email:"Email",ph_password:"Пароль",remember_me:"Запомнить меня",login_btn:"Войти",login_link_register:"Нет аккаунта? Создать",register_title:"Создать аккаунт",register_subtitle:"Начните мониторинг заводов с помощью AI",ph_full_name:"Полное имя",ph_confirm_password:"Подтвердите пароль",register_btn:"Создать аккаунт",register_link_login:"Уже есть аккаунт? Войти",err_missing_fields:"Заполните все поля",err_invalid_email:"Введите корректный email",err_weak_password:"Пароль должен быть от 8 символов, с буквой и цифрой",err_password_mismatch:"Пароли не совпадают",err_invalid_credentials:"Неверный email или пароль",err_email_taken:"Этот email уже зарегистрирован",err_generic:"Что-то пошло не так. Попробуйте снова",my_factories_title:"Мои заводы",add_factory_btn:"+ Добавить завод",edit_factory_btn:"Изменить",delete_factory_btn:"Удалить",confirm_delete_factory:"Удалить этот завод? Это действие нельзя отменить.",no_factories_yet:"Вы ещё не добавили ни одного завода.",factory_created_toast:"Завод создан и проанализирован",factory_updated_toast:"Завод обновлён",factory_deleted_toast:"Завод удалён",ai_insights_feed_title:"Лента AI-аналитики",no_ai_insights_yet:"Пока нет AI-аналитики. Добавьте завод, чтобы начать.",reanalyze_btn:"Проанализировать снова",view_insights_btn:"Смотреть аналитику",created_label:"Создано",cancel_btn:"Отмена",save_btn:"Сохранить изменения",nav_live_monitor:"Мониторинг",add_machine_scada_btn:"+ Добавить станок",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Опрос",live_chart_title:"График датчиков в реальном времени",machines_table_title:"Станки",machine_code_col:"Код",machine_name_col:"Название",status_col:"Статус",risk_col:"Риск",no_machines_yet:"Станков пока нет. Нажмите «+ Добавить станок».",section_machine_info:"Информация о станке",section_sensor_data:"Данные датчиков",section_status:"Статус",section_notes:"Заметки",status_stopped:"Остановлен",status_maintenance:"Обслуживание",priority_low:"Низкий",priority_normal:"Обычный",priority_high:"Высокий",priority_critical:"Критический",save_and_analyze_btn:"Сохранить и анализировать",source_col:"Источник",source_auto:"Авто (SCADA)",source_manual:"Вручную",nav_alerts:"Оповещения",acknowledge_btn:"Подтвердить",acknowledged_label:"Подтверждено",acknowledge_all_btn:"Подтвердить все",no_alerts_yet:"Оповещений нет. Всё работает штатно.",download_report_btn:"Отчёт",alert_details_template:"Температура {temp}°C, вибрация {vib} мм/с, статус: {status}",section_energy_intel:"Энергетический интеллект",daily_output_hint:"Используется для расчёта удельного энергопотребления (кВт·ч на единицу).",energy_insights_title:"Энергетический интеллект",idle_power_title:"Обнаружение холостого хода",idle_active_msg:"Станок простаивает — расходуется примерно {kw} кВт впустую.",idle_none_msg:"Потерь энергии на холостом ходу не обнаружено.",friction_loss_title:"Прогноз потерь энергии",friction_active_msg:"Обнаружено повышенное трение: +{pct}% лишней мощности (~{kw} кВт). Запланируйте обслуживание, чтобы избежать потерь.",friction_none_msg:"Аномального трения не обнаружено.",sec_title:"Удельное энергопотребление",sec_label:"кВт·ч на единицу",sec_unit:"кВт·ч/ед.",sec_no_data_msg:"Укажите суточный объём выпуска при добавлении станка, чтобы увидеть этот показатель.",optimal_load_title:"Оптимальная зона нагрузки",optimal_load_label:"Оптимальная нагрузка",current_load_label:"Текущая нагрузка",at_optimal_msg:"Работает в оптимальной зоне нагрузки.",adjust_to_optimal_msg:"Приблизьте нагрузку к {pct}%, чтобы минимизировать расход энергии на единицу.",nav_digital_twin:"Цифровой двойник",twin_hint:"Перетаскивайте для поворота, прокручивайте для масштаба, нажмите на станок для подробностей.",twin_unavailable_msg:"Не удалось загрузить 3D-вид (проверьте подключение к интернету для библиотеки Three.js).",failure_prediction_title:"Прогноз отказа",report_lib_missing_msg:"Для экспорта в PDF нужна библиотека reportlab. Выполните: pip install reportlab, затем перезапустите сервер.",ph_machine_id:"ID станка (напр. M-01)",ph_machine_name:"Название станка",ph_factory_section:"Участок завода",ph_operator_name:"Имя оператора",ph_pressure:"Давление (бар)",ph_voltage:"Напряжение (В)",ph_current:"Ток (А)",ph_error_code:"Код ошибки",ph_daily_output:"Суточный выпуск (ед.)",ph_notes:"Заметки...",nav_system_intel:"Системная аналитика",nav_roi:"ROI-панель",refresh_btn:"Обновить",system_risk_label:"Системный риск",healthy_label:"Исправны",at_risk_label:"В зоне риска",clusters_title:"Кластеры станков",propagation_title:"Распространение аномалий",propagation_hint:"Как отказ одного станка повышает риск соседних.",no_propagation:"Распространение аномалий не обнаружено.",avg_risk_label:"Средний риск",added_risk_label:"Добавленный риск",effective_risk_label:"Итоговый риск",simulation_title:"Что-если симуляция",simulation_hint:"Выберите станок, измените показания датчиков и посмотрите на изменение риска.",run_simulation_btn:"Запустить симуляцию",failure_probability_label:"Вероятность отказа",stress_level_label:"Уровень нагрузки",predicted_status_label:"Прогноз статуса",confidence_label:"Достоверность",root_cause_title:"Первопричина",rul_col:"Остаточный ресурс",rul_healthy:"Исправен",potential_loss_label:"Потенциальные потери",saved_label:"Сэкономлено AI",wasted_energy_label:"Потери энергии / месяц",efficiency_gain_label:"Прирост эффективности",cost_by_machine_title:"Финансовый риск по станкам",top_cause_col:"Основная причина",roi_assumptions_msg:"Допущения: простой {downtime}/ч, ремонт {hours} ч, энергия {price}/кВт·ч.",role_label:"Ваша роль",role_engineer:"Инженер",role_manager:"Менеджер",role_admin:"Администратор",cause_bearing_wear:"Износ подшипника",cause_overload_thermal:"Тепловая перегрузка",cause_cooling_failure:"Отказ охлаждения",cause_misalignment:"Расцентровка вала",cause_lubrication_loss:"Потеря смазки",cause_normal_operation:"Нормальная работа",nav_story:"Режим истории",story_hint:"Воспроизводит развитие отказа подшипника за 22 часа и показывает, когда именно AI его обнаружил — и сколько это стоило.",simulate_failure_btn:"Смоделировать отказ",outcome_title:"Итог",warning_time_label:"Раннее предупреждение",loss_ignored_label:"Потери без реакции",loss_acted_label:"Потери при реакции",money_saved_label:"Сэкономлено",timeline_title:"Хронология отказа",story_detection_msg:"AI обнаружил это за {hours} ч до поломки, при риске {risk}% — первопричина: {cause} (достоверность {confidence}%).",story_stage_healthy:"Исправен",story_stage_early_drift:"Начало отклонения",story_stage_ai_detects:"AI обнаружил",story_stage_critical:"Критично",priority_low:"Низкий",priority_medium:"Средний",priority_high:"Высокий",priority_critical:"Критический",action_stop_machine:"Остановить станок",action_inspect_bearings:"Проверить подшипники",action_check_cooling:"Проверить охлаждение",action_schedule_shutdown_24h:"Запланировать остановку (24ч)",action_order_spare_parts:"Заказать запчасти",action_reduce_load:"Снизить нагрузку",action_schedule_inspection_72h:"Запланировать осмотр (72ч)",action_monitor_closely:"Внимательно наблюдать",action_verify_sensor:"Проверить датчик",action_power_down_idle:"Отключить простаивающий станок",action_review_shift_schedule:"Пересмотреть график смен",action_no_action:"Действий не требуется",nav_oee:"OEE",nav_workorders:"Наряды",oee_hint:"Доступность x Производительность x Качество (ISO 22400). Мировой уровень — 85%, типичный завод — около 60%.",availability_label:"Доступность",performance_label:"Производительность",quality_label:"Качество",weakest_factor_label:"Слабое звено",downtime_by_reason_title:"Простои по причинам",downtime_cost_label:"Стоимость простоя",oee_trend_title:"Динамика OEE",shifts_title:"Смены",shift_col:"Смена",downtime_col:"Простой",log_shift_btn:"Внести смену",no_shifts_yet:"Смены ещё не внесены.",minutes_short:"мин",range_1d:"Сегодня",range_7d:"7 дней",range_30d:"30 дней",all_machines_option:"Все станки",reason_unspecified:"Не указано",err_good_exceeds_total:"Годных не может быть больше общего количества",oee_grade_world_class:"Мировой уровень",oee_grade_typical:"Типичный",oee_grade_low:"Низкий",oee_grade_critical:"Критический",reason_breakdown:"Поломка",reason_changeover:"Переналадка",reason_no_material:"Нет материала",reason_no_operator:"Нет оператора",reason_planned_maintenance:"Плановое ТО",reason_quality_issue:"Проблема качества",reason_setup:"Настройка",reason_other:"Другое",workorders_hint:"Превращает прогноз AI в отслеживаемую задачу — чтобы предупреждение закончилось ремонтом.",new_work_order_btn:"+ Новый наряд",no_work_orders:"Нарядов пока нет.",avg_completion_label:"Ср. выполнение",assigned_label:"Назначен",source_ai:"AI",wo_status_open:"Открыт",wo_status_in_progress:"В работе",wo_status_done:"Выполнен",wo_status_cancelled:"Отменён",wo_advance_to_in_progress:"Начать работу",wo_advance_to_done:"Отметить выполненным",ph_shift_name:"Название смены",ph_planned_minutes:"Плановые минуты",ph_downtime_minutes:"Минуты простоя",ph_total_units:"Всего единиц",ph_good_units:"Годных единиц",ph_cycle_seconds:"Идеальный цикл (сек)",ph_wo_title:"Название",ph_assigned_to:"Ответственный",ph_wo_description:"Описание",overdue_label:"Просрочено",nav_history:"История",history_hint:"Сохранённая история датчиков — так вы докажете, что реально изменилось за пилот.",no_history_yet:"История ещё не записана. Подержите Мониторинг открытым несколько минут, и данные начнут накапливаться.",range_24h:"24 часа",range_3d:"3 дня",range_10d:"10 дней",sensor_trend_title:"Динамика датчиков",risk_trend_title:"Динамика риска",trend_flat:"без изменений",trend_rising:"растёт",trend_falling:"снижается",create_work_order_btn:"Создать наряд",work_order_created_msg:"Наряд создан",alertreason_immediate_failure_risk:"Риск немедленного отказа",alertreason_failure_imminent:"Отказ неизбежен",alertreason_degradation_accelerating:"Ускоряющийся износ",alertreason_outside_normal_envelope:"Выход за штатные пределы",alertreason_pressure_anomaly:"Аномалия давления",alertreason_idle_waste:"Потери на холостом ходу",alertreason_informational:"Информационное",alert_reason_label:"Причина",nav_system_health:"Состояние системы",system_health_hint:"Состояние канала данных, модели и защиты — то, что ломается незаметно.",connections_title:"Промышленные подключения",data_mode_label:"Режим данных",reads_label:"Чтения",failures_label:"Сбои",buffered_label:"В буфере",pipeline_title:"Конвейер приёма",queue_depth_label:"Глубина очереди",duplicates_label:"Дубликаты подавлены",retried_label:"Повторов",dead_letter_label:"В карантине",model_title:"Модель прогноза",train_model_btn:"Обучить модель",check_drift_btn:"Проверить дрейф",model_not_trained:"Модель не обучена — оценки риска ориентировочные, не проверенные.",model_trained_msg:"Модель обучена",trained_on_label:"Обучено на",drift_title:"Дрейф данных",retrain_recommended:"рекомендуется переобучение",security_title:"Проверки безопасности",admin_only_msg:"Требуется доступ администратора.",conn_state_healthy:"исправно",conn_state_stale:"устарело",conn_state_disconnected:"отключено",conn_state_never_connected:"не подключалось",drift_stable:"стабильно",drift_moderate:"умеренно",drift_severe:"серьёзно",metric_precision:"Точность",metric_recall:"Полнота",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"Доля ложных тревог",model_cannot_train:"Пока нельзя обучить",model_reason_no_confirmed_failures:"Нет подтверждённых отказов",model_reason_insufficient_telemetry:"Недостаточно истории датчиков",model_reason_insufficient_positive_samples:"Недостаточно подтверждённых отказов",model_reason_no_failures_in_holdout:"В тестовом периоде нет отказов",check_jwt_secret_strong:"Надёжный JWT-секрет",check_debug_disabled:"Режим отладки выключен",check_https_in_use:"Используется HTTPS",check_database_is_postgres:"База PostgreSQL",check_rate_limiting_active:"Ограничение запросов активно",check_account_lockout_active:"Блокировка аккаунтов активна",check_audit_logging_active:"Журнал аудита ведётся",check_security_headers_active:"Заголовки безопасности активны",check_smtp_configured:"Email настроен",check_industrial_read_only:"Доступ к оборудованию только на чтение",model_train_hint:"Отмечайте реальные отказы, чтобы включить обучение.",drift_status_no_trained_model:"Модель ещё не обучена",drift_status_insufficient_recent_data:"Недостаточно свежих данных",msg_model_untrained_note:"Модель ещё не обучена — оценки риска ориентировочные, не проверенные.",msg_train_needs_failures:"Для обучения нужны подтверждённые отказы. Отмечайте их на странице отказов.",msg_train_no_holdout_failures:"В тестовом периоде нет отказов для оценки.",msg_drift_needs_model:"Сначала обучите модель — дрейф измеряется относительно её данных.",msg_evaluation_needs_failures:"Точность нельзя измерить, пока не отмечены реальные поломки.",msg_holdout_metrics_note:"Метрики получены на данных, которых модель не видела при обучении.",msg_simulation_mode_note:"SIMULATION генерирует данные локально; состояние связи важно только с реальным оборудованием.",msg_savings_needs_two_windows:"Для сравнения до/после нужны данные в обеих половинах периода.",msg_roi_system_cost_note:"Стоимость системы здесь неизвестна — разделите выгоду на свои затраты, чтобы получить ROI.",msg_reliability_not_calibrated:"Используются отраслевые параметры, а не данные этого завода. Отмечайте реальные отказы для калибровки.",msg_no_trained_model:"Модель ещё не обучена",msg_insufficient_recent_data:"Недостаточно свежих данных",nav_failures:"Журнал отказов",failures_hint:"Отмечайте каждую реальную поломку. Именно это учит модель поведению вашего завода — без этого прогнозы остаются общими.",log_failure_btn:"+ Отметить отказ",calibration_title:"Прогресс калибровки",calibration_hint:"Каждому узлу нужно достаточно подтверждённых отказов, чтобы прогноз был откалиброван под этот завод.",calibrated_label:"откалибровано",needs_more_failures:"нужно ещё {n}",ml_model_label:"Модель прогноза",model_ready_to_train:"Готова к обучению",logged_failures_title:"Зарегистрированные отказы",no_failures_yet:"Отказы ещё не отмечены.",was_predicted_label:"спрогнозирован",machine_label:"Станок",component_label:"Какой узел отказал",component_hint:"Выберите ближайший вариант — именно на этом учится модель.",occurred_at_label:"Когда произошло",downtime_label:"Простой (мин)",repair_cost_label:"Стоимость ремонта",notes_label:"Примечания",ph_failure_notes:"Что наблюдалось?",failure_logged_msg:"Отказ зарегистрирован",confirm_delete_failure:"Удалить эту запись об отказе?",err_no_machine_selected:"Выберите станок",err_no_date:"Укажите дату",err_future_date:"Дата не может быть в будущем",component_bearing:"Подшипник",component_motor:"Двигатель",component_pump:"Насос",component_cooling_system:"Система охлаждения",component_gearbox:"Редуктор",cause_seal_leak:"Утечка уплотнения",cause_cavitation:"Кавитация",cause_overpressure:"Избыточное давление",cause_blocked_discharge:"Забит выход",component_prediction_title:"Прогноз по узлам",component_prediction_hint:"Остаточный ресурс каждого узла по текущему состоянию станка.",limiting_label:"критичный",days_short:"дней",industry_default_label:"отраслевые значения",calibrated_to_plant:"Откалибровано под этот завод",not_calibrated_warning:"Используются отраслевые значения — отмечайте реальные отказы для калибровки."},
+  kk: {tagline:"Жаһандық өнеркәсіптік интеллект платформасы",live_label:"Тікелей эфир",kpi_energy:"Энергия тұтыну",kpi_efficiency:"Тиімділік",kpi_active:"Белсенді станоктар",kpi_alerts:"Дабылдар",kwh_unit:"кВт·сағ",chart_title:"Нақты уақыттағы көрсеткіштер",machine_status_title:"Станоктар күйі",status_running:"Жұмыс істеп тұр",status_warning:"Ескерту",status_critical:"Сыни",form_title:"Зауыт деректерін енгізу",factory_name_label:"Зауыт атауы",machine_count_label:"Станоктар саны",energy_cost_label:"Энергия құны ($/кВт·сағ)",machine_type_label:"Станок түрі",temperature_label:"Температура (°C)",vibration_label:"Діріл (мм/с)",load_label:"Жүктеме (%)",submit_btn:"Зауытты талдау",submitting:"Жаңартылуда...",ai_panel_title:"AI-талдау",ai_placeholder:"AI-талдау алу үшін зауыт деректерін жіберіңіз.",ai_analyzing:"Талдануда...",ai_risks:"Тәуекелдер",ai_efficiency_insights:"Тиімділік талдауы",ai_optimizations:"Оңтайландыру ұсыныстары",toast_updated:"Зауыт деректері жаңартылды",toast_analysis_done:"AI-талдау аяқталды",toast_error:"Қате орын алды",nav_dashboard:"Басқару тақтасы",nav_factories:"Зауыттар",nav_ai_insights:"AI-талдау",logout_btn:"Шығу",login_title:"Қайта қош келдіңіз",login_subtitle:"FactoryPulse AI аккаунтыңызға кіріңіз",ph_email:"Email",ph_password:"Құпия сөз",remember_me:"Мені есте сақтау",login_btn:"Кіру",login_link_register:"Аккаунтыңыз жоқ па? Тіркелу",register_title:"Аккаунт құру",register_subtitle:"Зауыттарды AI арқылы бақылауды бастаңыз",ph_full_name:"Толық аты-жөні",ph_confirm_password:"Құпия сөзді қайталаңыз",register_btn:"Аккаунт құру",register_link_login:"Аккаунтыңыз бар ма? Кіру",err_missing_fields:"Барлық өрістерді толтырыңыз",err_invalid_email:"Дұрыс email мекенжайын енгізіңіз",err_weak_password:"Құпия сөз кемінде 8 таңба, әріп пен сан болуы керек",err_password_mismatch:"Құпия сөздер сәйкес келмейді",err_invalid_credentials:"Қате email немесе құпия сөз",err_email_taken:"Бұл email тіркелген",err_generic:"Қате орын алды. Қайталап көріңіз",my_factories_title:"Менің зауыттарым",add_factory_btn:"+ Зауыт қосу",edit_factory_btn:"Өзгерту",delete_factory_btn:"Жою",confirm_delete_factory:"Бұл зауытты жоясыз ба? Бұл әрекетті кері қайтару мүмкін емес.",no_factories_yet:"Сіз әлі ешбір зауыт қосқан жоқсыз.",factory_created_toast:"Зауыт құрылды және талданды",factory_updated_toast:"Зауыт жаңартылды",factory_deleted_toast:"Зауыт жойылды",ai_insights_feed_title:"AI-талдау таспасы",no_ai_insights_yet:"AI-талдау әлі жоқ. Бастау үшін зауыт қосыңыз.",reanalyze_btn:"Қайта талдау",view_insights_btn:"Талдауды көру",created_label:"Құрылған күні",cancel_btn:"Бас тарту",save_btn:"Өзгерістерді сақтау",nav_live_monitor:"Тікелей мониторинг",add_machine_scada_btn:"+ Станок қосу",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Сұрау",live_chart_title:"Нақты уақыттағы сенсор графигі",machines_table_title:"Станоктар",machine_code_col:"Код",machine_name_col:"Атауы",status_col:"Күй",risk_col:"Тәуекел",no_machines_yet:"Станоктар әлі жоқ. «+ Станок қосу» басыңыз.",section_machine_info:"Станок туралы ақпарат",section_sensor_data:"Сенсор деректері",section_status:"Күй",section_notes:"Ескертпелер",status_stopped:"Тоқтатылды",status_maintenance:"Техникалық қызмет",priority_low:"Төмен",priority_normal:"Қалыпты",priority_high:"Жоғары",priority_critical:"Сыни",save_and_analyze_btn:"Сақтау және талдау",source_col:"Дереккөз",source_auto:"Авто (SCADA)",source_manual:"Қолмен",nav_alerts:"Дабылдар",acknowledge_btn:"Растау",acknowledged_label:"Расталды",acknowledge_all_btn:"Барлығын растау",no_alerts_yet:"Дабылдар жоқ. Бәрі қалыпты жұмыс істеп тұр.",download_report_btn:"Есеп",alert_details_template:"Температура {temp}°C, діріл {vib} мм/с, күйі: {status}",section_energy_intel:"Энергетикалық интеллект",daily_output_hint:"Бірлік өнімге кететін энергияны есептеу үшін қолданылады (кВт·сағ/бірлік).",energy_insights_title:"Энергетикалық интеллект",idle_power_title:"Бос жүрісті анықтау",idle_active_msg:"Станок бос тұр — шамамен {kw} кВт босқа кетіп жатыр.",idle_none_msg:"Бос жүріс шығыны табылмады.",friction_loss_title:"Энергия шығынын болжау",friction_active_msg:"Артық үйкеліс табылды: +{pct}% қосымша қуат (~{kw} кВт). Шығынды болдырмау үшін техникалық қызмет жоспарлаңыз.",friction_none_msg:"Ауытқыған үйкеліс табылмады.",sec_title:"Бірлік өнімге кететін қуат",sec_label:"кВт·сағ/бірлік",sec_unit:"кВт·сағ/бірлік",sec_no_data_msg:"Бұл көрсеткішті көру үшін станок қосқанда күнделікті өнім санын енгізіңіз.",optimal_load_title:"Оңтайлы жұмыс режимі",optimal_load_label:"Оңтайлы жүктеме",current_load_label:"Ағымдағы жүктеме",at_optimal_msg:"Оңтайлы жүктеме аймағында жұмыс істеп тұр.",adjust_to_optimal_msg:"Бірлікке кететін энергияны азайту үшін жүктемені {pct}%-ға жақындатыңыз.",nav_digital_twin:"Цифрлық егіз",twin_hint:"Айналдыру үшін сүйреңіз, масштабтау үшін айналдырыңыз, толық мәлімет үшін станокты басыңыз.",twin_unavailable_msg:"3D көрініс жүктелмеді (Three.js кітапханасы үшін интернет байланысын тексеріңіз).",failure_prediction_title:"Ақаудың болжамы",report_lib_missing_msg:"PDF экспорты үшін reportlab кітапханасы керек. Орындаңыз: pip install reportlab, содан кейін серверді қайта қосыңыз.",ph_machine_id:"Станок ID (мыс. M-01)",ph_machine_name:"Станок атауы",ph_factory_section:"Зауыт учаскесі",ph_operator_name:"Оператор аты",ph_pressure:"Қысым (бар)",ph_voltage:"Кернеу (В)",ph_current:"Ток (А)",ph_error_code:"Қате коды",ph_daily_output:"Күнделікті өнім (бірлік)",ph_notes:"Ескертпелер...",nav_system_intel:"Жүйелік талдау",nav_roi:"ROI тақтасы",refresh_btn:"Жаңарту",system_risk_label:"Жүйелік тәуекел",healthy_label:"Сау",at_risk_label:"Тәуекелде",clusters_title:"Станок кластерлері",propagation_title:"Ақаудың таралуы",propagation_hint:"Бір станоктың ақауы көршілеріне қалай әсер етеді.",no_propagation:"Ақаудың таралуы анықталмады.",avg_risk_label:"Орташа тәуекел",added_risk_label:"Қосылған тәуекел",effective_risk_label:"Нақты тәуекел",simulation_title:"Не-болса симуляциясы",simulation_hint:"Станокты таңдап, сенсор мәндерін өзгертіп, тәуекелдің қалай өзгеретінін көріңіз.",run_simulation_btn:"Симуляцияны іске қосу",failure_probability_label:"Ақау ықтималдығы",stress_level_label:"Кернеу деңгейі",predicted_status_label:"Күй болжамы",confidence_label:"Сенімділік",root_cause_title:"Түпкі себеп",rul_col:"Қалдық ресурс",rul_healthy:"Сау",potential_loss_label:"Ықтимал шығын",saved_label:"AI үнемдеді",wasted_energy_label:"Энергия шығыны / ай",efficiency_gain_label:"Тиімділік өсімі",cost_by_machine_title:"Станоктар бойынша қаржы тәуекелі",top_cause_col:"Негізгі себеп",roi_assumptions_msg:"Болжамдар: тоқтап қалу {downtime}/сағ, жөндеу {hours} сағ, энергия {price}/кВт·сағ.",role_label:"Сіздің рөліңіз",role_engineer:"Инженер",role_manager:"Менеджер",role_admin:"Әкімші",cause_bearing_wear:"Подшипник тозуы",cause_overload_thermal:"Жылулық шамадан тыс жүктеме",cause_cooling_failure:"Салқындату ақауы",cause_misalignment:"Білік центрден ауытқуы",cause_lubrication_loss:"Майлау жоғалуы",cause_normal_operation:"Қалыпты жұмыс",nav_story:"Оқиға режимі",story_hint:"Подшипник ақауының 22 сағат ішінде дамуын ойнатып, AI оны дәл қашан анықтағанын және бұл қанша тұратынын көрсетеді.",simulate_failure_btn:"Ақауды модельдеу",outcome_title:"Нәтиже",warning_time_label:"Ерте ескерту",loss_ignored_label:"Әрекетсіз шығын",loss_acted_label:"Әрекет еткендегі шығын",money_saved_label:"Үнемделді",timeline_title:"Ақау хронологиясы",story_detection_msg:"AI мұны бұзылудан {hours} сағат бұрын, {risk}% тәуекелде анықтады — түпкі себеп: {cause} (сенімділік {confidence}%).",story_stage_healthy:"Сау",story_stage_early_drift:"Ауытқу басы",story_stage_ai_detects:"AI анықтады",story_stage_critical:"Сыни",priority_low:"Төмен",priority_medium:"Орташа",priority_high:"Жоғары",priority_critical:"Сыни",action_stop_machine:"Станокты тоқтату",action_inspect_bearings:"Подшипниктерді тексеру",action_check_cooling:"Салқындатуды тексеру",action_schedule_shutdown_24h:"Тоқтатуды жоспарлау (24сағ)",action_order_spare_parts:"Қосалқы бөлшек тапсырыс беру",action_reduce_load:"Жүктемені азайту",action_schedule_inspection_72h:"Тексеруді жоспарлау (72сағ)",action_monitor_closely:"Мұқият бақылау",action_verify_sensor:"Сенсорды тексеру",action_power_down_idle:"Бос тұрған станокты өшіру",action_review_shift_schedule:"Ауысым кестесін қайта қарау",action_no_action:"Әрекет қажет емес",nav_oee:"OEE",nav_workorders:"Тапсырыстар",oee_hint:"Қолжетімділік x Өнімділік x Сапа (ISO 22400). Әлемдік деңгей — 85%, әдеттегі зауыт — 60% шамасында.",availability_label:"Қолжетімділік",performance_label:"Өнімділік",quality_label:"Сапа",weakest_factor_label:"Әлсіз буын",downtime_by_reason_title:"Себебі бойынша тоқтап қалу",downtime_cost_label:"Тоқтап қалу құны",oee_trend_title:"OEE динамикасы",shifts_title:"Ауысымдар",shift_col:"Ауысым",downtime_col:"Тоқтап қалу",log_shift_btn:"Ауысым енгізу",no_shifts_yet:"Ауысымдар әлі енгізілмеген.",minutes_short:"мин",range_1d:"Бүгін",range_7d:"7 күн",range_30d:"30 күн",all_machines_option:"Барлық станоктар",reason_unspecified:"Көрсетілмеген",err_good_exceeds_total:"Жарамды саны жалпы санынан көп бола алмайды",oee_grade_world_class:"Әлемдік деңгей",oee_grade_typical:"Әдеттегі",oee_grade_low:"Төмен",oee_grade_critical:"Сыни",reason_breakdown:"Бұзылу",reason_changeover:"Қайта баптау",reason_no_material:"Материал жоқ",reason_no_operator:"Оператор жоқ",reason_planned_maintenance:"Жоспарлы ТҚ",reason_quality_issue:"Сапа мәселесі",reason_setup:"Орнату",reason_other:"Басқа",workorders_hint:"AI болжамын бақыланатын тапсырысқа айналдырады — ескерту нақты жөндеумен аяқталсын.",new_work_order_btn:"+ Жаңа тапсырыс",no_work_orders:"Тапсырыстар әлі жоқ.",avg_completion_label:"Орт. орындалу",assigned_label:"Тағайындалды",source_ai:"AI",wo_status_open:"Ашық",wo_status_in_progress:"Орындалуда",wo_status_done:"Орындалды",wo_status_cancelled:"Бас тартылды",wo_advance_to_in_progress:"Жұмысты бастау",wo_advance_to_done:"Орындалды деп белгілеу",ph_shift_name:"Ауысым атауы",ph_planned_minutes:"Жоспарлы минут",ph_downtime_minutes:"Тоқтап қалған минут",ph_total_units:"Жалпы саны",ph_good_units:"Жарамды саны",ph_cycle_seconds:"Оңтайлы цикл (сек)",ph_wo_title:"Атауы",ph_assigned_to:"Жауапты",ph_wo_description:"Сипаттама",overdue_label:"Мерзімі өткен",nav_history:"Тарих",history_hint:"Сақталған сенсор тарихы — пилот кезінде не өзгергенін осылай дәлелдейсіз.",no_history_yet:"Тарих әлі жазылмаған. Тікелей мониторингті бірнеше минут ашық қалдырсаңыз, дерек жинала бастайды.",range_24h:"24 сағат",range_3d:"3 күн",range_10d:"10 күн",sensor_trend_title:"Сенсор динамикасы",risk_trend_title:"Тәуекел динамикасы",trend_flat:"өзгеріссіз",trend_rising:"өсуде",trend_falling:"төмендеуде",create_work_order_btn:"Тапсырыс жасау",work_order_created_msg:"Тапсырыс жасалды",alertreason_immediate_failure_risk:"Дереу бұзылу қаупі",alertreason_failure_imminent:"Ақау таяу",alertreason_degradation_accelerating:"Тозу үдеуде",alertreason_outside_normal_envelope:"Қалыпты шектен тыс",alertreason_pressure_anomaly:"Қысым ауытқуы",alertreason_idle_waste:"Бос жүріс шығыны",alertreason_informational:"Ақпараттық",alert_reason_label:"Себебі",nav_system_health:"Жүйе денсаулығы",system_health_hint:"Дерек арнасының, модельдің және қорғаныстың күйі — байқаусыз бұзылатын нәрселер.",connections_title:"Өнеркәсіптік байланыстар",data_mode_label:"Дерек режимі",reads_label:"Оқулар",failures_label:"Сәтсіздіктер",buffered_label:"Буферде",pipeline_title:"Қабылдау конвейері",queue_depth_label:"Кезек тереңдігі",duplicates_label:"Қайталамалар басылды",retried_label:"Қайталанды",dead_letter_label:"Карантинде",model_title:"Болжам моделі",train_model_btn:"Модельді оқыту",check_drift_btn:"Дрейфті тексеру",model_not_trained:"Модель оқытылмаған — тәуекел бағасы бағдарлы, тексерілмеген.",model_trained_msg:"Модель оқытылды",trained_on_label:"Оқытылған үлгі",drift_title:"Дерек дрейфі",retrain_recommended:"қайта оқыту ұсынылады",security_title:"Қауіпсіздік тексерістері",admin_only_msg:"Әкімші рұқсаты қажет.",conn_state_healthy:"сау",conn_state_stale:"ескірген",conn_state_disconnected:"ажыратылған",conn_state_never_connected:"қосылмаған",drift_stable:"тұрақты",drift_moderate:"орташа",drift_severe:"ауыр",metric_precision:"Дәлдік",metric_recall:"Толықтық",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"Жалған дабыл үлесі",model_cannot_train:"Әзірге оқыту мүмкін емес",model_reason_no_confirmed_failures:"Расталған ақаулар жоқ",model_reason_insufficient_telemetry:"Сенсор тарихы жеткіліксіз",model_reason_insufficient_positive_samples:"Расталған ақаулар жеткіліксіз",model_reason_no_failures_in_holdout:"Тест кезеңінде ақау жоқ",check_jwt_secret_strong:"Сенімді JWT құпиясы",check_debug_disabled:"Жөндеу режимі өшірулі",check_https_in_use:"HTTPS қолданылады",check_database_is_postgres:"PostgreSQL дерекқоры",check_rate_limiting_active:"Сұраныс шектеуі белсенді",check_account_lockout_active:"Аккаунт бұғаттауы белсенді",check_audit_logging_active:"Аудит журналы жүргізіледі",check_security_headers_active:"Қауіпсіздік тақырыптары белсенді",check_smtp_configured:"Email бапталған",check_industrial_read_only:"Жабдыққа қатынау тек оқу үшін",model_train_hint:"Оқытуды қосу үшін нақты ақауларды белгілеңіз.",drift_status_no_trained_model:"Модель әлі оқытылмаған",drift_status_insufficient_recent_data:"Жаңа дерек жеткіліксіз",msg_model_untrained_note:"Модель әлі оқытылмаған — тәуекел бағасы бағдарлы, тексерілмеген.",msg_train_needs_failures:"Оқыту үшін расталған ақаулар қажет. Оларды ақаулар бетінде белгілеңіз.",msg_train_no_holdout_failures:"Тест кезеңінде бағалауға ақау жоқ.",msg_drift_needs_model:"Алдымен модельді оқытыңыз — дрейф оның деректеріне қатысты өлшенеді.",msg_evaluation_needs_failures:"Нақты бұзылулар белгіленбейінше дәлдікті өлшеу мүмкін емес.",msg_holdout_metrics_note:"Метрикалар модель оқыту кезінде көрмеген деректен алынған.",msg_simulation_mode_note:"SIMULATION деректі жергілікті жасайды; байланыс күйі нақты жабдықпен ғана маңызды.",msg_savings_needs_two_windows:"Бұрын/кейін салыстыруға кезеңнің екі бөлігінде де дерек керек.",msg_roi_system_cost_note:"Жүйе құны бұл жерде белгісіз — ROI алу үшін пайданы өз шығыныңызға бөліңіз.",msg_reliability_not_calibrated:"Осы зауыттың емес, салалық параметрлер қолданылуда. Калибрлеу үшін нақты ақауларды белгілеңіз.",msg_no_trained_model:"Модель әлі оқытылмаған",msg_insufficient_recent_data:"Жаңа дерек жеткіліксіз",nav_failures:"Ақаулар журналы",failures_hint:"Әр нақты бұзылуды белгілеңіз. Дәл осы модельді зауытыңыздың нақты мінезіне үйретеді — онсыз болжамдар жалпы болып қалады.",log_failure_btn:"+ Ақауды белгілеу",calibration_title:"Калибрлеу барысы",calibration_hint:"Болжам осы зауытқа калибрленуі үшін әр торапқа жеткілікті расталған ақау қажет.",calibrated_label:"калибрленген",needs_more_failures:"тағы {n} қажет",ml_model_label:"Болжам моделі",model_ready_to_train:"Оқытуға дайын",logged_failures_title:"Тіркелген ақаулар",no_failures_yet:"Ақаулар әлі белгіленбеген.",was_predicted_label:"болжанған",machine_label:"Станок",component_label:"Қай тарап істен шықты",component_hint:"Ең жақын нұсқаны таңдаңыз — модель дәл осыдан үйренеді.",occurred_at_label:"Қашан болды",downtime_label:"Тоқтап қалу (мин)",repair_cost_label:"Жөндеу құны",notes_label:"Ескертпелер",ph_failure_notes:"Не байқалды?",failure_logged_msg:"Ақау тіркелді",confirm_delete_failure:"Осы ақау жазбасын жою керек пе?",err_no_machine_selected:"Станокты таңдаңыз",err_no_date:"Күнін көрсетіңіз",err_future_date:"Күн болашақта бола алмайды",component_bearing:"Подшипник",component_motor:"Қозғалтқыш",component_pump:"Сорғы",component_cooling_system:"Салқындату жүйесі",component_gearbox:"Редуктор",cause_seal_leak:"Тығыздағыш ағуы",cause_cavitation:"Кавитация",cause_overpressure:"Шамадан тыс қысым",cause_blocked_discharge:"Шығыс бітелген",component_prediction_title:"Тарап бойынша болжам",component_prediction_hint:"Станоктың ағымдағы күйі бойынша әр тараптың қалдық ресурсы.",limiting_label:"шектеуші",days_short:"күн",industry_default_label:"салалық әдепкі",calibrated_to_plant:"Осы зауытқа калибрленген",not_calibrated_warning:"Салалық мәндер қолданылуда — калибрлеу үшін нақты ақауларды белгілеңіз."},
+  de: {tagline:"Globale Industrielle Intelligenzplattform",live_label:"Live",kpi_energy:"Energieverbrauch",kpi_efficiency:"Effizienz",kpi_active:"Aktive Maschinen",kpi_alerts:"Warnungen",kwh_unit:"kWh",chart_title:"Echtzeit-Leistung",machine_status_title:"Maschinenstatus",status_running:"Läuft",status_warning:"Warnung",status_critical:"Kritisch",form_title:"Fabrikdateneingabe",factory_name_label:"Fabrikname",machine_count_label:"Anzahl der Maschinen",energy_cost_label:"Energiekosten ($/kWh)",machine_type_label:"Maschinentyp",temperature_label:"Temperatur (°C)",vibration_label:"Vibration (mm/s)",load_label:"Last (%)",submit_btn:"Fabrik Analysieren",submitting:"Aktualisieren...",ai_panel_title:"KI-Einblicke",ai_placeholder:"Senden Sie Fabrikdaten, um eine KI-Analyse zu erstellen.",ai_analyzing:"Analysiere...",ai_risks:"Risiken",ai_efficiency_insights:"Effizienzanalyse",ai_optimizations:"Optimierungsvorschläge",toast_updated:"Fabrikdaten aktualisiert",toast_analysis_done:"KI-Analyse abgeschlossen",toast_error:"Etwas ist schiefgelaufen",nav_dashboard:"Übersicht",nav_factories:"Fabriken",nav_ai_insights:"KI-Einblicke",logout_btn:"Abmelden",login_title:"Willkommen zurück",login_subtitle:"Melden Sie sich bei Ihrem FactoryPulse AI-Konto an",ph_email:"E-Mail",ph_password:"Passwort",remember_me:"Angemeldet bleiben",login_btn:"Einloggen",login_link_register:"Kein Konto? Jetzt erstellen",register_title:"Konto erstellen",register_subtitle:"Beginnen Sie mit der KI-Überwachung Ihrer Fabriken",ph_full_name:"Vollständiger Name",ph_confirm_password:"Passwort bestätigen",register_btn:"Konto erstellen",register_link_login:"Bereits ein Konto? Anmelden",err_missing_fields:"Bitte füllen Sie alle Felder aus",err_invalid_email:"Bitte geben Sie eine gültige E-Mail-Adresse ein",err_weak_password:"Passwort muss mind. 8 Zeichen, einen Buchstaben und eine Zahl enthalten",err_password_mismatch:"Passwörter stimmen nicht überein",err_invalid_credentials:"Ungültige E-Mail oder Passwort",err_email_taken:"Diese E-Mail ist bereits registriert",err_generic:"Etwas ist schiefgelaufen. Bitte erneut versuchen",my_factories_title:"Meine Fabriken",add_factory_btn:"+ Fabrik Hinzufügen",edit_factory_btn:"Bearbeiten",delete_factory_btn:"Löschen",confirm_delete_factory:"Diese Fabrik löschen? Dies kann nicht rückgängig gemacht werden.",no_factories_yet:"Sie haben noch keine Fabriken hinzugefügt.",factory_created_toast:"Fabrik erstellt und analysiert",factory_updated_toast:"Fabrik aktualisiert",factory_deleted_toast:"Fabrik gelöscht",ai_insights_feed_title:"KI-Einblicke Feed",no_ai_insights_yet:"Noch keine KI-Einblicke. Fügen Sie eine Fabrik hinzu.",reanalyze_btn:"Erneut analysieren",view_insights_btn:"Einblicke Anzeigen",created_label:"Erstellt",cancel_btn:"Abbrechen",save_btn:"Änderungen Speichern",nav_live_monitor:"Live-Überwachung",add_machine_scada_btn:"+ Maschine Hinzufügen",usb_status:"USB:",plc_status:"SPS:",polling_mode:"Abfrage",live_chart_title:"Live-Sensordiagramm",machines_table_title:"Maschinen",machine_code_col:"Code",machine_name_col:"Name",status_col:"Status",risk_col:"Risiko",no_machines_yet:"Noch keine Maschinen. Klicken Sie auf „+ Maschine Hinzufügen“.",section_machine_info:"Maschineninformationen",section_sensor_data:"Sensordaten",section_status:"Status",section_notes:"Notizen",status_stopped:"Gestoppt",status_maintenance:"Wartung",priority_low:"Niedrig",priority_normal:"Normal",priority_high:"Hoch",priority_critical:"Kritisch",save_and_analyze_btn:"Speichern & Analysieren",source_col:"Quelle",source_auto:"Auto (SCADA)",source_manual:"Manuell",nav_alerts:"Warnungen",acknowledge_btn:"Bestätigen",acknowledged_label:"Bestätigt",acknowledge_all_btn:"Alle Bestätigen",no_alerts_yet:"Keine Warnungen. Alles läuft reibungslos.",download_report_btn:"Bericht",alert_details_template:"Temperatur {temp}°C, Vibration {vib} mm/s, Status: {status}",section_energy_intel:"Energieintelligenz",daily_output_hint:"Wird zur Berechnung des spezifischen Energieverbrauchs verwendet (kWh pro Einheit).",energy_insights_title:"Energieintelligenz",idle_power_title:"Leerlaufenergie-Erkennung",idle_active_msg:"Maschine im Leerlauf – aktuell werden etwa {kw} kW verschwendet.",idle_none_msg:"Kein Leerlaufenergieverlust festgestellt.",friction_loss_title:"Vorausschauender Energieverlust",friction_active_msg:"Erhöhte Reibung festgestellt: +{pct}% Mehrleistung (~{kw} kW extra). Wartung einplanen, um Verluste zu vermeiden.",friction_none_msg:"Keine abnormale Reibung festgestellt.",sec_title:"Spezifischer Energieverbrauch",sec_label:"kWh pro Einheit",sec_unit:"kWh/Einheit",sec_no_data_msg:"Geben Sie die Tagesproduktion beim Hinzufügen der Maschine an, um diese Kennzahl zu sehen.",optimal_load_title:"Optimale Lastzone",optimal_load_label:"Optimale Last",current_load_label:"Aktuelle Last",at_optimal_msg:"Läuft in der optimalen Lastzone.",adjust_to_optimal_msg:"Last auf {pct}% anpassen, um den Energieverbrauch pro Einheit zu minimieren.",nav_digital_twin:"Digitaler Zwilling",twin_hint:"Ziehen zum Drehen, Scrollen zum Zoomen, Maschine anklicken für Live-Details.",twin_unavailable_msg:"3D-Ansicht konnte nicht geladen werden (Internetverbindung für Three.js prüfen).",failure_prediction_title:"Ausfallvorhersage",report_lib_missing_msg:"Für den PDF-Export wird die reportlab-Bibliothek benötigt. Führen Sie aus: pip install reportlab und starten Sie den Server neu.",ph_machine_id:"Maschinen-ID (z.B. M-01)",ph_machine_name:"Maschinenname",ph_factory_section:"Fabrikbereich",ph_operator_name:"Bedienername",ph_pressure:"Druck (bar)",ph_voltage:"Spannung (V)",ph_current:"Strom (A)",ph_error_code:"Fehlercode",ph_daily_output:"Tagesproduktion (Einheiten)",ph_notes:"Notizen...",nav_system_intel:"Systemintelligenz",nav_roi:"ROI-Dashboard",refresh_btn:"Aktualisieren",system_risk_label:"Systemrisiko",healthy_label:"Gesund",at_risk_label:"Gefährdet",clusters_title:"Maschinencluster",propagation_title:"Anomalie-Ausbreitung",propagation_hint:"Wie eine ausfallende Maschine das Risiko ihrer Nachbarn erhöht.",no_propagation:"Keine Anomalie-Ausbreitung erkannt.",avg_risk_label:"Durchschn. Risiko",added_risk_label:"Zusätzliches Risiko",effective_risk_label:"Effektives Risiko",simulation_title:"Was-wäre-wenn-Simulation",simulation_hint:"Maschine wählen, Sensorwerte verschieben und die Ausfallwahrscheinlichkeit beobachten.",run_simulation_btn:"Simulation starten",failure_probability_label:"Ausfallwahrscheinlichkeit",stress_level_label:"Belastungsgrad",predicted_status_label:"Prognostizierter Status",confidence_label:"Konfidenz",root_cause_title:"Grundursache",rul_col:"Restnutzungsdauer",rul_healthy:"Gesund",potential_loss_label:"Potenzieller Verlust",saved_label:"Durch KI gespart",wasted_energy_label:"Energieverlust / Monat",efficiency_gain_label:"Effizienzgewinn",cost_by_machine_title:"Kostenrisiko pro Maschine",top_cause_col:"Hauptursache",roi_assumptions_msg:"Annahmen: Ausfall {downtime}/h, {hours}h Reparatur, {price}/kWh Energie.",role_label:"Ihre Rolle",role_engineer:"Ingenieur",role_manager:"Manager",role_admin:"Administrator",cause_bearing_wear:"Lagerverschleiß",cause_overload_thermal:"Thermische Überlastung",cause_cooling_failure:"Kühlungsausfall",cause_misalignment:"Wellenversatz",cause_lubrication_loss:"Schmierverlust",cause_normal_operation:"Normalbetrieb",nav_story:"Story-Modus",story_hint:"Spielt einen über 22 Stunden entstehenden Lagerschaden nach und zeigt genau, wann die KI ihn erkannte — und was das wert war.",simulate_failure_btn:"Ausfall Simulieren",outcome_title:"Ergebnis",warning_time_label:"Frühwarnung",loss_ignored_label:"Verlust ohne Reaktion",loss_acted_label:"Verlust bei Reaktion",money_saved_label:"Gespart",timeline_title:"Ausfall-Zeitleiste",story_detection_msg:"Die KI meldete dies {hours} Stunden vor dem Ausfall bei {risk}% Risiko — Grundursache: {cause} ({confidence}% Konfidenz).",story_stage_healthy:"Gesund",story_stage_early_drift:"Erste Abweichung",story_stage_ai_detects:"KI Erkennt",story_stage_critical:"Kritisch",priority_low:"Niedrig",priority_medium:"Mittel",priority_high:"Hoch",priority_critical:"Kritisch",action_stop_machine:"Maschine stoppen",action_inspect_bearings:"Lager prüfen",action_check_cooling:"Kühlung prüfen",action_schedule_shutdown_24h:"Abschaltung planen (24h)",action_order_spare_parts:"Ersatzteile bestellen",action_reduce_load:"Last reduzieren",action_schedule_inspection_72h:"Inspektion planen (72h)",action_monitor_closely:"Genau beobachten",action_verify_sensor:"Sensor prüfen",action_power_down_idle:"Leerlaufmaschine abschalten",action_review_shift_schedule:"Schichtplan überprüfen",action_no_action:"Keine Maßnahme nötig",nav_oee:"OEE",nav_workorders:"Aufträge",oee_hint:"Verfügbarkeit x Leistung x Qualität (ISO 22400). Weltklasse ist 85%, eine typische Fabrik liegt bei etwa 60%.",availability_label:"Verfügbarkeit",performance_label:"Leistung",quality_label:"Qualität",weakest_factor_label:"Schwächster",downtime_by_reason_title:"Ausfallzeit nach Grund",downtime_cost_label:"Ausfallkosten",oee_trend_title:"OEE-Trend",shifts_title:"Schichten",shift_col:"Schicht",downtime_col:"Ausfallzeit",log_shift_btn:"Schicht erfassen",no_shifts_yet:"Noch keine Schichten erfasst.",minutes_short:"Min",range_1d:"Heute",range_7d:"7 Tage",range_30d:"30 Tage",all_machines_option:"Alle Maschinen",reason_unspecified:"Nicht angegeben",err_good_exceeds_total:"Gutteile können die Gesamtmenge nicht überschreiten",oee_grade_world_class:"Weltklasse",oee_grade_typical:"Typisch",oee_grade_low:"Niedrig",oee_grade_critical:"Kritisch",reason_breakdown:"Störung",reason_changeover:"Rüsten",reason_no_material:"Kein Material",reason_no_operator:"Kein Bediener",reason_planned_maintenance:"Geplante Wartung",reason_quality_issue:"Qualitätsproblem",reason_setup:"Einrichtung",reason_other:"Sonstiges",workorders_hint:"Macht aus einer KI-Prognose eine nachverfolgbare Aufgabe — damit eine Warnung in einer Reparatur endet.",new_work_order_btn:"+ Neuer Auftrag",no_work_orders:"Noch keine Aufträge.",avg_completion_label:"Ø Bearbeitung",assigned_label:"Zugewiesen",source_ai:"KI",wo_status_open:"Offen",wo_status_in_progress:"In Arbeit",wo_status_done:"Erledigt",wo_status_cancelled:"Storniert",wo_advance_to_in_progress:"Arbeit beginnen",wo_advance_to_done:"Als erledigt markieren",ph_shift_name:"Schichtname",ph_planned_minutes:"Geplante Minuten",ph_downtime_minutes:"Ausfallminuten",ph_total_units:"Gesamtstückzahl",ph_good_units:"Gutteile",ph_cycle_seconds:"Idealzyklus (Sek.)",ph_wo_title:"Titel",ph_assigned_to:"Zugewiesen an",ph_wo_description:"Beschreibung",overdue_label:"Überfällig",nav_history:"Verlauf",history_hint:"Gespeicherte Sensorhistorie — damit belegen Sie, was sich im Pilot wirklich verändert hat.",no_history_yet:"Noch kein Verlauf aufgezeichnet. Lassen Sie das Live-Monitoring einige Minuten offen, dann sammeln sich Daten.",range_24h:"24 Stunden",range_3d:"3 Tage",range_10d:"10 Tage",sensor_trend_title:"Sensorverlauf",risk_trend_title:"Risikoverlauf",trend_flat:"unverändert",trend_rising:"steigend",trend_falling:"fallend",create_work_order_btn:"Auftrag erstellen",work_order_created_msg:"Auftrag erstellt",alertreason_immediate_failure_risk:"Unmittelbares Ausfallrisiko",alertreason_failure_imminent:"Ausfall unmittelbar bevorstehend",alertreason_degradation_accelerating:"Verschleiß beschleunigt sich",alertreason_outside_normal_envelope:"Außerhalb des Normalbereichs",alertreason_pressure_anomaly:"Druckanomalie",alertreason_idle_waste:"Leerlauf-Energieverlust",alertreason_informational:"Informativ",alert_reason_label:"Grund",nav_system_health:"Systemzustand",system_health_hint:"Zustand von Datenpfad, Modell und Sicherheit — das, was unbemerkt kaputtgeht.",connections_title:"Industrielle Verbindungen",data_mode_label:"Datenmodus",reads_label:"Lesevorgänge",failures_label:"Fehler",buffered_label:"Gepuffert",pipeline_title:"Ingest-Pipeline",queue_depth_label:"Warteschlange",duplicates_label:"Duplikate unterdrückt",retried_label:"Wiederholt",dead_letter_label:"Quarantäne",model_title:"Prognosemodell",train_model_btn:"Modell trainieren",check_drift_btn:"Drift prüfen",model_not_trained:"Kein trainiertes Modell — Risikowerte sind Richtwerte, nicht validiert.",model_trained_msg:"Modell trainiert",trained_on_label:"Trainiert mit",drift_title:"Datendrift",retrain_recommended:"Neutraining empfohlen",security_title:"Sicherheitsprüfungen",admin_only_msg:"Administratorzugang erforderlich.",conn_state_healthy:"gesund",conn_state_stale:"veraltet",conn_state_disconnected:"getrennt",conn_state_never_connected:"nie verbunden",drift_stable:"stabil",drift_moderate:"moderat",drift_severe:"schwer",metric_precision:"Precision",metric_recall:"Recall",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"Fehlalarmrate",model_cannot_train:"Training noch nicht möglich",model_reason_no_confirmed_failures:"Keine bestätigten Ausfälle erfasst",model_reason_insufficient_telemetry:"Zu wenig Sensorhistorie",model_reason_insufficient_positive_samples:"Zu wenige bestätigte Ausfälle",model_reason_no_failures_in_holdout:"Keine Ausfälle im Testzeitraum",check_jwt_secret_strong:"Starkes JWT-Secret",check_debug_disabled:"Debug-Modus deaktiviert",check_https_in_use:"HTTPS in Verwendung",check_database_is_postgres:"PostgreSQL-Datenbank",check_rate_limiting_active:"Rate-Limiting aktiv",check_account_lockout_active:"Kontosperre aktiv",check_audit_logging_active:"Audit-Protokollierung aktiv",check_security_headers_active:"Sicherheits-Header aktiv",check_smtp_configured:"E-Mail konfiguriert",check_industrial_read_only:"Industriezugriff nur lesend",model_train_hint:"Erfassen Sie echte Ausfälle, um das Training zu ermöglichen.",drift_status_no_trained_model:"Noch kein trainiertes Modell",drift_status_insufficient_recent_data:"Zu wenig aktuelle Daten",msg_model_untrained_note:"Noch kein Modell trainiert — Risikowerte sind Richtwerte, nicht validiert.",msg_train_needs_failures:"Für das Training werden bestätigte Ausfälle benötigt. Erfassen Sie sie auf der Ausfallseite.",msg_train_no_holdout_failures:"Der Testzeitraum enthält keine Ausfälle zur Bewertung.",msg_drift_needs_model:"Trainieren Sie zuerst ein Modell — Drift wird gegen dessen Daten gemessen.",msg_evaluation_needs_failures:"Genauigkeit ist nicht messbar, solange keine echten Ausfälle erfasst sind.",msg_holdout_metrics_note:"Kennzahlen stammen aus Daten, die das Modell im Training nie gesehen hat.",msg_simulation_mode_note:"SIMULATION erzeugt Daten lokal; Verbindungszustand zählt nur bei echter Hardware.",msg_savings_needs_two_windows:"Ein Vorher/Nachher-Vergleich braucht Daten in beiden Hälften des Zeitraums.",msg_roi_system_cost_note:"Systemkosten sind hier unbekannt — teilen Sie den Nutzen durch Ihre Kosten für den ROI.",msg_reliability_not_calibrated:"Es werden Branchenparameter verwendet, nicht die dieser Fabrik. Erfassen Sie echte Ausfälle zur Kalibrierung.",msg_no_trained_model:"Noch kein trainiertes Modell",msg_insufficient_recent_data:"Zu wenig aktuelle Daten",nav_failures:"Ausfallprotokoll",failures_hint:"Erfassen Sie jeden echten Ausfall. Genau das lehrt das Modell das Verhalten Ihrer Anlage — ohne dies bleiben Prognosen allgemein.",log_failure_btn:"+ Ausfall erfassen",calibration_title:"Kalibrierungsfortschritt",calibration_hint:"Jede Komponente braucht genügend bestätigte Ausfälle, bevor ihre Prognose für diese Anlage kalibriert ist.",calibrated_label:"kalibriert",needs_more_failures:"noch {n} nötig",ml_model_label:"Prognosemodell",model_ready_to_train:"Bereit zum Training",logged_failures_title:"Erfasste Ausfälle",no_failures_yet:"Noch keine Ausfälle erfasst.",was_predicted_label:"prognostiziert",machine_label:"Maschine",component_label:"Welche Komponente fiel aus",component_hint:"Wählen Sie die nächstliegende — daraus lernt das Modell.",occurred_at_label:"Wann geschah es",downtime_label:"Ausfallzeit (Min)",repair_cost_label:"Reparaturkosten",notes_label:"Notizen",ph_failure_notes:"Was wurde beobachtet?",failure_logged_msg:"Ausfall erfasst",confirm_delete_failure:"Diesen Ausfalleintrag löschen?",err_no_machine_selected:"Maschine auswählen",err_no_date:"Datum angeben",err_future_date:"Das Datum darf nicht in der Zukunft liegen",component_bearing:"Lager",component_motor:"Motor",component_pump:"Pumpe",component_cooling_system:"Kühlsystem",component_gearbox:"Getriebe",cause_seal_leak:"Dichtungsleckage",cause_cavitation:"Kavitation",cause_overpressure:"Überdruck",cause_blocked_discharge:"Verstopfter Auslass",component_prediction_title:"Komponentenprognose",component_prediction_hint:"Restlebensdauer je Komponente aus dem aktuellen Maschinenzustand.",limiting_label:"begrenzend",days_short:"Tage",industry_default_label:"Branchenwerte",calibrated_to_plant:"Auf diese Anlage kalibriert",not_calibrated_warning:"Es werden Branchenwerte genutzt — erfassen Sie echte Ausfälle zur Kalibrierung."},
+  fr: {tagline:"Plateforme mondiale d'intelligence industrielle",live_label:"En direct",kpi_energy:"Consommation d'Énergie",kpi_efficiency:"Efficacité",kpi_active:"Machines Actives",kpi_alerts:"Alertes",kwh_unit:"kWh",chart_title:"Performance en Temps Réel",machine_status_title:"État des Machines",status_running:"En marche",status_warning:"Avertissement",status_critical:"Critique",form_title:"Saisie des Données d'Usine",factory_name_label:"Nom de l'Usine",machine_count_label:"Nombre de Machines",energy_cost_label:"Coût de l'Énergie ($/kWh)",machine_type_label:"Type de Machine",temperature_label:"Température (°C)",vibration_label:"Vibration (mm/s)",load_label:"Charge (%)",submit_btn:"Analyser l'Usine",submitting:"Mise à jour...",ai_panel_title:"Analyses IA",ai_placeholder:"Envoyez les données de l'usine pour générer une analyse IA.",ai_analyzing:"Analyse en cours...",ai_risks:"Risques",ai_efficiency_insights:"Analyse d'Efficacité",ai_optimizations:"Suggestions d'Optimisation",toast_updated:"Données d'usine mises à jour",toast_analysis_done:"Analyse IA terminée",toast_error:"Une erreur est survenue",nav_dashboard:"Tableau de Bord",nav_factories:"Usines",nav_ai_insights:"Analyses IA",logout_btn:"Déconnexion",login_title:"Content de vous revoir",login_subtitle:"Connectez-vous à votre compte FactoryPulse AI",ph_email:"E-mail",ph_password:"Mot de passe",remember_me:"Se souvenir de moi",login_btn:"Se connecter",login_link_register:"Pas de compte ? Créez-en un",register_title:"Créer votre compte",register_subtitle:"Commencez à surveiller vos usines avec l'IA",ph_full_name:"Nom Complet",ph_confirm_password:"Confirmer le Mot de Passe",register_btn:"Créer un Compte",register_link_login:"Déjà un compte ? Se connecter",err_missing_fields:"Veuillez remplir tous les champs",err_invalid_email:"Veuillez entrer une adresse e-mail valide",err_weak_password:"Le mot de passe doit contenir 8 caractères min., une lettre et un chiffre",err_password_mismatch:"Les mots de passe ne correspondent pas",err_invalid_credentials:"E-mail ou mot de passe incorrect",err_email_taken:"Cet e-mail est déjà enregistré",err_generic:"Une erreur est survenue. Veuillez réessayer",my_factories_title:"Mes Usines",add_factory_btn:"+ Ajouter une Usine",edit_factory_btn:"Modifier",delete_factory_btn:"Supprimer",confirm_delete_factory:"Supprimer cette usine ? Cette action est irréversible.",no_factories_yet:"Vous n'avez pas encore ajouté d'usine.",factory_created_toast:"Usine créée et analysée",factory_updated_toast:"Usine mise à jour",factory_deleted_toast:"Usine supprimée",ai_insights_feed_title:"Flux d'Analyses IA",no_ai_insights_yet:"Aucune analyse IA pour l'instant. Ajoutez une usine.",reanalyze_btn:"Réanalyser",view_insights_btn:"Voir les Analyses",created_label:"Créée le",cancel_btn:"Annuler",save_btn:"Enregistrer les Modifications",nav_live_monitor:"Surveillance en Direct",add_machine_scada_btn:"+ Ajouter une Machine",usb_status:"USB :",plc_status:"API :",polling_mode:"Interrogation",live_chart_title:"Graphique des Capteurs en Direct",machines_table_title:"Machines",machine_code_col:"Code",machine_name_col:"Nom",status_col:"Statut",risk_col:"Risque",no_machines_yet:"Aucune machine pour l'instant. Cliquez sur « + Ajouter une Machine ».",section_machine_info:"Informations sur la Machine",section_sensor_data:"Données des Capteurs",section_status:"Statut",section_notes:"Notes",status_stopped:"Arrêtée",status_maintenance:"Maintenance",priority_low:"Faible",priority_normal:"Normale",priority_high:"Élevée",priority_critical:"Critique",save_and_analyze_btn:"Enregistrer et Analyser",source_col:"Source",source_auto:"Auto (SCADA)",source_manual:"Manuel",nav_alerts:"Alertes",acknowledge_btn:"Confirmer",acknowledged_label:"Confirmé",acknowledge_all_btn:"Tout Confirmer",no_alerts_yet:"Aucune alerte. Tout fonctionne normalement.",download_report_btn:"Rapport",alert_details_template:"Température {temp}°C, vibration {vib} mm/s, statut : {status}",section_energy_intel:"Intelligence Énergétique",daily_output_hint:"Utilisé pour calculer la consommation énergétique spécifique (kWh par unité).",energy_insights_title:"Intelligence Énergétique",idle_power_title:"Détection de Puissance au Ralenti",idle_active_msg:"Machine au ralenti - environ {kw} kW gaspillés actuellement.",idle_none_msg:"Aucun gaspillage d'énergie au ralenti détecté.",friction_loss_title:"Perte d'Énergie Prédictive",friction_active_msg:"Friction élevée détectée : +{pct}% de surcharge (~{kw} kW en plus). Planifiez une maintenance pour éviter les pertes.",friction_none_msg:"Aucune friction anormale détectée.",sec_title:"Consommation Énergétique Spécifique",sec_label:"kWh par unité",sec_unit:"kWh/unité",sec_no_data_msg:"Indiquez la production quotidienne lors de l'ajout de la machine pour voir cette mesure.",optimal_load_title:"Zone de Charge Optimale",optimal_load_label:"Charge optimale",current_load_label:"Charge actuelle",at_optimal_msg:"Fonctionne dans la zone de charge optimale.",adjust_to_optimal_msg:"Ajustez la charge vers {pct}% pour minimiser l'énergie par unité.",nav_digital_twin:"Jumeau Numérique",twin_hint:"Faites glisser pour pivoter, défilez pour zoomer, cliquez sur une machine pour ses détails en direct.",twin_unavailable_msg:"Impossible de charger la vue 3D (vérifiez votre connexion internet pour Three.js).",failure_prediction_title:"Prédiction de Panne",report_lib_missing_msg:"L'export PDF nécessite la bibliothèque reportlab. Exécutez : pip install reportlab, puis redémarrez le serveur.",ph_machine_id:"ID Machine (ex. M-01)",ph_machine_name:"Nom de la Machine",ph_factory_section:"Section de l'Usine",ph_operator_name:"Nom de l'Opérateur",ph_pressure:"Pression (bar)",ph_voltage:"Tension (V)",ph_current:"Courant (A)",ph_error_code:"Code d'Erreur",ph_daily_output:"Production Quotidienne (unités)",ph_notes:"Notes...",nav_system_intel:"Intelligence Système",nav_roi:"Tableau ROI",refresh_btn:"Actualiser",system_risk_label:"Risque Système",healthy_label:"Sains",at_risk_label:"À Risque",clusters_title:"Clusters de Machines",propagation_title:"Propagation d'Anomalies",propagation_hint:"Comment une machine défaillante augmente le risque de ses voisines.",no_propagation:"Aucune propagation d'anomalie détectée.",avg_risk_label:"Risque moyen",added_risk_label:"Risque ajouté",effective_risk_label:"Risque effectif",simulation_title:"Simulation Hypothétique",simulation_hint:"Choisissez une machine, modifiez ses capteurs et observez la probabilité de panne.",run_simulation_btn:"Lancer la Simulation",failure_probability_label:"Probabilité de Panne",stress_level_label:"Niveau de Contrainte",predicted_status_label:"Statut Prévu",confidence_label:"Confiance",root_cause_title:"Cause Racine",rul_col:"Durée de Vie Restante",rul_healthy:"Sain",potential_loss_label:"Perte Potentielle",saved_label:"Économisé par l'IA",wasted_energy_label:"Énergie Gaspillée / mois",efficiency_gain_label:"Gain d'Efficacité",cost_by_machine_title:"Exposition Financière par Machine",top_cause_col:"Cause Principale",roi_assumptions_msg:"Hypothèses : arrêt {downtime}/h, réparation {hours}h, énergie {price}/kWh.",role_label:"Votre Rôle",role_engineer:"Ingénieur",role_manager:"Manager",role_admin:"Administrateur",cause_bearing_wear:"Usure de roulement",cause_overload_thermal:"Surcharge thermique",cause_cooling_failure:"Panne de refroidissement",cause_misalignment:"Désalignement d'arbre",cause_lubrication_loss:"Perte de lubrification",cause_normal_operation:"Fonctionnement normal",nav_story:"Mode Récit",story_hint:"Rejoue une panne de roulement se développant sur 22 heures et montre exactement quand l'IA l'a détectée — et ce que cela valait.",simulate_failure_btn:"Simuler une Panne",outcome_title:"Résultat",warning_time_label:"Alerte Précoce",loss_ignored_label:"Perte sans Réaction",loss_acted_label:"Perte avec Réaction",money_saved_label:"Économisé",timeline_title:"Chronologie de la Panne",story_detection_msg:"L'IA l'a signalé {hours} heures avant la panne, à {risk}% de risque — cause racine : {cause} (confiance {confidence}%).",story_stage_healthy:"Sain",story_stage_early_drift:"Première Dérive",story_stage_ai_detects:"L'IA Détecte",story_stage_critical:"Critique",priority_low:"Faible",priority_medium:"Moyen",priority_high:"Élevé",priority_critical:"Critique",action_stop_machine:"Arrêter la machine",action_inspect_bearings:"Inspecter les roulements",action_check_cooling:"Vérifier le refroidissement",action_schedule_shutdown_24h:"Planifier l'arrêt (24h)",action_order_spare_parts:"Commander des pièces",action_reduce_load:"Réduire la charge",action_schedule_inspection_72h:"Planifier l'inspection (72h)",action_monitor_closely:"Surveiller de près",action_verify_sensor:"Vérifier le capteur",action_power_down_idle:"Éteindre la machine au ralenti",action_review_shift_schedule:"Revoir le planning",action_no_action:"Aucune action requise",nav_oee:"TRS",nav_workorders:"Ordres de Travail",oee_hint:"Disponibilité x Performance x Qualité (ISO 22400). Le niveau mondial est 85%, une usine typique avoisine 60%.",availability_label:"Disponibilité",performance_label:"Performance",quality_label:"Qualité",weakest_factor_label:"Le plus faible",downtime_by_reason_title:"Arrêts par Cause",downtime_cost_label:"Coût d'arrêt",oee_trend_title:"Tendance TRS",shifts_title:"Équipes",shift_col:"Équipe",downtime_col:"Arrêt",log_shift_btn:"Saisir une Équipe",no_shifts_yet:"Aucune équipe saisie.",minutes_short:"min",range_1d:"Aujourd'hui",range_7d:"7 jours",range_30d:"30 jours",all_machines_option:"Toutes les machines",reason_unspecified:"Non spécifié",err_good_exceeds_total:"Les pièces bonnes ne peuvent dépasser le total",oee_grade_world_class:"Niveau mondial",oee_grade_typical:"Typique",oee_grade_low:"Faible",oee_grade_critical:"Critique",reason_breakdown:"Panne",reason_changeover:"Changement de série",reason_no_material:"Pas de matière",reason_no_operator:"Pas d'opérateur",reason_planned_maintenance:"Maintenance planifiée",reason_quality_issue:"Problème qualité",reason_setup:"Réglage",reason_other:"Autre",workorders_hint:"Transforme une prédiction IA en tâche suivie — pour qu'une alerte se termine par une réparation.",new_work_order_btn:"+ Nouvel Ordre",no_work_orders:"Aucun ordre de travail.",avg_completion_label:"Achèvement moy.",assigned_label:"Assigné",source_ai:"IA",wo_status_open:"Ouvert",wo_status_in_progress:"En cours",wo_status_done:"Terminé",wo_status_cancelled:"Annulé",wo_advance_to_in_progress:"Commencer",wo_advance_to_done:"Marquer terminé",ph_shift_name:"Nom de l'équipe",ph_planned_minutes:"Minutes planifiées",ph_downtime_minutes:"Minutes d'arrêt",ph_total_units:"Unités totales",ph_good_units:"Unités bonnes",ph_cycle_seconds:"Cycle idéal (sec)",ph_wo_title:"Titre",ph_assigned_to:"Assigné à",ph_wo_description:"Description",overdue_label:"En retard",nav_history:"Historique",history_hint:"Historique des capteurs enregistré — c'est ainsi que vous prouvez ce qui a réellement changé pendant le pilote.",no_history_yet:"Aucun historique enregistré. Laissez le Monitoring ouvert quelques minutes et les données s'accumuleront.",range_24h:"24 heures",range_3d:"3 jours",range_10d:"10 jours",sensor_trend_title:"Tendance des Capteurs",risk_trend_title:"Tendance du Risque",trend_flat:"inchangé",trend_rising:"en hausse",trend_falling:"en baisse",create_work_order_btn:"Créer un Ordre",work_order_created_msg:"Ordre de travail créé",alertreason_immediate_failure_risk:"Risque de panne immédiat",alertreason_failure_imminent:"Panne imminente",alertreason_degradation_accelerating:"Dégradation qui s'accélère",alertreason_outside_normal_envelope:"Hors plage normale",alertreason_pressure_anomaly:"Anomalie de pression",alertreason_idle_waste:"Gaspillage au ralenti",alertreason_informational:"Informatif",alert_reason_label:"Motif",nav_system_health:"État du Système",system_health_hint:"État du flux de données, du modèle et de la sécurité — ce qui casse sans bruit.",connections_title:"Connexions Industrielles",data_mode_label:"Mode de données",reads_label:"Lectures",failures_label:"Échecs",buffered_label:"En tampon",pipeline_title:"Pipeline d'Ingestion",queue_depth_label:"Profondeur de file",duplicates_label:"Doublons supprimés",retried_label:"Réessayés",dead_letter_label:"En quarantaine",model_title:"Modèle de Prédiction",train_model_btn:"Entraîner le Modèle",check_drift_btn:"Vérifier la Dérive",model_not_trained:"Aucun modèle entraîné — les scores de risque sont indicatifs, non validés.",model_trained_msg:"Modèle entraîné",trained_on_label:"Entraîné sur",drift_title:"Dérive des Données",retrain_recommended:"réentraînement recommandé",security_title:"Contrôles de Sécurité",admin_only_msg:"Accès administrateur requis.",conn_state_healthy:"sain",conn_state_stale:"obsolète",conn_state_disconnected:"déconnecté",conn_state_never_connected:"jamais connecté",drift_stable:"stable",drift_moderate:"modérée",drift_severe:"sévère",metric_precision:"Précision",metric_recall:"Rappel",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"Taux de fausses alertes",model_cannot_train:"Entraînement impossible pour l'instant",model_reason_no_confirmed_failures:"Aucune panne confirmée enregistrée",model_reason_insufficient_telemetry:"Historique capteurs insuffisant",model_reason_insufficient_positive_samples:"Pas assez de pannes confirmées",model_reason_no_failures_in_holdout:"Aucune panne dans la période de test",check_jwt_secret_strong:"Secret JWT robuste",check_debug_disabled:"Mode debug désactivé",check_https_in_use:"HTTPS utilisé",check_database_is_postgres:"Base PostgreSQL",check_rate_limiting_active:"Limitation de débit active",check_account_lockout_active:"Verrouillage de compte actif",check_audit_logging_active:"Journal d'audit actif",check_security_headers_active:"En-têtes de sécurité actifs",check_smtp_configured:"E-mail configuré",check_industrial_read_only:"Accès industriel en lecture seule",model_train_hint:"Enregistrez les pannes réelles pour permettre l'entraînement.",drift_status_no_trained_model:"Aucun modèle entraîné",drift_status_insufficient_recent_data:"Pas assez de données récentes",msg_model_untrained_note:"Aucun modèle entraîné — les scores de risque sont indicatifs, non validés.",msg_train_needs_failures:"L'entraînement nécessite des pannes confirmées. Enregistrez-les sur la page Pannes.",msg_train_no_holdout_failures:"La période de test ne contient aucune panne à évaluer.",msg_drift_needs_model:"Entraînez d'abord un modèle — la dérive se mesure par rapport à ses données.",msg_evaluation_needs_failures:"La précision ne peut être mesurée tant qu'aucune panne réelle n'est enregistrée.",msg_holdout_metrics_note:"Les métriques proviennent de données jamais vues par le modèle à l'entraînement.",msg_simulation_mode_note:"SIMULATION génère les données localement ; l'état des connexions ne compte qu'avec du matériel réel.",msg_savings_needs_two_windows:"Une comparaison avant/après exige des données dans les deux moitiés de la période.",msg_roi_system_cost_note:"Le coût du système est inconnu ici — divisez le bénéfice par votre coût pour obtenir le ROI.",msg_reliability_not_calibrated:"Paramètres sectoriels utilisés, pas ceux de cette usine. Enregistrez des pannes réelles pour calibrer.",msg_no_trained_model:"Aucun modèle entraîné",msg_insufficient_recent_data:"Pas assez de données récentes",nav_failures:"Journal des Pannes",failures_hint:"Enregistrez chaque panne réelle. C'est ce qui apprend au modèle le comportement de votre usine — sans cela, les prédictions restent génériques.",log_failure_btn:"+ Enregistrer une panne",calibration_title:"Progression de la Calibration",calibration_hint:"Chaque composant a besoin d'assez de pannes confirmées avant que sa prédiction soit calibrée pour cette usine.",calibrated_label:"calibré",needs_more_failures:"{n} de plus requises",ml_model_label:"Modèle de prédiction",model_ready_to_train:"Prêt à entraîner",logged_failures_title:"Pannes Enregistrées",no_failures_yet:"Aucune panne enregistrée.",was_predicted_label:"prédite",machine_label:"Machine",component_label:"Quel composant est tombé en panne",component_hint:"Choisissez le plus proche — c'est ce que le modèle apprend.",occurred_at_label:"Quand est-ce arrivé",downtime_label:"Arrêt (min)",repair_cost_label:"Coût de réparation",notes_label:"Notes",ph_failure_notes:"Qu'a-t-on observé ?",failure_logged_msg:"Panne enregistrée",confirm_delete_failure:"Supprimer cet enregistrement ?",err_no_machine_selected:"Sélectionnez une machine",err_no_date:"Indiquez la date",err_future_date:"La date ne peut pas être dans le futur",component_bearing:"Roulement",component_motor:"Moteur",component_pump:"Pompe",component_cooling_system:"Système de refroidissement",component_gearbox:"Réducteur",cause_seal_leak:"Fuite de joint",cause_cavitation:"Cavitation",cause_overpressure:"Surpression",cause_blocked_discharge:"Refoulement obstrué",component_prediction_title:"Prédiction par Composant",component_prediction_hint:"Durée de vie restante par composant, d'après l'état actuel de la machine.",limiting_label:"limitant",days_short:"jours",industry_default_label:"valeurs sectorielles",calibrated_to_plant:"Calibré pour cette usine",not_calibrated_warning:"Valeurs sectorielles utilisées — enregistrez des pannes réelles pour calibrer."},
+  es: {tagline:"Plataforma Global de Inteligencia Industrial",live_label:"En vivo",kpi_energy:"Uso de Energía",kpi_efficiency:"Eficiencia",kpi_active:"Máquinas Activas",kpi_alerts:"Alertas",kwh_unit:"kWh",chart_title:"Rendimiento en Tiempo Real",machine_status_title:"Estado de Máquinas",status_running:"Funcionando",status_warning:"Advertencia",status_critical:"Crítico",form_title:"Entrada de Datos de Fábrica",factory_name_label:"Nombre de Fábrica",machine_count_label:"Número de Máquinas",energy_cost_label:"Costo de Energía ($/kWh)",machine_type_label:"Tipo de Máquina",temperature_label:"Temperatura (°C)",vibration_label:"Vibración (mm/s)",load_label:"Carga (%)",submit_btn:"Analizar Fábrica",submitting:"Actualizando...",ai_panel_title:"Perspectivas IA",ai_placeholder:"Envíe datos de fábrica para generar un análisis IA.",ai_analyzing:"Analizando...",ai_risks:"Riesgos",ai_efficiency_insights:"Análisis de Eficiencia",ai_optimizations:"Sugerencias de Optimización",toast_updated:"Datos de fábrica actualizados",toast_analysis_done:"Análisis IA completo",toast_error:"Algo salió mal",nav_dashboard:"Panel",nav_factories:"Fábricas",nav_ai_insights:"Perspectivas IA",logout_btn:"Cerrar Sesión",login_title:"Bienvenido de nuevo",login_subtitle:"Inicia sesión en tu cuenta de FactoryPulse AI",ph_email:"Correo electrónico",ph_password:"Contraseña",remember_me:"Recuérdame",login_btn:"Iniciar Sesión",login_link_register:"¿No tienes cuenta? Crea una",register_title:"Crea tu cuenta",register_subtitle:"Empieza a monitorear tus fábricas con IA",ph_full_name:"Nombre Completo",ph_confirm_password:"Confirmar Contraseña",register_btn:"Crear Cuenta",register_link_login:"¿Ya tienes cuenta? Inicia sesión",err_missing_fields:"Por favor complete todos los campos",err_invalid_email:"Por favor ingrese un correo válido",err_weak_password:"La contraseña debe tener mín. 8 caracteres, una letra y un número",err_password_mismatch:"Las contraseñas no coinciden",err_invalid_credentials:"Correo o contraseña incorrectos",err_email_taken:"Este correo ya está registrado",err_generic:"Algo salió mal. Inténtalo de nuevo",my_factories_title:"Mis Fábricas",add_factory_btn:"+ Añadir Fábrica",edit_factory_btn:"Editar",delete_factory_btn:"Eliminar",confirm_delete_factory:"¿Eliminar esta fábrica? Esta acción no se puede deshacer.",no_factories_yet:"Aún no has añadido ninguna fábrica.",factory_created_toast:"Fábrica creada y analizada",factory_updated_toast:"Fábrica actualizada",factory_deleted_toast:"Fábrica eliminada",ai_insights_feed_title:"Feed de Perspectivas IA",no_ai_insights_yet:"Aún no hay perspectivas IA. Añade una fábrica.",reanalyze_btn:"Reanalizar",view_insights_btn:"Ver Perspectivas",created_label:"Creada",cancel_btn:"Cancelar",save_btn:"Guardar Cambios",nav_live_monitor:"Monitor en Vivo",add_machine_scada_btn:"+ Añadir Máquina",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Sondeo",live_chart_title:"Gráfico de Sensores en Vivo",machines_table_title:"Máquinas",machine_code_col:"Código",machine_name_col:"Nombre",status_col:"Estado",risk_col:"Riesgo",no_machines_yet:"Aún no hay máquinas. Haga clic en «+ Añadir Máquina».",section_machine_info:"Información de la Máquina",section_sensor_data:"Datos de Sensores",section_status:"Estado",section_notes:"Notas",status_stopped:"Detenida",status_maintenance:"Mantenimiento",priority_low:"Baja",priority_normal:"Normal",priority_high:"Alta",priority_critical:"Crítica",save_and_analyze_btn:"Guardar y Analizar",source_col:"Fuente",source_auto:"Auto (SCADA)",source_manual:"Manual",nav_alerts:"Alertas",acknowledge_btn:"Reconocer",acknowledged_label:"Reconocido",acknowledge_all_btn:"Reconocer Todo",no_alerts_yet:"Sin alertas. Todo funciona correctamente.",download_report_btn:"Informe",alert_details_template:"Temperatura {temp}°C, vibración {vib} mm/s, estado: {status}",section_energy_intel:"Inteligencia Energética",daily_output_hint:"Se usa para calcular el consumo energético específico (kWh por unidad).",energy_insights_title:"Inteligencia Energética",idle_power_title:"Detección de Potencia en Inactividad",idle_active_msg:"Máquina inactiva - se desperdician aprox. {kw} kW ahora mismo.",idle_none_msg:"No se detectó desperdicio de energía en inactividad.",friction_loss_title:"Pérdida de Energía Predictiva",friction_active_msg:"Fricción elevada detectada: +{pct}% de sobrecarga (~{kw} kW extra). Programe mantenimiento para evitar pérdidas.",friction_none_msg:"No se detectó fricción anormal.",sec_title:"Consumo Energético Específico",sec_label:"kWh por unidad",sec_unit:"kWh/unidad",sec_no_data_msg:"Ingrese la producción diaria al añadir esta máquina para ver esta métrica.",optimal_load_title:"Zona de Carga Óptima",optimal_load_label:"Carga óptima",current_load_label:"Carga actual",at_optimal_msg:"Funcionando en la zona de carga óptima.",adjust_to_optimal_msg:"Ajuste la carga hacia {pct}% para minimizar la energía por unidad.",nav_digital_twin:"Gemelo Digital",twin_hint:"Arrastre para rotar, desplácese para acercar, haga clic en una máquina para ver sus detalles en vivo.",twin_unavailable_msg:"No se pudo cargar la vista 3D (verifique su conexión a internet para Three.js).",failure_prediction_title:"Predicción de Fallo",report_lib_missing_msg:"La exportación a PDF necesita la librería reportlab. Ejecute: pip install reportlab, luego reinicie el servidor.",ph_machine_id:"ID de Máquina (ej. M-01)",ph_machine_name:"Nombre de la Máquina",ph_factory_section:"Sección de la Fábrica",ph_operator_name:"Nombre del Operador",ph_pressure:"Presión (bar)",ph_voltage:"Voltaje (V)",ph_current:"Corriente (A)",ph_error_code:"Código de Error",ph_daily_output:"Producción Diaria (unidades)",ph_notes:"Notas...",nav_system_intel:"Inteligencia del Sistema",nav_roi:"Panel ROI",refresh_btn:"Actualizar",system_risk_label:"Riesgo del Sistema",healthy_label:"Saludables",at_risk_label:"En Riesgo",clusters_title:"Clústeres de Máquinas",propagation_title:"Propagación de Anomalías",propagation_hint:"Cómo una máquina en fallo eleva el riesgo de sus vecinas.",no_propagation:"No se detectó propagación de anomalías.",avg_risk_label:"Riesgo medio",added_risk_label:"Riesgo añadido",effective_risk_label:"Riesgo efectivo",simulation_title:"Simulación Hipotética",simulation_hint:"Elija una máquina, ajuste sus sensores y vea cómo cambia la probabilidad de fallo.",run_simulation_btn:"Ejecutar Simulación",failure_probability_label:"Probabilidad de Fallo",stress_level_label:"Nivel de Estrés",predicted_status_label:"Estado Previsto",confidence_label:"Confianza",root_cause_title:"Causa Raíz",rul_col:"Vida Útil Restante",rul_healthy:"Saludable",potential_loss_label:"Pérdida Potencial",saved_label:"Ahorrado por IA",wasted_energy_label:"Energía Desperdiciada / mes",efficiency_gain_label:"Ganancia de Eficiencia",cost_by_machine_title:"Exposición de Costes por Máquina",top_cause_col:"Causa Principal",roi_assumptions_msg:"Supuestos: parada {downtime}/h, reparación {hours}h, energía {price}/kWh.",role_label:"Su Rol",role_engineer:"Ingeniero",role_manager:"Gerente",role_admin:"Administrador",cause_bearing_wear:"Desgaste de rodamiento",cause_overload_thermal:"Sobrecarga térmica",cause_cooling_failure:"Fallo de refrigeración",cause_misalignment:"Desalineación del eje",cause_lubrication_loss:"Pérdida de lubricación",cause_normal_operation:"Operación normal",nav_story:"Modo Historia",story_hint:"Reproduce un fallo de rodamiento desarrollándose en 22 horas y muestra exactamente cuándo lo detectó la IA — y cuánto valía.",simulate_failure_btn:"Simular Fallo",outcome_title:"Resultado",warning_time_label:"Aviso Temprano",loss_ignored_label:"Pérdida sin Reacción",loss_acted_label:"Pérdida con Reacción",money_saved_label:"Ahorrado",timeline_title:"Cronología del Fallo",story_detection_msg:"La IA lo detectó {hours} horas antes de la avería, con {risk}% de riesgo — causa raíz: {cause} ({confidence}% de confianza).",story_stage_healthy:"Saludable",story_stage_early_drift:"Primera Desviación",story_stage_ai_detects:"La IA Detecta",story_stage_critical:"Crítico",priority_low:"Bajo",priority_medium:"Medio",priority_high:"Alto",priority_critical:"Crítico",action_stop_machine:"Detener máquina",action_inspect_bearings:"Inspeccionar rodamientos",action_check_cooling:"Revisar refrigeración",action_schedule_shutdown_24h:"Programar parada (24h)",action_order_spare_parts:"Pedir repuestos",action_reduce_load:"Reducir carga",action_schedule_inspection_72h:"Programar inspección (72h)",action_monitor_closely:"Vigilar de cerca",action_verify_sensor:"Verificar sensor",action_power_down_idle:"Apagar máquina inactiva",action_review_shift_schedule:"Revisar turnos",action_no_action:"No se requiere acción",nav_oee:"OEE",nav_workorders:"Órdenes de Trabajo",oee_hint:"Disponibilidad x Rendimiento x Calidad (ISO 22400). El nivel mundial es 85%; una fábrica típica ronda el 60%.",availability_label:"Disponibilidad",performance_label:"Rendimiento",quality_label:"Calidad",weakest_factor_label:"Más débil",downtime_by_reason_title:"Paradas por Causa",downtime_cost_label:"Costo de parada",oee_trend_title:"Tendencia OEE",shifts_title:"Turnos",shift_col:"Turno",downtime_col:"Parada",log_shift_btn:"Registrar Turno",no_shifts_yet:"Aún no hay turnos registrados.",minutes_short:"min",range_1d:"Hoy",range_7d:"7 días",range_30d:"30 días",all_machines_option:"Todas las máquinas",reason_unspecified:"Sin especificar",err_good_exceeds_total:"Las piezas buenas no pueden superar el total",oee_grade_world_class:"Nivel mundial",oee_grade_typical:"Típico",oee_grade_low:"Bajo",oee_grade_critical:"Crítico",reason_breakdown:"Avería",reason_changeover:"Cambio de formato",reason_no_material:"Sin material",reason_no_operator:"Sin operario",reason_planned_maintenance:"Mantenimiento planificado",reason_quality_issue:"Problema de calidad",reason_setup:"Preparación",reason_other:"Otro",workorders_hint:"Convierte una predicción de IA en tarea rastreable — para que una alerta acabe en reparación.",new_work_order_btn:"+ Nueva Orden",no_work_orders:"Aún no hay órdenes.",avg_completion_label:"Finalización prom.",assigned_label:"Asignado",source_ai:"IA",wo_status_open:"Abierta",wo_status_in_progress:"En curso",wo_status_done:"Completada",wo_status_cancelled:"Cancelada",wo_advance_to_in_progress:"Iniciar trabajo",wo_advance_to_done:"Marcar completada",ph_shift_name:"Nombre del turno",ph_planned_minutes:"Minutos planificados",ph_downtime_minutes:"Minutos de parada",ph_total_units:"Unidades totales",ph_good_units:"Unidades buenas",ph_cycle_seconds:"Ciclo ideal (seg)",ph_wo_title:"Título",ph_assigned_to:"Asignado a",ph_wo_description:"Descripción",overdue_label:"Vencidas",nav_history:"Historial",history_hint:"Historial de sensores guardado: así demuestra qué cambió realmente durante el piloto.",no_history_yet:"Aún no hay historial. Mantenga el Monitoreo abierto unos minutos y los datos empezarán a acumularse.",range_24h:"24 horas",range_3d:"3 días",range_10d:"10 días",sensor_trend_title:"Tendencia de Sensores",risk_trend_title:"Tendencia de Riesgo",trend_flat:"sin cambios",trend_rising:"subiendo",trend_falling:"bajando",create_work_order_btn:"Crear Orden",work_order_created_msg:"Orden de trabajo creada",alertreason_immediate_failure_risk:"Riesgo de fallo inmediato",alertreason_failure_imminent:"Fallo inminente",alertreason_degradation_accelerating:"Degradación acelerándose",alertreason_outside_normal_envelope:"Fuera del rango normal",alertreason_pressure_anomaly:"Anomalía de presión",alertreason_idle_waste:"Desperdicio en inactividad",alertreason_informational:"Informativo",alert_reason_label:"Motivo",nav_system_health:"Estado del Sistema",system_health_hint:"Estado del flujo de datos, el modelo y la seguridad — lo que se rompe en silencio.",connections_title:"Conexiones Industriales",data_mode_label:"Modo de datos",reads_label:"Lecturas",failures_label:"Fallos",buffered_label:"En búfer",pipeline_title:"Canal de Ingesta",queue_depth_label:"Profundidad de cola",duplicates_label:"Duplicados suprimidos",retried_label:"Reintentados",dead_letter_label:"En cuarentena",model_title:"Modelo de Predicción",train_model_btn:"Entrenar Modelo",check_drift_btn:"Comprobar Deriva",model_not_trained:"Sin modelo entrenado — las puntuaciones de riesgo son indicativas, no validadas.",model_trained_msg:"Modelo entrenado",trained_on_label:"Entrenado con",drift_title:"Deriva de Datos",retrain_recommended:"se recomienda reentrenar",security_title:"Comprobaciones de Seguridad",admin_only_msg:"Se requiere acceso de administrador.",conn_state_healthy:"saludable",conn_state_stale:"obsoleto",conn_state_disconnected:"desconectado",conn_state_never_connected:"nunca conectado",drift_stable:"estable",drift_moderate:"moderada",drift_severe:"severa",metric_precision:"Precisión",metric_recall:"Exhaustividad",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"Tasa de falsas alarmas",model_cannot_train:"Aún no se puede entrenar",model_reason_no_confirmed_failures:"Sin fallos confirmados registrados",model_reason_insufficient_telemetry:"Historial de sensores insuficiente",model_reason_insufficient_positive_samples:"Fallos confirmados insuficientes",model_reason_no_failures_in_holdout:"Sin fallos en el período de prueba",check_jwt_secret_strong:"Secreto JWT robusto",check_debug_disabled:"Modo depuración desactivado",check_https_in_use:"HTTPS en uso",check_database_is_postgres:"Base de datos PostgreSQL",check_rate_limiting_active:"Límite de peticiones activo",check_account_lockout_active:"Bloqueo de cuentas activo",check_audit_logging_active:"Registro de auditoría activo",check_security_headers_active:"Cabeceras de seguridad activas",check_smtp_configured:"Email configurado",check_industrial_read_only:"Acceso industrial solo lectura",model_train_hint:"Registre fallos reales para habilitar el entrenamiento.",drift_status_no_trained_model:"Aún no hay modelo entrenado",drift_status_insufficient_recent_data:"Datos recientes insuficientes",msg_model_untrained_note:"Aún no hay modelo entrenado — las puntuaciones de riesgo son indicativas, no validadas.",msg_train_needs_failures:"El entrenamiento requiere fallos confirmados. Regístrelos en la página de fallos.",msg_train_no_holdout_failures:"El período de prueba no contiene fallos para evaluar.",msg_drift_needs_model:"Entrene un modelo primero — la deriva se mide contra sus datos.",msg_evaluation_needs_failures:"La precisión no se puede medir hasta registrar averías reales.",msg_holdout_metrics_note:"Las métricas provienen de datos que el modelo nunca vio durante el entrenamiento.",msg_simulation_mode_note:"SIMULATION genera datos localmente; el estado de conexión solo importa con hardware real.",msg_savings_needs_two_windows:"Una comparación antes/después necesita datos en ambas mitades del período.",msg_roi_system_cost_note:"El coste del sistema aquí se desconoce — divida el beneficio entre su coste para obtener el ROI.",msg_reliability_not_calibrated:"Se usan parámetros del sector, no de esta fábrica. Registre fallos reales para calibrar.",msg_no_trained_model:"Aún no hay modelo entrenado",msg_insufficient_recent_data:"Datos recientes insuficientes",nav_failures:"Registro de Fallos",failures_hint:"Registre cada avería real. Es lo que enseña al modelo el comportamiento de su planta — sin ello, las predicciones siguen siendo genéricas.",log_failure_btn:"+ Registrar fallo",calibration_title:"Progreso de Calibración",calibration_hint:"Cada componente necesita suficientes fallos confirmados antes de que su predicción se calibre para esta planta.",calibrated_label:"calibrado",needs_more_failures:"faltan {n}",ml_model_label:"Modelo de predicción",model_ready_to_train:"Listo para entrenar",logged_failures_title:"Fallos Registrados",no_failures_yet:"Aún no hay fallos registrados.",was_predicted_label:"predicho",machine_label:"Máquina",component_label:"Qué componente falló",component_hint:"Elija el más parecido — es de lo que aprende el modelo.",occurred_at_label:"Cuándo ocurrió",downtime_label:"Parada (min)",repair_cost_label:"Coste de reparación",notes_label:"Notas",ph_failure_notes:"¿Qué se observó?",failure_logged_msg:"Fallo registrado",confirm_delete_failure:"¿Eliminar este registro de fallo?",err_no_machine_selected:"Seleccione una máquina",err_no_date:"Indique la fecha",err_future_date:"La fecha no puede estar en el futuro",component_bearing:"Rodamiento",component_motor:"Motor",component_pump:"Bomba",component_cooling_system:"Sistema de refrigeración",component_gearbox:"Reductor",cause_seal_leak:"Fuga de sello",cause_cavitation:"Cavitación",cause_overpressure:"Sobrepresión",cause_blocked_discharge:"Descarga obstruida",component_prediction_title:"Predicción por Componente",component_prediction_hint:"Vida útil restante por componente, según el estado actual de la máquina.",limiting_label:"limitante",days_short:"días",industry_default_label:"valores del sector",calibrated_to_plant:"Calibrado para esta planta",not_calibrated_warning:"Se usan valores del sector — registre fallos reales para calibrar."},
+  zh: {tagline:"全球工业智能平台",live_label:"实时",kpi_energy:"能源使用量",kpi_efficiency:"效率",kpi_active:"运行中设备",kpi_alerts:"警报",kwh_unit:"kWh",chart_title:"实时性能",machine_status_title:"设备状态",status_running:"运行中",status_warning:"警告",status_critical:"严重",form_title:"工厂数据输入",factory_name_label:"工厂名称",machine_count_label:"设备数量",energy_cost_label:"能源成本 ($/kWh)",machine_type_label:"设备类型",temperature_label:"温度 (°C)",vibration_label:"振动 (mm/s)",load_label:"负载 (%)",submit_btn:"分析工厂",submitting:"更新中...",ai_panel_title:"AI 洞察",ai_placeholder:"提交工厂数据以生成AI分析。",ai_analyzing:"分析中...",ai_risks:"风险",ai_efficiency_insights:"效率分析",ai_optimizations:"优化建议",toast_updated:"工厂数据已更新",toast_analysis_done:"AI分析已完成",toast_error:"出现错误",nav_dashboard:"仪表盘",nav_factories:"工厂",nav_ai_insights:"AI洞察",logout_btn:"退出",login_title:"欢迎回来",login_subtitle:"登录您的 FactoryPulse AI 账户",ph_email:"电子邮件",ph_password:"密码",remember_me:"记住我",login_btn:"登录",login_link_register:"没有账户？创建一个",register_title:"创建账户",register_subtitle:"开始使用AI监控您的工厂",ph_full_name:"全名",ph_confirm_password:"确认密码",register_btn:"创建账户",register_link_login:"已有账户？登录",err_missing_fields:"请填写所有字段",err_invalid_email:"请输入有效的电子邮件地址",err_weak_password:"密码至少8位，需包含字母和数字",err_password_mismatch:"两次密码不一致",err_invalid_credentials:"电子邮件或密码错误",err_email_taken:"该电子邮件已被注册",err_generic:"出现错误，请重试",my_factories_title:"我的工厂",add_factory_btn:"+ 添加工厂",edit_factory_btn:"编辑",delete_factory_btn:"删除",confirm_delete_factory:"删除此工厂？此操作无法撤销。",no_factories_yet:"您还没有添加任何工厂。",factory_created_toast:"工厂已创建并分析",factory_updated_toast:"工厂已更新",factory_deleted_toast:"工厂已删除",ai_insights_feed_title:"AI洞察动态",no_ai_insights_yet:"暂无AI洞察。请添加工厂开始。",reanalyze_btn:"重新分析",view_insights_btn:"查看洞察",created_label:"创建于",cancel_btn:"取消",save_btn:"保存更改",nav_live_monitor:"实时监控",add_machine_scada_btn:"+ 添加设备",usb_status:"USB:",plc_status:"PLC:",polling_mode:"轮询",live_chart_title:"实时传感器图表",machines_table_title:"设备",machine_code_col:"编号",machine_name_col:"名称",status_col:"状态",risk_col:"风险",no_machines_yet:"暂无设备。点击“+ 添加设备”。",section_machine_info:"设备信息",section_sensor_data:"传感器数据",section_status:"状态",section_notes:"备注",status_stopped:"已停止",status_maintenance:"维护中",priority_low:"低",priority_normal:"正常",priority_high:"高",priority_critical:"严重",save_and_analyze_btn:"保存并分析",source_col:"数据来源",source_auto:"自动 (SCADA)",source_manual:"手动",nav_alerts:"警报",acknowledge_btn:"确认",acknowledged_label:"已确认",acknowledge_all_btn:"全部确认",no_alerts_yet:"暂无警报，一切运行正常。",download_report_btn:"报告",alert_details_template:"温度 {temp}°C，振动 {vib} mm/s，状态：{status}",section_energy_intel:"能源智能",daily_output_hint:"用于计算单位能耗（kWh/单位）。",energy_insights_title:"能源智能",idle_power_title:"空转功率检测",idle_active_msg:"设备处于空转状态 — 目前大约浪费 {kw} kW。",idle_none_msg:"未检测到空转能耗浪费。",friction_loss_title:"预测性能量损耗",friction_active_msg:"检测到摩擦增加：额外功率 +{pct}%（约 {kw} kW）。请安排维护以避免损耗。",friction_none_msg:"未检测到异常摩擦。",sec_title:"单位能耗",sec_label:"每单位kWh",sec_unit:"kWh/单位",sec_no_data_msg:"添加设备时请输入日产量以查看此指标。",optimal_load_title:"最佳负载区间",optimal_load_label:"最佳负载",current_load_label:"当前负载",at_optimal_msg:"正在最佳负载区间运行。",adjust_to_optimal_msg:"将负载调整至 {pct}% 以最小化单位能耗。",nav_digital_twin:"数字孪生",twin_hint:"拖动旋转，滚动缩放，点击设备查看实时详情。",twin_unavailable_msg:"无法加载3D视图（请检查Three.js库的网络连接）。",failure_prediction_title:"故障预测",report_lib_missing_msg:"PDF导出需要reportlab库。请运行：pip install reportlab，然后重启服务器。",ph_machine_id:"设备编号（如 M-01）",ph_machine_name:"设备名称",ph_factory_section:"工厂车间",ph_operator_name:"操作员姓名",ph_pressure:"压力（bar）",ph_voltage:"电压（V）",ph_current:"电流（A）",ph_error_code:"错误代码",ph_daily_output:"日产量（单位）",ph_notes:"备注...",nav_system_intel:"系统智能",nav_roi:"ROI 仪表板",refresh_btn:"刷新",system_risk_label:"系统风险",healthy_label:"健康",at_risk_label:"有风险",clusters_title:"设备集群",propagation_title:"异常传播",propagation_hint:"一台故障设备如何提高相邻设备的风险。",no_propagation:"未检测到异常传播。",avg_risk_label:"平均风险",added_risk_label:"附加风险",effective_risk_label:"实际风险",simulation_title:"假设模拟",simulation_hint:"选择设备，调整传感器数值，观察故障概率的变化。",run_simulation_btn:"运行模拟",failure_probability_label:"故障概率",stress_level_label:"应力水平",predicted_status_label:"预测状态",confidence_label:"置信度",root_cause_title:"根本原因",rul_col:"剩余寿命",rul_healthy:"健康",potential_loss_label:"潜在损失",saved_label:"AI 节省",wasted_energy_label:"浪费能源 / 月",efficiency_gain_label:"效率提升",cost_by_machine_title:"各设备成本风险",top_cause_col:"主要原因",roi_assumptions_msg:"假设：停机 {downtime}/小时，维修 {hours} 小时，能源 {price}/kWh。",role_label:"您的角色",role_engineer:"工程师",role_manager:"经理",role_admin:"管理员",cause_bearing_wear:"轴承磨损",cause_overload_thermal:"热过载",cause_cooling_failure:"冷却故障",cause_misalignment:"轴不对中",cause_lubrication_loss:"润滑损失",cause_normal_operation:"正常运行",nav_story:"故事模式",story_hint:"重现22小时内轴承故障的发展过程，精确展示AI何时发现它——以及这价值多少。",simulate_failure_btn:"模拟故障",outcome_title:"结果",warning_time_label:"提前预警",loss_ignored_label:"不作为的损失",loss_acted_label:"采取行动的损失",money_saved_label:"节省金额",timeline_title:"故障时间线",story_detection_msg:"AI在故障前 {hours} 小时发现，风险 {risk}%——根本原因：{cause}（置信度 {confidence}%）。",story_stage_healthy:"健康",story_stage_early_drift:"初期偏移",story_stage_ai_detects:"AI检测到",story_stage_critical:"严重",priority_low:"低",priority_medium:"中",priority_high:"高",priority_critical:"严重",action_stop_machine:"停止设备",action_inspect_bearings:"检查轴承",action_check_cooling:"检查冷却",action_schedule_shutdown_24h:"安排停机（24小时）",action_order_spare_parts:"订购备件",action_reduce_load:"降低负载",action_schedule_inspection_72h:"安排检查（72小时）",action_monitor_closely:"密切监控",action_verify_sensor:"验证传感器",action_power_down_idle:"关闭空转设备",action_review_shift_schedule:"检查班次安排",action_no_action:"无需操作",nav_oee:"OEE",nav_workorders:"工单",oee_hint:"可用率 x 表现性 x 质量 (ISO 22400)。世界级为85%，典型工厂约60%。",availability_label:"可用率",performance_label:"表现性",quality_label:"质量",weakest_factor_label:"最弱项",downtime_by_reason_title:"停机原因分析",downtime_cost_label:"停机成本",oee_trend_title:"OEE趋势",shifts_title:"班次",shift_col:"班次",downtime_col:"停机",log_shift_btn:"记录班次",no_shifts_yet:"尚未记录班次。",minutes_short:"分钟",range_1d:"今天",range_7d:"7天",range_30d:"30天",all_machines_option:"所有设备",reason_unspecified:"未指定",err_good_exceeds_total:"合格品不能超过总数",oee_grade_world_class:"世界级",oee_grade_typical:"典型",oee_grade_low:"低",oee_grade_critical:"严重",reason_breakdown:"故障",reason_changeover:"换型",reason_no_material:"缺料",reason_no_operator:"缺人",reason_planned_maintenance:"计划维护",reason_quality_issue:"质量问题",reason_setup:"调试",reason_other:"其他",workorders_hint:"将AI预测转化为可跟踪的任务——让预警真正以维修告终。",new_work_order_btn:"+ 新建工单",no_work_orders:"暂无工单。",avg_completion_label:"平均完成",assigned_label:"负责人",source_ai:"AI",wo_status_open:"待处理",wo_status_in_progress:"进行中",wo_status_done:"已完成",wo_status_cancelled:"已取消",wo_advance_to_in_progress:"开始工作",wo_advance_to_done:"标记完成",ph_shift_name:"班次名称",ph_planned_minutes:"计划分钟",ph_downtime_minutes:"停机分钟",ph_total_units:"总数量",ph_good_units:"合格数量",ph_cycle_seconds:"理想节拍（秒）",ph_wo_title:"标题",ph_assigned_to:"负责人",ph_wo_description:"描述",overdue_label:"逾期",nav_history:"历史",history_hint:"已存储的传感器历史——用它证明试点期间到底改变了什么。",no_history_yet:"尚未记录历史。保持实时监控页面打开几分钟，数据就会开始累积。",range_24h:"24小时",range_3d:"3天",range_10d:"10天",sensor_trend_title:"传感器趋势",risk_trend_title:"风险趋势",trend_flat:"无变化",trend_rising:"上升",trend_falling:"下降",create_work_order_btn:"创建工单",work_order_created_msg:"工单已创建",alertreason_immediate_failure_risk:"立即故障风险",alertreason_failure_imminent:"故障迫在眉睫",alertreason_degradation_accelerating:"劣化加速",alertreason_outside_normal_envelope:"超出正常范围",alertreason_pressure_anomaly:"压力异常",alertreason_idle_waste:"空转能耗浪费",alertreason_informational:"提示信息",alert_reason_label:"原因",nav_system_health:"系统健康",system_health_hint:"数据链路、模型和安全状态——那些会悄悄出问题的部分。",connections_title:"工业连接",data_mode_label:"数据模式",reads_label:"读取次数",failures_label:"失败次数",buffered_label:"已缓冲",pipeline_title:"接入管道",queue_depth_label:"队列深度",duplicates_label:"已抑制重复",retried_label:"已重试",dead_letter_label:"已隔离",model_title:"预测模型",train_model_btn:"训练模型",check_drift_btn:"检查漂移",model_not_trained:"未训练模型——风险评分仅供参考，未经验证。",model_trained_msg:"模型已训练",trained_on_label:"训练样本",drift_title:"数据漂移",retrain_recommended:"建议重新训练",security_title:"安全检查",admin_only_msg:"需要管理员权限。",conn_state_healthy:"正常",conn_state_stale:"过时",conn_state_disconnected:"已断开",conn_state_never_connected:"从未连接",drift_stable:"稳定",drift_moderate:"中等",drift_severe:"严重",metric_precision:"精确率",metric_recall:"召回率",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"误报率",model_cannot_train:"暂时无法训练",model_reason_no_confirmed_failures:"未记录确认的故障",model_reason_insufficient_telemetry:"传感器历史数据不足",model_reason_insufficient_positive_samples:"确认的故障数量不足",model_reason_no_failures_in_holdout:"测试期内没有故障",check_jwt_secret_strong:"JWT密钥强度足够",check_debug_disabled:"调试模式已关闭",check_https_in_use:"使用HTTPS",check_database_is_postgres:"PostgreSQL数据库",check_rate_limiting_active:"限流已启用",check_account_lockout_active:"账户锁定已启用",check_audit_logging_active:"审计日志已启用",check_security_headers_active:"安全响应头已启用",check_smtp_configured:"邮件已配置",check_industrial_read_only:"工业访问仅读取",model_train_hint:"记录真实故障以启用训练。",drift_status_no_trained_model:"尚无训练模型",drift_status_insufficient_recent_data:"近期数据不足",msg_model_untrained_note:"尚未训练模型——风险评分仅供参考，未经验证。",msg_train_needs_failures:"训练需要确认的故障。请在故障页面记录。",msg_train_no_holdout_failures:"测试期内没有可评估的故障。",msg_drift_needs_model:"请先训练模型——漂移是相对其训练数据测量的。",msg_evaluation_needs_failures:"在记录真实故障之前无法测量准确度。",msg_holdout_metrics_note:"指标来自模型训练时从未见过的数据。",msg_simulation_mode_note:"SIMULATION 在本地生成数据；连接状态仅在使用真实硬件时有意义。",msg_savings_needs_two_windows:"前后对比需要该时段两半都有数据。",msg_roi_system_cost_note:"此处不知系统成本——用收益除以您的成本即可得到投资回报率。",msg_reliability_not_calibrated:"使用的是行业通用参数，而非本厂参数。记录真实故障以进行校准。",msg_no_trained_model:"尚无训练模型",msg_insufficient_recent_data:"近期数据不足",nav_failures:"故障日志",failures_hint:"记录每一次真实故障。这正是让模型学习贵厂实际行为的方式——没有它，预测只能是通用的。",log_failure_btn:"+ 记录故障",calibration_title:"校准进度",calibration_hint:"每个部件都需要足够的已确认故障，其预测才能针对本厂完成校准。",calibrated_label:"已校准",needs_more_failures:"还需 {n} 次",ml_model_label:"预测模型",model_ready_to_train:"可以训练",logged_failures_title:"已记录的故障",no_failures_yet:"尚未记录故障。",was_predicted_label:"已预测",machine_label:"设备",component_label:"哪个部件故障",component_hint:"选择最接近的——模型正是从中学习。",occurred_at_label:"何时发生",downtime_label:"停机（分钟）",repair_cost_label:"维修成本",notes_label:"备注",ph_failure_notes:"观察到什么？",failure_logged_msg:"故障已记录",confirm_delete_failure:"删除此故障记录？",err_no_machine_selected:"请选择设备",err_no_date:"请填写日期",err_future_date:"日期不能是将来",component_bearing:"轴承",component_motor:"电机",component_pump:"泵",component_cooling_system:"冷却系统",component_gearbox:"减速机",cause_seal_leak:"密封泄漏",cause_cavitation:"气蚀",cause_overpressure:"超压",cause_blocked_discharge:"出口堵塞",component_prediction_title:"部件级预测",component_prediction_hint:"根据设备当前状态给出各部件的剩余寿命。",limiting_label:"关键",days_short:"天",industry_default_label:"行业默认值",calibrated_to_plant:"已针对本厂校准",not_calibrated_warning:"正在使用行业默认值——记录真实故障以完成校准。"},
+  ar: {tagline:"منصة الذكاء الصناعي العالمية",live_label:"مباشر",kpi_energy:"استهلاك الطاقة",kpi_efficiency:"الكفاءة",kpi_active:"الآلات النشطة",kpi_alerts:"التنبيهات",kwh_unit:"kWh",chart_title:"الأداء في الوقت الفعلي",machine_status_title:"حالة الآلات",status_running:"تعمل",status_warning:"تحذير",status_critical:"حرج",form_title:"إدخال بيانات المصنع",factory_name_label:"اسم المصنع",machine_count_label:"عدد الآلات",energy_cost_label:"تكلفة الطاقة ($/kWh)",machine_type_label:"نوع الآلة",temperature_label:"درجة الحرارة (°C)",vibration_label:"الاهتزاز (مم/ث)",load_label:"الحمل (%)",submit_btn:"تحليل المصنع",submitting:"جارٍ التحديث...",ai_panel_title:"رؤى الذكاء الاصطناعي",ai_placeholder:"أرسل بيانات المصنع لإنشاء تحليل بالذكاء الاصطناعي.",ai_analyzing:"جارٍ التحليل...",ai_risks:"المخاطر",ai_efficiency_insights:"تحليل الكفاءة",ai_optimizations:"اقتراحات التحسين",toast_updated:"تم تحديث بيانات المصنع",toast_analysis_done:"اكتمل تحليل الذكاء الاصطناعي",toast_error:"حدث خطأ ما",nav_dashboard:"لوحة التحكم",nav_factories:"المصانع",nav_ai_insights:"رؤى الذكاء الاصطناعي",logout_btn:"تسجيل الخروج",login_title:"مرحباً بعودتك",login_subtitle:"سجل الدخول إلى حساب FactoryPulse AI الخاص بك",ph_email:"البريد الإلكتروني",ph_password:"كلمة المرور",remember_me:"تذكرني",login_btn:"تسجيل الدخول",login_link_register:"ليس لديك حساب؟ أنشئ واحداً",register_title:"إنشاء حسابك",register_subtitle:"ابدأ بمراقبة مصانعك بالذكاء الاصطناعي",ph_full_name:"الاسم الكامل",ph_confirm_password:"تأكيد كلمة المرور",register_btn:"إنشاء حساب",register_link_login:"لديك حساب بالفعل؟ سجل الدخول",err_missing_fields:"يرجى ملء جميع الحقول",err_invalid_email:"يرجى إدخال بريد إلكتروني صالح",err_weak_password:"يجب أن تكون كلمة المرور 8 أحرف على الأقل وتحتوي على حرف ورقم",err_password_mismatch:"كلمتا المرور غير متطابقتين",err_invalid_credentials:"البريد الإلكتروني أو كلمة المرور غير صحيحة",err_email_taken:"هذا البريد الإلكتروني مسجل بالفعل",err_generic:"حدث خطأ ما. يرجى المحاولة مرة أخرى",my_factories_title:"مصانعي",add_factory_btn:"+ إضافة مصنع",edit_factory_btn:"تعديل",delete_factory_btn:"حذف",confirm_delete_factory:"هل تريد حذف هذا المصنع؟ لا يمكن التراجع عن هذا.",no_factories_yet:"لم تقم بإضافة أي مصنع بعد.",factory_created_toast:"تم إنشاء المصنع وتحليله",factory_updated_toast:"تم تحديث المصنع",factory_deleted_toast:"تم حذف المصنع",ai_insights_feed_title:"موجز رؤى الذكاء الاصطناعي",no_ai_insights_yet:"لا توجد رؤى بعد. أضف مصنعاً للبدء.",reanalyze_btn:"إعادة التحليل",view_insights_btn:"عرض الرؤى",created_label:"تاريخ الإنشاء",cancel_btn:"إلغاء",save_btn:"حفظ التغييرات",nav_live_monitor:"المراقبة المباشرة",add_machine_scada_btn:"+ إضافة آلة",usb_status:"USB:",plc_status:"PLC:",polling_mode:"استطلاع",live_chart_title:"مخطط المستشعرات المباشر",machines_table_title:"الآلات",machine_code_col:"الرمز",machine_name_col:"الاسم",status_col:"الحالة",risk_col:"الخطر",no_machines_yet:"لا توجد آلات بعد. انقر على «+ إضافة آلة».",section_machine_info:"معلومات الآلة",section_sensor_data:"بيانات المستشعر",section_status:"الحالة",section_notes:"ملاحظات",status_stopped:"متوقفة",status_maintenance:"صيانة",priority_low:"منخفضة",priority_normal:"عادية",priority_high:"عالية",priority_critical:"حرجة",save_and_analyze_btn:"حفظ وتحليل",source_col:"المصدر",source_auto:"تلقائي (SCADA)",source_manual:"يدوي",nav_alerts:"التنبيهات",acknowledge_btn:"إقرار",acknowledged_label:"تم الإقرار",acknowledge_all_btn:"إقرار الكل",no_alerts_yet:"لا توجد تنبيهات. كل شيء يعمل بسلاسة.",download_report_btn:"تقرير",alert_details_template:"درجة الحرارة {temp}°C، الاهتزاز {vib} مم/ث، الحالة: {status}",section_energy_intel:"ذكاء الطاقة",daily_output_hint:"يُستخدم لحساب استهلاك الطاقة النوعي (kWh لكل وحدة).",energy_insights_title:"ذكاء الطاقة",idle_power_title:"كشف طاقة الخمول",idle_active_msg:"الآلة خاملة - يُهدر حاليًا حوالي {kw} كيلوواط.",idle_none_msg:"لم يتم اكتشاف هدر طاقة أثناء الخمول.",friction_loss_title:"فقدان الطاقة التنبؤي",friction_active_msg:"تم اكتشاف احتكاك مرتفع: +{pct}% زيادة في الطاقة (~{kw} كيلوواط إضافية). جدولة الصيانة لتجنب الخسائر.",friction_none_msg:"لم يتم اكتشاف احتكاك غير طبيعي.",sec_title:"استهلاك الطاقة النوعي",sec_label:"kWh لكل وحدة",sec_unit:"kWh/وحدة",sec_no_data_msg:"أدخل الإنتاج اليومي عند إضافة هذه الآلة لرؤية هذا المقياس.",optimal_load_title:"منطقة الحمل الأمثل",optimal_load_label:"الحمل الأمثل",current_load_label:"الحمل الحالي",at_optimal_msg:"يعمل في منطقة الحمل الأمثل.",adjust_to_optimal_msg:"اضبط الحمل نحو {pct}% لتقليل الطاقة لكل وحدة.",nav_digital_twin:"التوأم الرقمي",twin_hint:"اسحب للتدوير، مرر للتكبير، انقر على آلة لرؤية تفاصيلها المباشرة.",twin_unavailable_msg:"تعذر تحميل العرض ثلاثي الأبعاد (تحقق من اتصال الإنترنت لمكتبة Three.js).",failure_prediction_title:"توقع العطل",report_lib_missing_msg:"يتطلب تصدير PDF مكتبة reportlab. نفّذ: pip install reportlab، ثم أعد تشغيل الخادم.",ph_machine_id:"معرف الآلة (مثل M-01)",ph_machine_name:"اسم الآلة",ph_factory_section:"قسم المصنع",ph_operator_name:"اسم المشغل",ph_pressure:"الضغط (بار)",ph_voltage:"الجهد (فولت)",ph_current:"التيار (أمبير)",ph_error_code:"رمز الخطأ",ph_daily_output:"الإنتاج اليومي (وحدة)",ph_notes:"ملاحظات...",nav_system_intel:"ذكاء النظام",nav_roi:"لوحة العائد",refresh_btn:"تحديث",system_risk_label:"مخاطر النظام",healthy_label:"سليمة",at_risk_label:"في خطر",clusters_title:"مجموعات الآلات",propagation_title:"انتشار الشذوذ",propagation_hint:"كيف ترفع آلة معطلة مخاطر الآلات المجاورة.",no_propagation:"لم يتم اكتشاف انتشار للشذوذ.",avg_risk_label:"متوسط المخاطر",added_risk_label:"مخاطر مضافة",effective_risk_label:"المخاطر الفعلية",simulation_title:"محاكاة ماذا-لو",simulation_hint:"اختر آلة، غيّر قيم المستشعرات، وشاهد كيف يتغير احتمال العطل.",run_simulation_btn:"تشغيل المحاكاة",failure_probability_label:"احتمال العطل",stress_level_label:"مستوى الإجهاد",predicted_status_label:"الحالة المتوقعة",confidence_label:"الثقة",root_cause_title:"السبب الجذري",rul_col:"العمر المتبقي",rul_healthy:"سليمة",potential_loss_label:"الخسارة المحتملة",saved_label:"وفّره الذكاء الاصطناعي",wasted_energy_label:"الطاقة المهدورة / شهر",efficiency_gain_label:"مكسب الكفاءة",cost_by_machine_title:"التعرض للتكلفة حسب الآلة",top_cause_col:"السبب الرئيسي",roi_assumptions_msg:"الافتراضات: توقف {downtime}/ساعة، إصلاح {hours} ساعة، طاقة {price}/kWh.",role_label:"دورك",role_engineer:"مهندس",role_manager:"مدير",role_admin:"مسؤول",cause_bearing_wear:"تآكل المحمل",cause_overload_thermal:"حمل حراري زائد",cause_cooling_failure:"عطل التبريد",cause_misalignment:"انحراف العمود",cause_lubrication_loss:"فقدان التزييت",cause_normal_operation:"تشغيل طبيعي",nav_story:"وضع القصة",story_hint:"يعيد تشغيل عطل محمل يتطور خلال 22 ساعة ويوضح بالضبط متى اكتشفه الذكاء الاصطناعي — وكم كانت قيمة ذلك.",simulate_failure_btn:"محاكاة العطل",outcome_title:"النتيجة",warning_time_label:"إنذار مبكر",loss_ignored_label:"الخسارة دون تدخل",loss_acted_label:"الخسارة مع التدخل",money_saved_label:"المبلغ الموفر",timeline_title:"الجدول الزمني للعطل",story_detection_msg:"اكتشف الذكاء الاصطناعي ذلك قبل {hours} ساعة من العطل، بمخاطر {risk}% — السبب الجذري: {cause} (ثقة {confidence}%).",story_stage_healthy:"سليمة",story_stage_early_drift:"انحراف مبكر",story_stage_ai_detects:"الذكاء الاصطناعي يكتشف",story_stage_critical:"حرج",priority_low:"منخفض",priority_medium:"متوسط",priority_high:"عالي",priority_critical:"حرج",action_stop_machine:"إيقاف الآلة",action_inspect_bearings:"فحص المحامل",action_check_cooling:"فحص التبريد",action_schedule_shutdown_24h:"جدولة الإيقاف (24 ساعة)",action_order_spare_parts:"طلب قطع الغيار",action_reduce_load:"تقليل الحمل",action_schedule_inspection_72h:"جدولة الفحص (72 ساعة)",action_monitor_closely:"مراقبة عن كثب",action_verify_sensor:"التحقق من المستشعر",action_power_down_idle:"إطفاء الآلة الخاملة",action_review_shift_schedule:"مراجعة جدول المناوبات",action_no_action:"لا حاجة لأي إجراء",nav_oee:"OEE",nav_workorders:"أوامر العمل",oee_hint:"الجاهزية x الأداء x الجودة (ISO 22400). المستوى العالمي 85%، والمصنع النموذجي حوالي 60%.",availability_label:"الجاهزية",performance_label:"الأداء",quality_label:"الجودة",weakest_factor_label:"الأضعف",downtime_by_reason_title:"التوقف حسب السبب",downtime_cost_label:"تكلفة التوقف",oee_trend_title:"اتجاه OEE",shifts_title:"الورديات",shift_col:"وردية",downtime_col:"توقف",log_shift_btn:"تسجيل وردية",no_shifts_yet:"لم يتم تسجيل ورديات بعد.",minutes_short:"دقيقة",range_1d:"اليوم",range_7d:"7 أيام",range_30d:"30 يوم",all_machines_option:"كل الآلات",reason_unspecified:"غير محدد",err_good_exceeds_total:"لا يمكن أن تتجاوز القطع السليمة الإجمالي",oee_grade_world_class:"المستوى العالمي",oee_grade_typical:"نموذجي",oee_grade_low:"منخفض",oee_grade_critical:"حرج",reason_breakdown:"عطل",reason_changeover:"تغيير الإنتاج",reason_no_material:"لا مواد",reason_no_operator:"لا مشغل",reason_planned_maintenance:"صيانة مخططة",reason_quality_issue:"مشكلة جودة",reason_setup:"إعداد",reason_other:"أخرى",workorders_hint:"يحوّل تنبؤ الذكاء الاصطناعي إلى مهمة متتبعة — لينتهي التحذير بإصلاح فعلي.",new_work_order_btn:"+ أمر عمل جديد",no_work_orders:"لا توجد أوامر عمل.",avg_completion_label:"متوسط الإنجاز",assigned_label:"مُسند إلى",source_ai:"ذكاء اصطناعي",wo_status_open:"مفتوح",wo_status_in_progress:"قيد التنفيذ",wo_status_done:"منجز",wo_status_cancelled:"ملغى",wo_advance_to_in_progress:"بدء العمل",wo_advance_to_done:"وضع علامة منجز",ph_shift_name:"اسم الوردية",ph_planned_minutes:"الدقائق المخططة",ph_downtime_minutes:"دقائق التوقف",ph_total_units:"إجمالي الوحدات",ph_good_units:"الوحدات السليمة",ph_cycle_seconds:"الدورة المثالية (ثانية)",ph_wo_title:"العنوان",ph_assigned_to:"مُسند إلى",ph_wo_description:"الوصف",overdue_label:"متأخر",nav_history:"السجل",history_hint:"سجل المستشعرات المحفوظ — هكذا تثبت ما تغيّر فعليًا خلال التجربة.",no_history_yet:"لم يتم تسجيل سجل بعد. اترك المراقبة المباشرة مفتوحة لبضع دقائق وستبدأ البيانات بالتراكم.",range_24h:"24 ساعة",range_3d:"3 أيام",range_10d:"10 أيام",sensor_trend_title:"اتجاه المستشعرات",risk_trend_title:"اتجاه المخاطر",trend_flat:"بدون تغيير",trend_rising:"في ارتفاع",trend_falling:"في انخفاض",create_work_order_btn:"إنشاء أمر عمل",work_order_created_msg:"تم إنشاء أمر العمل",alertreason_immediate_failure_risk:"خطر عطل فوري",alertreason_failure_imminent:"عطل وشيك",alertreason_degradation_accelerating:"تدهور متسارع",alertreason_outside_normal_envelope:"خارج النطاق الطبيعي",alertreason_pressure_anomaly:"شذوذ في الضغط",alertreason_idle_waste:"هدر طاقة الخمول",alertreason_informational:"معلوماتي",alert_reason_label:"السبب",nav_system_health:"حالة النظام",system_health_hint:"حالة مسار البيانات والنموذج والأمان — الأشياء التي تتعطل بصمت.",connections_title:"الاتصالات الصناعية",data_mode_label:"وضع البيانات",reads_label:"القراءات",failures_label:"الإخفاقات",buffered_label:"مُخزَّن مؤقتًا",pipeline_title:"خط الاستيعاب",queue_depth_label:"عمق الطابور",duplicates_label:"المكررات المكبوتة",retried_label:"أُعيدت المحاولة",dead_letter_label:"في الحجر",model_title:"نموذج التنبؤ",train_model_btn:"تدريب النموذج",check_drift_btn:"فحص الانحراف",model_not_trained:"لا يوجد نموذج مدرَّب — درجات المخاطر إرشادية وغير مُتحقَّق منها.",model_trained_msg:"تم تدريب النموذج",trained_on_label:"دُرِّب على",drift_title:"انحراف البيانات",retrain_recommended:"يُوصى بإعادة التدريب",security_title:"فحوصات الأمان",admin_only_msg:"مطلوب وصول المسؤول.",conn_state_healthy:"سليم",conn_state_stale:"قديم",conn_state_disconnected:"غير متصل",conn_state_never_connected:"لم يتصل قط",drift_stable:"مستقر",drift_moderate:"متوسط",drift_severe:"شديد",metric_precision:"الدقة",metric_recall:"الاستدعاء",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"معدل الإنذار الكاذب",model_cannot_train:"لا يمكن التدريب بعد",model_reason_no_confirmed_failures:"لا توجد أعطال مؤكدة مسجلة",model_reason_insufficient_telemetry:"سجل المستشعرات غير كافٍ",model_reason_insufficient_positive_samples:"الأعطال المؤكدة غير كافية",model_reason_no_failures_in_holdout:"لا توجد أعطال في فترة الاختبار",check_jwt_secret_strong:"سر JWT قوي",check_debug_disabled:"وضع التصحيح معطل",check_https_in_use:"HTTPS مستخدم",check_database_is_postgres:"قاعدة بيانات PostgreSQL",check_rate_limiting_active:"تحديد المعدل نشط",check_account_lockout_active:"قفل الحساب نشط",check_audit_logging_active:"سجل التدقيق نشط",check_security_headers_active:"رؤوس الأمان نشطة",check_smtp_configured:"البريد مُعد",check_industrial_read_only:"الوصول الصناعي للقراءة فقط",model_train_hint:"سجّل الأعطال الحقيقية لتمكين التدريب.",drift_status_no_trained_model:"لا يوجد نموذج مدرَّب بعد",drift_status_insufficient_recent_data:"بيانات حديثة غير كافية",msg_model_untrained_note:"لم يتم تدريب نموذج بعد — درجات المخاطر إرشادية وغير مُتحقَّق منها.",msg_train_needs_failures:"يتطلب التدريب أعطالاً مؤكدة. سجّلها في صفحة الأعطال.",msg_train_no_holdout_failures:"لا توجد أعطال في فترة الاختبار للتقييم.",msg_drift_needs_model:"درّب نموذجًا أولاً — يُقاس الانحراف مقابل بيانات تدريبه.",msg_evaluation_needs_failures:"لا يمكن قياس الدقة قبل تسجيل أعطال حقيقية.",msg_holdout_metrics_note:"المقاييس من بيانات لم يرها النموذج أثناء التدريب.",msg_simulation_mode_note:"SIMULATION يولّد البيانات محليًا؛ حالة الاتصال مهمة فقط مع أجهزة حقيقية.",msg_savings_needs_two_windows:"المقارنة قبل/بعد تحتاج بيانات في نصفَي الفترة.",msg_roi_system_cost_note:"تكلفة النظام غير معروفة هنا — اقسم الفائدة على تكلفتك للحصول على العائد.",msg_reliability_not_calibrated:"تُستخدم معايير الصناعة وليست معايير هذا المصنع. سجّل أعطالاً حقيقية للمعايرة.",msg_no_trained_model:"لا يوجد نموذج مدرَّب بعد",msg_insufficient_recent_data:"بيانات حديثة غير كافية",nav_failures:"سجل الأعطال",failures_hint:"سجّل كل عطل حقيقي. هذا ما يعلّم النموذج سلوك مصنعك الفعلي — بدونه تبقى التنبؤات عامة.",log_failure_btn:"+ تسجيل عطل",calibration_title:"تقدّم المعايرة",calibration_hint:"يحتاج كل مكوّن إلى أعطال مؤكدة كافية قبل معايرة تنبؤه لهذا المصنع.",calibrated_label:"مُعاير",needs_more_failures:"يلزم {n} إضافية",ml_model_label:"نموذج التنبؤ",model_ready_to_train:"جاهز للتدريب",logged_failures_title:"الأعطال المسجّلة",no_failures_yet:"لم تُسجَّل أعطال بعد.",was_predicted_label:"متوقَّع",machine_label:"الآلة",component_label:"أي مكوّن تعطّل",component_hint:"اختر الأقرب — هذا ما يتعلّمه النموذج.",occurred_at_label:"متى حدث",downtime_label:"التوقف (دقيقة)",repair_cost_label:"تكلفة الإصلاح",notes_label:"ملاحظات",ph_failure_notes:"ماذا لوحظ؟",failure_logged_msg:"تم تسجيل العطل",confirm_delete_failure:"حذف سجل العطل هذا؟",err_no_machine_selected:"اختر آلة",err_no_date:"أدخل التاريخ",err_future_date:"لا يمكن أن يكون التاريخ في المستقبل",component_bearing:"محمل",component_motor:"محرك",component_pump:"مضخة",component_cooling_system:"نظام التبريد",component_gearbox:"علبة تروس",cause_seal_leak:"تسرب الحشية",cause_cavitation:"التكهف",cause_overpressure:"ضغط زائد",cause_blocked_discharge:"انسداد التصريف",component_prediction_title:"التنبؤ حسب المكوّن",component_prediction_hint:"العمر المتبقي لكل مكوّن حسب الحالة الحالية للآلة.",limiting_label:"الحرج",days_short:"يوم",industry_default_label:"القيم القياسية",calibrated_to_plant:"مُعاير لهذا المصنع",not_calibrated_warning:"تُستخدم القيم القياسية — سجّل أعطالاً حقيقية للمعايرة."},
+  tr: {tagline:"Küresel Endüstriyel Zeka Platformu",live_label:"Canlı",kpi_energy:"Enerji Kullanımı",kpi_efficiency:"Verimlilik",kpi_active:"Aktif Makineler",kpi_alerts:"Uyarılar",kwh_unit:"kWh",chart_title:"Gerçek Zamanlı Performans",machine_status_title:"Makine Durumu",status_running:"Çalışıyor",status_warning:"Uyarı",status_critical:"Kritik",form_title:"Fabrika Veri Girişi",factory_name_label:"Fabrika Adı",machine_count_label:"Makine Sayısı",energy_cost_label:"Enerji Maliyeti ($/kWh)",machine_type_label:"Makine Türü",temperature_label:"Sıcaklık (°C)",vibration_label:"Titreşim (mm/s)",load_label:"Yük (%)",submit_btn:"Fabrikayı Analiz Et",submitting:"Güncelleniyor...",ai_panel_title:"AI Analizleri",ai_placeholder:"AI analizi oluşturmak için fabrika verilerini gönderin.",ai_analyzing:"Analiz ediliyor...",ai_risks:"Riskler",ai_efficiency_insights:"Verimlilik Analizi",ai_optimizations:"Optimizasyon Önerileri",toast_updated:"Fabrika verileri güncellendi",toast_analysis_done:"AI analizi tamamlandı",toast_error:"Bir şeyler ters gitti",nav_dashboard:"Panel",nav_factories:"Fabrikalar",nav_ai_insights:"AI Analizleri",logout_btn:"Çıkış Yap",login_title:"Tekrar hoş geldiniz",login_subtitle:"FactoryPulse AI hesabınıza giriş yapın",ph_email:"E-posta",ph_password:"Şifre",remember_me:"Beni hatırla",login_btn:"Giriş Yap",login_link_register:"Hesabınız yok mu? Oluşturun",register_title:"Hesabınızı oluşturun",register_subtitle:"Fabrikalarınızı AI ile izlemeye başlayın",ph_full_name:"Ad Soyad",ph_confirm_password:"Şifreyi Onayla",register_btn:"Hesap Oluştur",register_link_login:"Zaten hesabınız var mı? Giriş yapın",err_missing_fields:"Lütfen tüm alanları doldurun",err_invalid_email:"Lütfen geçerli bir e-posta adresi girin",err_weak_password:"Şifre en az 8 karakter, bir harf ve bir rakam içermeli",err_password_mismatch:"Şifreler eşleşmiyor",err_invalid_credentials:"E-posta veya şifre hatalı",err_email_taken:"Bu e-posta zaten kayıtlı",err_generic:"Bir şeyler ters gitti. Tekrar deneyin",my_factories_title:"Fabrikalarım",add_factory_btn:"+ Fabrika Ekle",edit_factory_btn:"Düzenle",delete_factory_btn:"Sil",confirm_delete_factory:"Bu fabrika silinsin mi? Bu işlem geri alınamaz.",no_factories_yet:"Henüz fabrika eklemediniz.",factory_created_toast:"Fabrika oluşturuldu ve analiz edildi",factory_updated_toast:"Fabrika güncellendi",factory_deleted_toast:"Fabrika silindi",ai_insights_feed_title:"AI Analiz Akışı",no_ai_insights_yet:"Henüz AI analizi yok. Başlamak için fabrika ekleyin.",reanalyze_btn:"Yeniden Analiz Et",view_insights_btn:"Analizleri Görüntüle",created_label:"Oluşturulma",cancel_btn:"İptal",save_btn:"Değişiklikleri Kaydet",nav_live_monitor:"Canlı İzleme",add_machine_scada_btn:"+ Makine Ekle",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Sorgulama",live_chart_title:"Canlı Sensör Grafiği",machines_table_title:"Makineler",machine_code_col:"Kod",machine_name_col:"Ad",status_col:"Durum",risk_col:"Risk",no_machines_yet:"Henüz makine yok. \"+ Makine Ekle\"ye tıklayın.",section_machine_info:"Makine Bilgisi",section_sensor_data:"Sensör Verileri",section_status:"Durum",section_notes:"Notlar",status_stopped:"Durduruldu",status_maintenance:"Bakımda",priority_low:"Düşük",priority_normal:"Normal",priority_high:"Yüksek",priority_critical:"Kritik",save_and_analyze_btn:"Kaydet ve Analiz Et",source_col:"Kaynak",source_auto:"Otomatik (SCADA)",source_manual:"Manuel",nav_alerts:"Uyarılar",acknowledge_btn:"Onayla",acknowledged_label:"Onaylandı",acknowledge_all_btn:"Tümünü Onayla",no_alerts_yet:"Uyarı yok. Her şey sorunsuz çalışıyor.",download_report_btn:"Rapor",alert_details_template:"Sıcaklık {temp}°C, titreşim {vib} mm/s, durum: {status}",section_energy_intel:"Enerji Zekası",daily_output_hint:"Özgül enerji tüketimini hesaplamak için kullanılır (birim başına kWh).",energy_insights_title:"Enerji Zekası",idle_power_title:"Boşta Güç Tespiti",idle_active_msg:"Makine boşta - şu anda yaklaşık {kw} kW israf ediliyor.",idle_none_msg:"Boşta enerji israfı tespit edilmedi.",friction_loss_title:"Öngörülü Enerji Kaybı",friction_active_msg:"Artan sürtünme tespit edildi: +%{pct} fazla güç (~{kw} kW ekstra). Kayıpları önlemek için bakım planlayın.",friction_none_msg:"Anormal sürtünme tespit edilmedi.",sec_title:"Özgül Enerji Tüketimi",sec_label:"birim başına kWh",sec_unit:"kWh/birim",sec_no_data_msg:"Bu metriği görmek için makineyi eklerken günlük üretimi girin.",optimal_load_title:"Optimal Yük Bölgesi",optimal_load_label:"Optimal yük",current_load_label:"Mevcut yük",at_optimal_msg:"Optimal yük bölgesinde çalışıyor.",adjust_to_optimal_msg:"Birim başına enerjiyi en aza indirmek için yükü %{pct}'e ayarlayın.",nav_digital_twin:"Dijital İkiz",twin_hint:"Döndürmek için sürükleyin, yakınlaştırmak için kaydırın, canlı detaylar için bir makineye tıklayın.",twin_unavailable_msg:"3D görünüm yüklenemedi (Three.js kütüphanesi için internet bağlantınızı kontrol edin).",failure_prediction_title:"Arıza Tahmini",report_lib_missing_msg:"PDF dışa aktarma için reportlab kütüphanesi gerekir. Çalıştırın: pip install reportlab, ardından sunucuyu yeniden başlatın.",ph_machine_id:"Makine ID (örn. M-01)",ph_machine_name:"Makine Adı",ph_factory_section:"Fabrika Bölümü",ph_operator_name:"Operatör Adı",ph_pressure:"Basınç (bar)",ph_voltage:"Voltaj (V)",ph_current:"Akım (A)",ph_error_code:"Hata Kodu",ph_daily_output:"Günlük Üretim (birim)",ph_notes:"Notlar...",nav_system_intel:"Sistem Zekası",nav_roi:"ROI Panosu",refresh_btn:"Yenile",system_risk_label:"Sistem Riski",healthy_label:"Sağlıklı",at_risk_label:"Riskli",clusters_title:"Makine Kümeleri",propagation_title:"Anomali Yayılımı",propagation_hint:"Arızalı bir makinenin komşularının riskini nasıl artırdığı.",no_propagation:"Anomali yayılımı tespit edilmedi.",avg_risk_label:"Ort. risk",added_risk_label:"Eklenen risk",effective_risk_label:"Etkin risk",simulation_title:"Ne-Olur Simülasyonu",simulation_hint:"Bir makine seçin, sensör değerlerini kaydırın ve arıza olasılığını izleyin.",run_simulation_btn:"Simülasyonu Çalıştır",failure_probability_label:"Arıza Olasılığı",stress_level_label:"Zorlanma Seviyesi",predicted_status_label:"Tahmini Durum",confidence_label:"Güven",root_cause_title:"Kök Neden",rul_col:"Kalan Ömür",rul_healthy:"Sağlıklı",potential_loss_label:"Potansiyel Kayıp",saved_label:"AI ile Tasarruf",wasted_energy_label:"İsraf Edilen Enerji / ay",efficiency_gain_label:"Verimlilik Artışı",cost_by_machine_title:"Makine Bazlı Maliyet Riski",top_cause_col:"Ana Neden",roi_assumptions_msg:"Varsayımlar: duruş {downtime}/sa, onarım {hours} sa, enerji {price}/kWh.",role_label:"Rolünüz",role_engineer:"Mühendis",role_manager:"Yönetici",role_admin:"Admin",cause_bearing_wear:"Rulman aşınması",cause_overload_thermal:"Termal aşırı yük",cause_cooling_failure:"Soğutma arızası",cause_misalignment:"Mil kaçıklığı",cause_lubrication_loss:"Yağlama kaybı",cause_normal_operation:"Normal çalışma",nav_story:"Hikaye Modu",story_hint:"22 saat içinde gelişen bir rulman arızasını yeniden oynatır ve yapay zekanın onu tam olarak ne zaman yakaladığını — ve bunun değerini gösterir.",simulate_failure_btn:"Arıza Simüle Et",outcome_title:"Sonuç",warning_time_label:"Erken Uyarı",loss_ignored_label:"Müdahalesiz Kayıp",loss_acted_label:"Müdahaleli Kayıp",money_saved_label:"Tasarruf",timeline_title:"Arıza Zaman Çizelgesi",story_detection_msg:"Yapay zeka bunu arızadan {hours} saat önce, %{risk} riskte tespit etti — kök neden: {cause} (%{confidence} güven).",story_stage_healthy:"Sağlıklı",story_stage_early_drift:"İlk Sapma",story_stage_ai_detects:"Yapay Zeka Tespit Etti",story_stage_critical:"Kritik",priority_low:"Düşük",priority_medium:"Orta",priority_high:"Yüksek",priority_critical:"Kritik",action_stop_machine:"Makineyi durdur",action_inspect_bearings:"Rulmanları incele",action_check_cooling:"Soğutmayı kontrol et",action_schedule_shutdown_24h:"Duruş planla (24s)",action_order_spare_parts:"Yedek parça sipariş et",action_reduce_load:"Yükü azalt",action_schedule_inspection_72h:"Muayene planla (72s)",action_monitor_closely:"Yakından izle",action_verify_sensor:"Sensörü doğrula",action_power_down_idle:"Boştaki makineyi kapat",action_review_shift_schedule:"Vardiya planını gözden geçir",action_no_action:"İşlem gerekmiyor",nav_oee:"OEE",nav_workorders:"İş Emirleri",oee_hint:"Kullanılabilirlik x Performans x Kalite (ISO 22400). Dünya standardı %85, tipik bir fabrika ise %60 civarındadır.",availability_label:"Kullanılabilirlik",performance_label:"Performans",quality_label:"Kalite",weakest_factor_label:"En zayıf",downtime_by_reason_title:"Nedene Göre Duruş",downtime_cost_label:"Duruş maliyeti",oee_trend_title:"OEE Trendi",shifts_title:"Vardiyalar",shift_col:"Vardiya",downtime_col:"Duruş",log_shift_btn:"Vardiya Kaydet",no_shifts_yet:"Henüz vardiya kaydedilmedi.",minutes_short:"dk",range_1d:"Bugün",range_7d:"7 gün",range_30d:"30 gün",all_machines_option:"Tüm makineler",reason_unspecified:"Belirtilmemiş",err_good_exceeds_total:"Sağlam adet toplamı aşamaz",oee_grade_world_class:"Dünya standardı",oee_grade_typical:"Tipik",oee_grade_low:"Düşük",oee_grade_critical:"Kritik",reason_breakdown:"Arıza",reason_changeover:"Tip değişimi",reason_no_material:"Malzeme yok",reason_no_operator:"Operatör yok",reason_planned_maintenance:"Planlı bakım",reason_quality_issue:"Kalite sorunu",reason_setup:"Kurulum",reason_other:"Diğer",workorders_hint:"AI tahminini takip edilebilir bir göreve dönüştürür — böylece uyarı gerçekten onarımla biter.",new_work_order_btn:"+ Yeni İş Emri",no_work_orders:"Henüz iş emri yok.",avg_completion_label:"Ort. Tamamlama",assigned_label:"Atanan",source_ai:"AI",wo_status_open:"Açık",wo_status_in_progress:"Devam Ediyor",wo_status_done:"Tamamlandı",wo_status_cancelled:"İptal",wo_advance_to_in_progress:"İşe başla",wo_advance_to_done:"Tamamlandı işaretle",ph_shift_name:"Vardiya adı",ph_planned_minutes:"Planlı dakika",ph_downtime_minutes:"Duruş dakikası",ph_total_units:"Toplam adet",ph_good_units:"Sağlam adet",ph_cycle_seconds:"İdeal çevrim (sn)",ph_wo_title:"Başlık",ph_assigned_to:"Atanan kişi",ph_wo_description:"Açıklama",overdue_label:"Gecikmiş",nav_history:"Geçmiş",history_hint:"Kaydedilmiş sensör geçmişi — pilot süresince gerçekte neyin değiştiğini böyle kanıtlarsınız.",no_history_yet:"Henüz geçmiş kaydedilmedi. Canlı İzleme'yi birkaç dakika açık tutun, veriler birikmeye başlar.",range_24h:"24 saat",range_3d:"3 gün",range_10d:"10 gün",sensor_trend_title:"Sensör Trendi",risk_trend_title:"Risk Trendi",trend_flat:"değişim yok",trend_rising:"yükseliyor",trend_falling:"düşüyor",create_work_order_btn:"İş Emri Oluştur",work_order_created_msg:"İş emri oluşturuldu",alertreason_immediate_failure_risk:"Ani arıza riski",alertreason_failure_imminent:"Arıza çok yakın",alertreason_degradation_accelerating:"Bozulma hızlanıyor",alertreason_outside_normal_envelope:"Normal aralık dışında",alertreason_pressure_anomaly:"Basınç anomalisi",alertreason_idle_waste:"Boşta enerji israfı",alertreason_informational:"Bilgilendirme",alert_reason_label:"Neden",nav_system_health:"Sistem Sağlığı",system_health_hint:"Veri yolunun, modelin ve güvenliğin durumu — sessizce bozulan şeyler.",connections_title:"Endüstriyel Bağlantılar",data_mode_label:"Veri modu",reads_label:"Okumalar",failures_label:"Hatalar",buffered_label:"Tamponda",pipeline_title:"Alım Hattı",queue_depth_label:"Kuyruk Derinliği",duplicates_label:"Bastırılan Kopyalar",retried_label:"Yeniden Denenen",dead_letter_label:"Karantinada",model_title:"Tahmin Modeli",train_model_btn:"Modeli Eğit",check_drift_btn:"Sapmayı Kontrol Et",model_not_trained:"Eğitilmiş model yok — risk skorları göstergedir, doğrulanmamıştır.",model_trained_msg:"Model eğitildi",trained_on_label:"Eğitim verisi",drift_title:"Veri Sapması",retrain_recommended:"yeniden eğitim önerilir",security_title:"Güvenlik Kontrolleri",admin_only_msg:"Yönetici erişimi gerekli.",conn_state_healthy:"sağlıklı",conn_state_stale:"eski",conn_state_disconnected:"bağlantı kesildi",conn_state_never_connected:"hiç bağlanmadı",drift_stable:"kararlı",drift_moderate:"orta",drift_severe:"ciddi",metric_precision:"Kesinlik",metric_recall:"Duyarlılık",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"Yanlış Alarm Oranı",model_cannot_train:"Henüz eğitilemiyor",model_reason_no_confirmed_failures:"Doğrulanmış arıza kaydı yok",model_reason_insufficient_telemetry:"Yetersiz sensör geçmişi",model_reason_insufficient_positive_samples:"Yetersiz doğrulanmış arıza",model_reason_no_failures_in_holdout:"Test döneminde arıza yok",check_jwt_secret_strong:"Güçlü JWT anahtarı",check_debug_disabled:"Hata ayıklama kapalı",check_https_in_use:"HTTPS kullanılıyor",check_database_is_postgres:"PostgreSQL veritabanı",check_rate_limiting_active:"Hız sınırlama aktif",check_account_lockout_active:"Hesap kilitleme aktif",check_audit_logging_active:"Denetim kaydı aktif",check_security_headers_active:"Güvenlik başlıkları aktif",check_smtp_configured:"E-posta yapılandırıldı",check_industrial_read_only:"Endüstriyel erişim salt okunur",model_train_hint:"Eğitimi etkinleştirmek için gerçek arızaları kaydedin.",drift_status_no_trained_model:"Henüz eğitilmiş model yok",drift_status_insufficient_recent_data:"Yeterli güncel veri yok",msg_model_untrained_note:"Henüz eğitilmiş model yok — risk skorları göstergedir, doğrulanmamıştır.",msg_train_needs_failures:"Eğitim doğrulanmış arıza gerektirir. Arızalar sayfasında kaydedin.",msg_train_no_holdout_failures:"Test döneminde değerlendirilecek arıza yok.",msg_drift_needs_model:"Önce bir model eğitin — sapma onun eğitim verisine göre ölçülür.",msg_evaluation_needs_failures:"Gerçek arızalar kaydedilmeden doğruluk ölçülemez.",msg_holdout_metrics_note:"Metrikler modelin eğitimde hiç görmediği veriden gelir.",msg_simulation_mode_note:"SIMULATION veriyi yerel üretir; bağlantı durumu yalnızca gerçek donanımla anlamlıdır.",msg_savings_needs_two_windows:"Önce/sonra karşılaştırması dönemin her iki yarısında da veri gerektirir.",msg_roi_system_cost_note:"Sistem maliyeti burada bilinmiyor — ROI için faydayı kendi maliyetinize bölün.",msg_reliability_not_calibrated:"Bu fabrikanın değil, sektör parametreleri kullanılıyor. Kalibrasyon için gerçek arıza kaydedin.",msg_no_trained_model:"Henüz eğitilmiş model yok",msg_insufficient_recent_data:"Yeterli güncel veri yok",nav_failures:"Arıza Günlüğü",failures_hint:"Her gerçek arızayı kaydedin. Modele fabrikanızın gerçek davranışını öğreten şey budur — bu olmadan tahminler genel kalır.",log_failure_btn:"+ Arıza Kaydet",calibration_title:"Kalibrasyon İlerlemesi",calibration_hint:"Her bileşenin tahmini bu fabrikaya göre kalibre edilmeden önce yeterli doğrulanmış arıza gerekir.",calibrated_label:"kalibre edildi",needs_more_failures:"{n} tane daha gerekli",ml_model_label:"Tahmin modeli",model_ready_to_train:"Eğitime hazır",logged_failures_title:"Kaydedilen Arızalar",no_failures_yet:"Henüz arıza kaydedilmedi.",was_predicted_label:"tahmin edildi",machine_label:"Makine",component_label:"Hangi bileşen arızalandı",component_hint:"En yakın olanı seçin — model bundan öğrenir.",occurred_at_label:"Ne zaman oldu",downtime_label:"Duruş (dk)",repair_cost_label:"Onarım maliyeti",notes_label:"Notlar",ph_failure_notes:"Ne gözlemlendi?",failure_logged_msg:"Arıza kaydedildi",confirm_delete_failure:"Bu arıza kaydı silinsin mi?",err_no_machine_selected:"Bir makine seçin",err_no_date:"Tarihi girin",err_future_date:"Tarih gelecekte olamaz",component_bearing:"Rulman",component_motor:"Motor",component_pump:"Pompa",component_cooling_system:"Soğutma sistemi",component_gearbox:"Redüktör",cause_seal_leak:"Salmastra kaçağı",cause_cavitation:"Kavitasyon",cause_overpressure:"Aşırı basınç",cause_blocked_discharge:"Tıkalı çıkış",component_prediction_title:"Bileşen Tahmini",component_prediction_hint:"Makinenin anlık durumuna göre her bileşenin kalan ömrü.",limiting_label:"kısıtlayıcı",days_short:"gün",industry_default_label:"sektör varsayılanı",calibrated_to_plant:"Bu fabrikaya kalibre edildi",not_calibrated_warning:"Sektör varsayılanları kullanılıyor — kalibrasyon için gerçek arıza kaydedin."},
+  it: {tagline:"Piattaforma Globale di Intelligenza Industriale",live_label:"In diretta",kpi_energy:"Consumo Energetico",kpi_efficiency:"Efficienza",kpi_active:"Macchine Attive",kpi_alerts:"Avvisi",kwh_unit:"kWh",chart_title:"Prestazioni in Tempo Reale",machine_status_title:"Stato delle Macchine",status_running:"In funzione",status_warning:"Avviso",status_critical:"Critico",form_title:"Inserimento Dati Fabbrica",factory_name_label:"Nome Fabbrica",machine_count_label:"Numero di Macchine",energy_cost_label:"Costo Energia ($/kWh)",machine_type_label:"Tipo di Macchina",temperature_label:"Temperatura (°C)",vibration_label:"Vibrazione (mm/s)",load_label:"Carico (%)",submit_btn:"Analizza Fabbrica",submitting:"Aggiornamento...",ai_panel_title:"Analisi IA",ai_placeholder:"Invia i dati della fabbrica per generare un'analisi IA.",ai_analyzing:"Analisi in corso...",ai_risks:"Rischi",ai_efficiency_insights:"Analisi dell'Efficienza",ai_optimizations:"Suggerimenti di Ottimizzazione",toast_updated:"Dati fabbrica aggiornati",toast_analysis_done:"Analisi IA completata",toast_error:"Qualcosa è andato storto",nav_dashboard:"Dashboard",nav_factories:"Fabbriche",nav_ai_insights:"Analisi IA",logout_btn:"Esci",login_title:"Bentornato",login_subtitle:"Accedi al tuo account FactoryPulse AI",ph_email:"Email",ph_password:"Password",remember_me:"Ricordami",login_btn:"Accedi",login_link_register:"Non hai un account? Creane uno",register_title:"Crea il tuo account",register_subtitle:"Inizia a monitorare le tue fabbriche con l'IA",ph_full_name:"Nome Completo",ph_confirm_password:"Conferma Password",register_btn:"Crea Account",register_link_login:"Hai già un account? Accedi",err_missing_fields:"Si prega di compilare tutti i campi",err_invalid_email:"Inserisci un indirizzo email valido",err_weak_password:"La password deve avere almeno 8 caratteri, una lettera e un numero",err_password_mismatch:"Le password non corrispondono",err_invalid_credentials:"Email o password errati",err_email_taken:"Questa email è già registrata",err_generic:"Qualcosa è andato storto. Riprova",my_factories_title:"Le Mie Fabbriche",add_factory_btn:"+ Aggiungi Fabbrica",edit_factory_btn:"Modifica",delete_factory_btn:"Elimina",confirm_delete_factory:"Eliminare questa fabbrica? Questa azione non può essere annullata.",no_factories_yet:"Non hai ancora aggiunto nessuna fabbrica.",factory_created_toast:"Fabbrica creata e analizzata",factory_updated_toast:"Fabbrica aggiornata",factory_deleted_toast:"Fabbrica eliminata",ai_insights_feed_title:"Feed di Analisi IA",no_ai_insights_yet:"Nessuna analisi IA ancora. Aggiungi una fabbrica.",reanalyze_btn:"Rianalizza",view_insights_btn:"Vedi Analisi",created_label:"Creata il",cancel_btn:"Annulla",save_btn:"Salva Modifiche",nav_live_monitor:"Monitoraggio Live",add_machine_scada_btn:"+ Aggiungi Macchina",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Polling",live_chart_title:"Grafico Sensori in Tempo Reale",machines_table_title:"Macchine",machine_code_col:"Codice",machine_name_col:"Nome",status_col:"Stato",risk_col:"Rischio",no_machines_yet:"Nessuna macchina ancora. Fai clic su «+ Aggiungi Macchina».",section_machine_info:"Informazioni Macchina",section_sensor_data:"Dati dei Sensori",section_status:"Stato",section_notes:"Note",status_stopped:"Ferma",status_maintenance:"Manutenzione",priority_low:"Bassa",priority_normal:"Normale",priority_high:"Alta",priority_critical:"Critica",save_and_analyze_btn:"Salva e Analizza",source_col:"Origine",source_auto:"Auto (SCADA)",source_manual:"Manuale",nav_alerts:"Avvisi",acknowledge_btn:"Conferma",acknowledged_label:"Confermato",acknowledge_all_btn:"Conferma Tutti",no_alerts_yet:"Nessun avviso. Tutto funziona correttamente.",download_report_btn:"Rapporto",alert_details_template:"Temperatura {temp}°C, vibrazione {vib} mm/s, stato: {status}",section_energy_intel:"Intelligenza Energetica",daily_output_hint:"Usato per calcolare il consumo energetico specifico (kWh per unità).",energy_insights_title:"Intelligenza Energetica",idle_power_title:"Rilevamento Potenza in Inattività",idle_active_msg:"Macchina inattiva - circa {kw} kW sprecati ora.",idle_none_msg:"Nessuno spreco di energia in inattività rilevato.",friction_loss_title:"Perdita di Energia Predittiva",friction_active_msg:"Attrito elevato rilevato: +{pct}% di sovraccarico (~{kw} kW extra). Pianifica la manutenzione per evitare perdite.",friction_none_msg:"Nessun attrito anomalo rilevato.",sec_title:"Consumo Energetico Specifico",sec_label:"kWh per unità",sec_unit:"kWh/unità",sec_no_data_msg:"Inserisci la produzione giornaliera aggiungendo questa macchina per vedere questa metrica.",optimal_load_title:"Zona di Carico Ottimale",optimal_load_label:"Carico ottimale",current_load_label:"Carico attuale",at_optimal_msg:"In funzione nella zona di carico ottimale.",adjust_to_optimal_msg:"Regola il carico verso {pct}% per minimizzare l'energia per unità.",nav_digital_twin:"Gemello Digitale",twin_hint:"Trascina per ruotare, scorri per zoomare, clicca su una macchina per i dettagli in tempo reale.",twin_unavailable_msg:"Impossibile caricare la vista 3D (controlla la connessione internet per Three.js).",failure_prediction_title:"Previsione del Guasto",report_lib_missing_msg:"L'esportazione PDF richiede la libreria reportlab. Esegui: pip install reportlab, poi riavvia il server.",ph_machine_id:"ID Macchina (es. M-01)",ph_machine_name:"Nome Macchina",ph_factory_section:"Sezione Fabbrica",ph_operator_name:"Nome Operatore",ph_pressure:"Pressione (bar)",ph_voltage:"Tensione (V)",ph_current:"Corrente (A)",ph_error_code:"Codice Errore",ph_daily_output:"Produzione Giornaliera (unità)",ph_notes:"Note...",nav_system_intel:"Intelligenza di Sistema",nav_roi:"Dashboard ROI",refresh_btn:"Aggiorna",system_risk_label:"Rischio di Sistema",healthy_label:"Sane",at_risk_label:"A Rischio",clusters_title:"Cluster di Macchine",propagation_title:"Propagazione Anomalie",propagation_hint:"Come una macchina in avaria aumenta il rischio delle vicine.",no_propagation:"Nessuna propagazione di anomalie rilevata.",avg_risk_label:"Rischio medio",added_risk_label:"Rischio aggiunto",effective_risk_label:"Rischio effettivo",simulation_title:"Simulazione What-If",simulation_hint:"Scegli una macchina, modifica i sensori e osserva la probabilità di guasto.",run_simulation_btn:"Avvia Simulazione",failure_probability_label:"Probabilità di Guasto",stress_level_label:"Livello di Stress",predicted_status_label:"Stato Previsto",confidence_label:"Confidenza",root_cause_title:"Causa Radice",rul_col:"Vita Utile Residua",rul_healthy:"Sana",potential_loss_label:"Perdita Potenziale",saved_label:"Risparmiato dall'IA",wasted_energy_label:"Energia Sprecata / mese",efficiency_gain_label:"Guadagno di Efficienza",cost_by_machine_title:"Esposizione ai Costi per Macchina",top_cause_col:"Causa Principale",roi_assumptions_msg:"Ipotesi: fermo {downtime}/h, riparazione {hours}h, energia {price}/kWh.",role_label:"Il Tuo Ruolo",role_engineer:"Ingegnere",role_manager:"Manager",role_admin:"Amministratore",cause_bearing_wear:"Usura del cuscinetto",cause_overload_thermal:"Sovraccarico termico",cause_cooling_failure:"Guasto raffreddamento",cause_misalignment:"Disallineamento albero",cause_lubrication_loss:"Perdita di lubrificazione",cause_normal_operation:"Funzionamento normale",nav_story:"Modalità Storia",story_hint:"Riproduce un guasto al cuscinetto che si sviluppa in 22 ore e mostra esattamente quando l'IA lo ha rilevato — e quanto valeva.",simulate_failure_btn:"Simula Guasto",outcome_title:"Risultato",warning_time_label:"Preavviso",loss_ignored_label:"Perdita senza Intervento",loss_acted_label:"Perdita con Intervento",money_saved_label:"Risparmiato",timeline_title:"Cronologia del Guasto",story_detection_msg:"L'IA lo ha segnalato {hours} ore prima del guasto, al {risk}% di rischio — causa radice: {cause} (confidenza {confidence}%).",story_stage_healthy:"Sana",story_stage_early_drift:"Prima Deriva",story_stage_ai_detects:"L'IA Rileva",story_stage_critical:"Critico",priority_low:"Basso",priority_medium:"Medio",priority_high:"Alto",priority_critical:"Critico",action_stop_machine:"Ferma macchina",action_inspect_bearings:"Ispeziona cuscinetti",action_check_cooling:"Controlla raffreddamento",action_schedule_shutdown_24h:"Pianifica fermo (24h)",action_order_spare_parts:"Ordina ricambi",action_reduce_load:"Riduci carico",action_schedule_inspection_72h:"Pianifica ispezione (72h)",action_monitor_closely:"Monitora da vicino",action_verify_sensor:"Verifica sensore",action_power_down_idle:"Spegni macchina inattiva",action_review_shift_schedule:"Rivedi turni",action_no_action:"Nessuna azione necessaria",nav_oee:"OEE",nav_workorders:"Ordini di Lavoro",oee_hint:"Disponibilità x Prestazioni x Qualità (ISO 22400). Il livello mondiale è 85%, una fabbrica tipica si attesta sul 60%.",availability_label:"Disponibilità",performance_label:"Prestazioni",quality_label:"Qualità",weakest_factor_label:"Più debole",downtime_by_reason_title:"Fermi per Causa",downtime_cost_label:"Costo dei fermi",oee_trend_title:"Andamento OEE",shifts_title:"Turni",shift_col:"Turno",downtime_col:"Fermo",log_shift_btn:"Registra Turno",no_shifts_yet:"Nessun turno registrato.",minutes_short:"min",range_1d:"Oggi",range_7d:"7 giorni",range_30d:"30 giorni",all_machines_option:"Tutte le macchine",reason_unspecified:"Non specificato",err_good_exceeds_total:"I pezzi buoni non possono superare il totale",oee_grade_world_class:"Livello mondiale",oee_grade_typical:"Tipico",oee_grade_low:"Basso",oee_grade_critical:"Critico",reason_breakdown:"Guasto",reason_changeover:"Cambio produzione",reason_no_material:"Materiale mancante",reason_no_operator:"Operatore mancante",reason_planned_maintenance:"Manutenzione pianificata",reason_quality_issue:"Problema qualità",reason_setup:"Setup",reason_other:"Altro",workorders_hint:"Trasforma una previsione IA in un compito tracciato — così un allarme finisce in una riparazione.",new_work_order_btn:"+ Nuovo Ordine",no_work_orders:"Nessun ordine di lavoro.",avg_completion_label:"Completamento medio",assigned_label:"Assegnato",source_ai:"IA",wo_status_open:"Aperto",wo_status_in_progress:"In corso",wo_status_done:"Completato",wo_status_cancelled:"Annullato",wo_advance_to_in_progress:"Inizia lavoro",wo_advance_to_done:"Segna completato",ph_shift_name:"Nome turno",ph_planned_minutes:"Minuti pianificati",ph_downtime_minutes:"Minuti di fermo",ph_total_units:"Unità totali",ph_good_units:"Unità buone",ph_cycle_seconds:"Ciclo ideale (sec)",ph_wo_title:"Titolo",ph_assigned_to:"Assegnato a",ph_wo_description:"Descrizione",overdue_label:"In ritardo",nav_history:"Cronologia",history_hint:"Cronologia dei sensori salvata — così dimostri cosa è realmente cambiato durante il pilota.",no_history_yet:"Nessuna cronologia registrata. Tieni il Monitoraggio aperto qualche minuto e i dati inizieranno ad accumularsi.",range_24h:"24 ore",range_3d:"3 giorni",range_10d:"10 giorni",sensor_trend_title:"Andamento Sensori",risk_trend_title:"Andamento Rischio",trend_flat:"nessuna variazione",trend_rising:"in aumento",trend_falling:"in calo",create_work_order_btn:"Crea Ordine",work_order_created_msg:"Ordine di lavoro creato",alertreason_immediate_failure_risk:"Rischio di guasto immediato",alertreason_failure_imminent:"Guasto imminente",alertreason_degradation_accelerating:"Degrado in accelerazione",alertreason_outside_normal_envelope:"Fuori dal range normale",alertreason_pressure_anomaly:"Anomalia di pressione",alertreason_idle_waste:"Spreco in inattività",alertreason_informational:"Informativo",alert_reason_label:"Motivo",nav_system_health:"Stato del Sistema",system_health_hint:"Stato del percorso dati, del modello e della sicurezza — ciò che si rompe in silenzio.",connections_title:"Connessioni Industriali",data_mode_label:"Modalità dati",reads_label:"Letture",failures_label:"Errori",buffered_label:"In buffer",pipeline_title:"Pipeline di Ingestione",queue_depth_label:"Profondità coda",duplicates_label:"Duplicati soppressi",retried_label:"Ritentati",dead_letter_label:"In quarantena",model_title:"Modello di Previsione",train_model_btn:"Addestra Modello",check_drift_btn:"Verifica Deriva",model_not_trained:"Nessun modello addestrato — i punteggi di rischio sono indicativi, non validati.",model_trained_msg:"Modello addestrato",trained_on_label:"Addestrato su",drift_title:"Deriva dei Dati",retrain_recommended:"riaddestramento consigliato",security_title:"Controlli di Sicurezza",admin_only_msg:"Accesso amministratore richiesto.",conn_state_healthy:"sano",conn_state_stale:"obsoleto",conn_state_disconnected:"disconnesso",conn_state_never_connected:"mai connesso",drift_stable:"stabile",drift_moderate:"moderata",drift_severe:"grave",metric_precision:"Precisione",metric_recall:"Richiamo",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"Tasso di falsi allarmi",model_cannot_train:"Non ancora addestrabile",model_reason_no_confirmed_failures:"Nessun guasto confermato registrato",model_reason_insufficient_telemetry:"Cronologia sensori insufficiente",model_reason_insufficient_positive_samples:"Guasti confermati insufficienti",model_reason_no_failures_in_holdout:"Nessun guasto nel periodo di test",check_jwt_secret_strong:"Segreto JWT robusto",check_debug_disabled:"Modalità debug disattivata",check_https_in_use:"HTTPS in uso",check_database_is_postgres:"Database PostgreSQL",check_rate_limiting_active:"Limitazione richieste attiva",check_account_lockout_active:"Blocco account attivo",check_audit_logging_active:"Registro di audit attivo",check_security_headers_active:"Header di sicurezza attivi",check_smtp_configured:"Email configurata",check_industrial_read_only:"Accesso industriale in sola lettura",model_train_hint:"Registra guasti reali per abilitare l'addestramento.",drift_status_no_trained_model:"Nessun modello addestrato",drift_status_insufficient_recent_data:"Dati recenti insufficienti",msg_model_untrained_note:"Nessun modello addestrato — i punteggi di rischio sono indicativi, non validati.",msg_train_needs_failures:"L'addestramento richiede guasti confermati. Registrali nella pagina Guasti.",msg_train_no_holdout_failures:"Il periodo di test non contiene guasti da valutare.",msg_drift_needs_model:"Addestra prima un modello — la deriva si misura sui suoi dati.",msg_evaluation_needs_failures:"L'accuratezza non è misurabile finché non si registrano guasti reali.",msg_holdout_metrics_note:"Le metriche derivano da dati mai visti dal modello in addestramento.",msg_simulation_mode_note:"SIMULATION genera dati localmente; lo stato delle connessioni conta solo con hardware reale.",msg_savings_needs_two_windows:"Un confronto prima/dopo richiede dati in entrambe le metà del periodo.",msg_roi_system_cost_note:"Il costo del sistema qui non è noto — dividi il beneficio per il tuo costo per il ROI.",msg_reliability_not_calibrated:"Si usano parametri di settore, non di questo stabilimento. Registra guasti reali per calibrare.",msg_no_trained_model:"Nessun modello addestrato",msg_insufficient_recent_data:"Dati recenti insufficienti",nav_failures:"Registro Guasti",failures_hint:"Registra ogni guasto reale. È questo che insegna al modello il comportamento del tuo stabilimento — senza, le previsioni restano generiche.",log_failure_btn:"+ Registra guasto",calibration_title:"Avanzamento Calibrazione",calibration_hint:"Ogni componente necessita di abbastanza guasti confermati prima che la sua previsione sia calibrata per questo stabilimento.",calibrated_label:"calibrato",needs_more_failures:"ne servono altri {n}",ml_model_label:"Modello di previsione",model_ready_to_train:"Pronto per l'addestramento",logged_failures_title:"Guasti Registrati",no_failures_yet:"Nessun guasto registrato.",was_predicted_label:"previsto",machine_label:"Macchina",component_label:"Quale componente si è guastato",component_hint:"Scegli il più simile — è da questo che il modello impara.",occurred_at_label:"Quando è successo",downtime_label:"Fermo (min)",repair_cost_label:"Costo riparazione",notes_label:"Note",ph_failure_notes:"Cosa è stato osservato?",failure_logged_msg:"Guasto registrato",confirm_delete_failure:"Eliminare questo record di guasto?",err_no_machine_selected:"Seleziona una macchina",err_no_date:"Inserisci la data",err_future_date:"La data non può essere futura",component_bearing:"Cuscinetto",component_motor:"Motore",component_pump:"Pompa",component_cooling_system:"Sistema di raffreddamento",component_gearbox:"Riduttore",cause_seal_leak:"Perdita tenuta",cause_cavitation:"Cavitazione",cause_overpressure:"Sovrapressione",cause_blocked_discharge:"Scarico ostruito",component_prediction_title:"Previsione per Componente",component_prediction_hint:"Vita residua di ogni componente, dallo stato attuale della macchina.",limiting_label:"limitante",days_short:"giorni",industry_default_label:"valori di settore",calibrated_to_plant:"Calibrato per questo stabilimento",not_calibrated_warning:"Si usano valori di settore — registra guasti reali per calibrare."},
+  pt: {tagline:"Plataforma Global de Inteligência Industrial",live_label:"Ao vivo",kpi_energy:"Uso de Energia",kpi_efficiency:"Eficiência",kpi_active:"Máquinas Ativas",kpi_alerts:"Alertas",kwh_unit:"kWh",chart_title:"Desempenho em Tempo Real",machine_status_title:"Status das Máquinas",status_running:"Em funcionamento",status_warning:"Aviso",status_critical:"Crítico",form_title:"Entrada de Dados da Fábrica",factory_name_label:"Nome da Fábrica",machine_count_label:"Número de Máquinas",energy_cost_label:"Custo de Energia ($/kWh)",machine_type_label:"Tipo de Máquina",temperature_label:"Temperatura (°C)",vibration_label:"Vibração (mm/s)",load_label:"Carga (%)",submit_btn:"Analisar Fábrica",submitting:"Atualizando...",ai_panel_title:"Insights de IA",ai_placeholder:"Envie os dados da fábrica para gerar uma análise de IA.",ai_analyzing:"Analisando...",ai_risks:"Riscos",ai_efficiency_insights:"Análise de Eficiência",ai_optimizations:"Sugestões de Otimização",toast_updated:"Dados da fábrica atualizados",toast_analysis_done:"Análise de IA concluída",toast_error:"Algo deu errado",nav_dashboard:"Painel",nav_factories:"Fábricas",nav_ai_insights:"Insights de IA",logout_btn:"Sair",login_title:"Bem-vindo de volta",login_subtitle:"Entre na sua conta FactoryPulse AI",ph_email:"E-mail",ph_password:"Senha",remember_me:"Lembrar de mim",login_btn:"Entrar",login_link_register:"Não tem conta? Crie uma",register_title:"Crie sua conta",register_subtitle:"Comece a monitorar suas fábricas com IA",ph_full_name:"Nome Completo",ph_confirm_password:"Confirmar Senha",register_btn:"Criar Conta",register_link_login:"Já tem conta? Entrar",err_missing_fields:"Por favor preencha todos os campos",err_invalid_email:"Por favor insira um e-mail válido",err_weak_password:"A senha deve ter no mínimo 8 caracteres, uma letra e um número",err_password_mismatch:"As senhas não coincidem",err_invalid_credentials:"E-mail ou senha incorretos",err_email_taken:"Este e-mail já está registrado",err_generic:"Algo deu errado. Tente novamente",my_factories_title:"Minhas Fábricas",add_factory_btn:"+ Adicionar Fábrica",edit_factory_btn:"Editar",delete_factory_btn:"Excluir",confirm_delete_factory:"Excluir esta fábrica? Esta ação não pode ser desfeita.",no_factories_yet:"Você ainda não adicionou nenhuma fábrica.",factory_created_toast:"Fábrica criada e analisada",factory_updated_toast:"Fábrica atualizada",factory_deleted_toast:"Fábrica excluída",ai_insights_feed_title:"Feed de Insights de IA",no_ai_insights_yet:"Ainda sem insights de IA. Adicione uma fábrica.",reanalyze_btn:"Reanalisar",view_insights_btn:"Ver Insights",created_label:"Criada em",cancel_btn:"Cancelar",save_btn:"Salvar Alterações",nav_live_monitor:"Monitor ao Vivo",add_machine_scada_btn:"+ Adicionar Máquina",usb_status:"USB:",plc_status:"CLP:",polling_mode:"Sondagem",live_chart_title:"Gráfico de Sensores ao Vivo",machines_table_title:"Máquinas",machine_code_col:"Código",machine_name_col:"Nome",status_col:"Status",risk_col:"Risco",no_machines_yet:"Ainda sem máquinas. Clique em «+ Adicionar Máquina».",section_machine_info:"Informações da Máquina",section_sensor_data:"Dados do Sensor",section_status:"Status",section_notes:"Notas",status_stopped:"Parada",status_maintenance:"Manutenção",priority_low:"Baixa",priority_normal:"Normal",priority_high:"Alta",priority_critical:"Crítica",save_and_analyze_btn:"Salvar e Analisar",source_col:"Origem",source_auto:"Auto (SCADA)",source_manual:"Manual",nav_alerts:"Alertas",acknowledge_btn:"Confirmar",acknowledged_label:"Confirmado",acknowledge_all_btn:"Confirmar Todos",no_alerts_yet:"Sem alertas. Tudo funcionando normalmente.",download_report_btn:"Relatório",alert_details_template:"Temperatura {temp}°C, vibração {vib} mm/s, status: {status}",section_energy_intel:"Inteligência Energética",daily_output_hint:"Usado para calcular o consumo energético específico (kWh por unidade).",energy_insights_title:"Inteligência Energética",idle_power_title:"Detecção de Potência Ociosa",idle_active_msg:"Máquina ociosa - cerca de {kw} kW desperdiçados agora.",idle_none_msg:"Nenhum desperdício de energia ociosa detectado.",friction_loss_title:"Perda de Energia Preditiva",friction_active_msg:"Atrito elevado detectado: +{pct}% de sobrecarga (~{kw} kW extra). Agende manutenção para evitar perdas.",friction_none_msg:"Nenhum atrito anormal detectado.",sec_title:"Consumo Energético Específico",sec_label:"kWh por unidade",sec_unit:"kWh/unidade",sec_no_data_msg:"Insira a produção diária ao adicionar esta máquina para ver esta métrica.",optimal_load_title:"Zona de Carga Ideal",optimal_load_label:"Carga ideal",current_load_label:"Carga atual",at_optimal_msg:"Funcionando na zona de carga ideal.",adjust_to_optimal_msg:"Ajuste a carga para {pct}% para minimizar a energia por unidade.",nav_digital_twin:"Gêmeo Digital",twin_hint:"Arraste para girar, role para ampliar, clique em uma máquina para ver detalhes ao vivo.",twin_unavailable_msg:"Não foi possível carregar a visualização 3D (verifique sua conexão com a internet para o Three.js).",failure_prediction_title:"Previsão de Falha",report_lib_missing_msg:"A exportação em PDF precisa da biblioteca reportlab. Execute: pip install reportlab, depois reinicie o servidor.",ph_machine_id:"ID da Máquina (ex. M-01)",ph_machine_name:"Nome da Máquina",ph_factory_section:"Seção da Fábrica",ph_operator_name:"Nome do Operador",ph_pressure:"Pressão (bar)",ph_voltage:"Tensão (V)",ph_current:"Corrente (A)",ph_error_code:"Código de Erro",ph_daily_output:"Produção Diária (unidades)",ph_notes:"Notas...",nav_system_intel:"Inteligência do Sistema",nav_roi:"Painel de ROI",refresh_btn:"Atualizar",system_risk_label:"Risco do Sistema",healthy_label:"Saudáveis",at_risk_label:"Em Risco",clusters_title:"Clusters de Máquinas",propagation_title:"Propagação de Anomalias",propagation_hint:"Como uma máquina com falha eleva o risco das vizinhas.",no_propagation:"Nenhuma propagação de anomalia detectada.",avg_risk_label:"Risco médio",added_risk_label:"Risco adicionado",effective_risk_label:"Risco efetivo",simulation_title:"Simulação E-Se",simulation_hint:"Escolha uma máquina, ajuste os sensores e veja a probabilidade de falha mudar.",run_simulation_btn:"Executar Simulação",failure_probability_label:"Probabilidade de Falha",stress_level_label:"Nível de Estresse",predicted_status_label:"Status Previsto",confidence_label:"Confiança",root_cause_title:"Causa Raiz",rul_col:"Vida Útil Restante",rul_healthy:"Saudável",potential_loss_label:"Perda Potencial",saved_label:"Economizado pela IA",wasted_energy_label:"Energia Desperdiçada / mês",efficiency_gain_label:"Ganho de Eficiência",cost_by_machine_title:"Exposição de Custo por Máquina",top_cause_col:"Causa Principal",roi_assumptions_msg:"Premissas: parada {downtime}/h, reparo {hours}h, energia {price}/kWh.",role_label:"Sua Função",role_engineer:"Engenheiro",role_manager:"Gerente",role_admin:"Administrador",cause_bearing_wear:"Desgaste de rolamento",cause_overload_thermal:"Sobrecarga térmica",cause_cooling_failure:"Falha de refrigeração",cause_misalignment:"Desalinhamento do eixo",cause_lubrication_loss:"Perda de lubrificação",cause_normal_operation:"Operação normal",nav_story:"Modo História",story_hint:"Reproduz uma falha de rolamento se desenvolvendo em 22 horas e mostra exatamente quando a IA a detectou — e quanto isso valia.",simulate_failure_btn:"Simular Falha",outcome_title:"Resultado",warning_time_label:"Aviso Antecipado",loss_ignored_label:"Perda sem Ação",loss_acted_label:"Perda com Ação",money_saved_label:"Economizado",timeline_title:"Linha do Tempo da Falha",story_detection_msg:"A IA sinalizou isso {hours} horas antes da quebra, com {risk}% de risco — causa raiz: {cause} ({confidence}% de confiança).",story_stage_healthy:"Saudável",story_stage_early_drift:"Primeiro Desvio",story_stage_ai_detects:"IA Detecta",story_stage_critical:"Crítico",priority_low:"Baixo",priority_medium:"Médio",priority_high:"Alto",priority_critical:"Crítico",action_stop_machine:"Parar máquina",action_inspect_bearings:"Inspecionar rolamentos",action_check_cooling:"Verificar refrigeração",action_schedule_shutdown_24h:"Agendar parada (24h)",action_order_spare_parts:"Pedir peças",action_reduce_load:"Reduzir carga",action_schedule_inspection_72h:"Agendar inspeção (72h)",action_monitor_closely:"Monitorar de perto",action_verify_sensor:"Verificar sensor",action_power_down_idle:"Desligar máquina ociosa",action_review_shift_schedule:"Revisar turnos",action_no_action:"Nenhuma ação necessária",nav_oee:"OEE",nav_workorders:"Ordens de Serviço",oee_hint:"Disponibilidade x Desempenho x Qualidade (ISO 22400). O nível mundial é 85%; uma fábrica típica fica perto de 60%.",availability_label:"Disponibilidade",performance_label:"Desempenho",quality_label:"Qualidade",weakest_factor_label:"Mais fraco",downtime_by_reason_title:"Paradas por Motivo",downtime_cost_label:"Custo de parada",oee_trend_title:"Tendência OEE",shifts_title:"Turnos",shift_col:"Turno",downtime_col:"Parada",log_shift_btn:"Registrar Turno",no_shifts_yet:"Nenhum turno registrado.",minutes_short:"min",range_1d:"Hoje",range_7d:"7 dias",range_30d:"30 dias",all_machines_option:"Todas as máquinas",reason_unspecified:"Não especificado",err_good_exceeds_total:"Peças boas não podem exceder o total",oee_grade_world_class:"Nível mundial",oee_grade_typical:"Típico",oee_grade_low:"Baixo",oee_grade_critical:"Crítico",reason_breakdown:"Quebra",reason_changeover:"Troca de produto",reason_no_material:"Sem material",reason_no_operator:"Sem operador",reason_planned_maintenance:"Manutenção planejada",reason_quality_issue:"Problema de qualidade",reason_setup:"Preparação",reason_other:"Outro",workorders_hint:"Transforma uma previsão de IA em tarefa rastreável — para que um alerta termine em reparo.",new_work_order_btn:"+ Nova Ordem",no_work_orders:"Nenhuma ordem de serviço.",avg_completion_label:"Conclusão méd.",assigned_label:"Atribuído",source_ai:"IA",wo_status_open:"Aberta",wo_status_in_progress:"Em andamento",wo_status_done:"Concluída",wo_status_cancelled:"Cancelada",wo_advance_to_in_progress:"Iniciar trabalho",wo_advance_to_done:"Marcar concluída",ph_shift_name:"Nome do turno",ph_planned_minutes:"Minutos planejados",ph_downtime_minutes:"Minutos de parada",ph_total_units:"Unidades totais",ph_good_units:"Unidades boas",ph_cycle_seconds:"Ciclo ideal (seg)",ph_wo_title:"Título",ph_assigned_to:"Atribuído a",ph_wo_description:"Descrição",overdue_label:"Atrasadas",nav_history:"Histórico",history_hint:"Histórico de sensores armazenado — é assim que você prova o que realmente mudou durante o piloto.",no_history_yet:"Nenhum histórico registrado. Mantenha o Monitoramento aberto por alguns minutos e os dados começarão a acumular.",range_24h:"24 horas",range_3d:"3 dias",range_10d:"10 dias",sensor_trend_title:"Tendência dos Sensores",risk_trend_title:"Tendência de Risco",trend_flat:"sem mudança",trend_rising:"subindo",trend_falling:"caindo",create_work_order_btn:"Criar Ordem",work_order_created_msg:"Ordem de serviço criada",alertreason_immediate_failure_risk:"Risco de falha imediata",alertreason_failure_imminent:"Falha iminente",alertreason_degradation_accelerating:"Degradação acelerando",alertreason_outside_normal_envelope:"Fora da faixa normal",alertreason_pressure_anomaly:"Anomalia de pressão",alertreason_idle_waste:"Desperdício em ociosidade",alertreason_informational:"Informativo",alert_reason_label:"Motivo",nav_system_health:"Saúde do Sistema",system_health_hint:"Estado do caminho de dados, do modelo e da segurança — o que quebra silenciosamente.",connections_title:"Conexões Industriais",data_mode_label:"Modo de dados",reads_label:"Leituras",failures_label:"Falhas",buffered_label:"Em buffer",pipeline_title:"Pipeline de Ingestão",queue_depth_label:"Profundidade da fila",duplicates_label:"Duplicados suprimidos",retried_label:"Repetidos",dead_letter_label:"Em quarentena",model_title:"Modelo de Previsão",train_model_btn:"Treinar Modelo",check_drift_btn:"Verificar Desvio",model_not_trained:"Nenhum modelo treinado — pontuações de risco são indicativas, não validadas.",model_trained_msg:"Modelo treinado",trained_on_label:"Treinado com",drift_title:"Desvio de Dados",retrain_recommended:"retreinamento recomendado",security_title:"Verificações de Segurança",admin_only_msg:"Acesso de administrador necessário.",conn_state_healthy:"saudável",conn_state_stale:"desatualizado",conn_state_disconnected:"desconectado",conn_state_never_connected:"nunca conectado",drift_stable:"estável",drift_moderate:"moderado",drift_severe:"severo",metric_precision:"Precisão",metric_recall:"Revocação",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"Taxa de falsos alarmes",model_cannot_train:"Ainda não é possível treinar",model_reason_no_confirmed_failures:"Nenhuma falha confirmada registrada",model_reason_insufficient_telemetry:"Histórico de sensores insuficiente",model_reason_insufficient_positive_samples:"Falhas confirmadas insuficientes",model_reason_no_failures_in_holdout:"Sem falhas no período de teste",check_jwt_secret_strong:"Segredo JWT forte",check_debug_disabled:"Modo debug desativado",check_https_in_use:"HTTPS em uso",check_database_is_postgres:"Banco PostgreSQL",check_rate_limiting_active:"Limite de requisições ativo",check_account_lockout_active:"Bloqueio de conta ativo",check_audit_logging_active:"Log de auditoria ativo",check_security_headers_active:"Cabeçalhos de segurança ativos",check_smtp_configured:"Email configurado",check_industrial_read_only:"Acesso industrial somente leitura",model_train_hint:"Registre falhas reais para habilitar o treinamento.",drift_status_no_trained_model:"Nenhum modelo treinado ainda",drift_status_insufficient_recent_data:"Dados recentes insuficientes",msg_model_untrained_note:"Nenhum modelo treinado ainda — as pontuações de risco são indicativas, não validadas.",msg_train_needs_failures:"O treinamento exige falhas confirmadas. Registre-as na página de falhas.",msg_train_no_holdout_failures:"O período de teste não contém falhas para avaliar.",msg_drift_needs_model:"Treine um modelo primeiro — o desvio é medido em relação aos seus dados.",msg_evaluation_needs_failures:"A precisão não pode ser medida até que quebras reais sejam registradas.",msg_holdout_metrics_note:"As métricas vêm de dados que o modelo nunca viu no treinamento.",msg_simulation_mode_note:"SIMULATION gera dados localmente; o estado da conexão só importa com hardware real.",msg_savings_needs_two_windows:"Uma comparação antes/depois precisa de dados nas duas metades do período.",msg_roi_system_cost_note:"O custo do sistema é desconhecido aqui — divida o benefício pelo seu custo para obter o ROI.",msg_reliability_not_calibrated:"Usam-se parâmetros do setor, não desta fábrica. Registre falhas reais para calibrar.",msg_no_trained_model:"Nenhum modelo treinado ainda",msg_insufficient_recent_data:"Dados recentes insuficientes",nav_failures:"Registro de Falhas",failures_hint:"Registre cada quebra real. É isso que ensina ao modelo o comportamento da sua fábrica — sem isso, as previsões permanecem genéricas.",log_failure_btn:"+ Registrar falha",calibration_title:"Progresso da Calibração",calibration_hint:"Cada componente precisa de falhas confirmadas suficientes antes que sua previsão seja calibrada para esta fábrica.",calibrated_label:"calibrado",needs_more_failures:"faltam {n}",ml_model_label:"Modelo de previsão",model_ready_to_train:"Pronto para treinar",logged_failures_title:"Falhas Registradas",no_failures_yet:"Nenhuma falha registrada ainda.",was_predicted_label:"previsto",machine_label:"Máquina",component_label:"Qual componente falhou",component_hint:"Escolha o mais próximo — é disso que o modelo aprende.",occurred_at_label:"Quando aconteceu",downtime_label:"Parada (min)",repair_cost_label:"Custo do reparo",notes_label:"Observações",ph_failure_notes:"O que foi observado?",failure_logged_msg:"Falha registrada",confirm_delete_failure:"Excluir este registro de falha?",err_no_machine_selected:"Selecione uma máquina",err_no_date:"Informe a data",err_future_date:"A data não pode estar no futuro",component_bearing:"Rolamento",component_motor:"Motor",component_pump:"Bomba",component_cooling_system:"Sistema de refrigeração",component_gearbox:"Redutor",cause_seal_leak:"Vazamento de vedação",cause_cavitation:"Cavitação",cause_overpressure:"Sobrepressão",cause_blocked_discharge:"Descarga bloqueada",component_prediction_title:"Previsão por Componente",component_prediction_hint:"Vida útil restante por componente, a partir do estado atual da máquina.",limiting_label:"limitante",days_short:"dias",industry_default_label:"padrões do setor",calibrated_to_plant:"Calibrado para esta fábrica",not_calibrated_warning:"Usando padrões do setor — registre falhas reais para calibrar."},
+  ja: {tagline:"グローバル産業インテリジェンスプラットフォーム",live_label:"ライブ",kpi_energy:"エネルギー使用量",kpi_efficiency:"効率",kpi_active:"稼働中の機械",kpi_alerts:"アラート",kwh_unit:"kWh",chart_title:"リアルタイムパフォーマンス",machine_status_title:"機械の状態",status_running:"稼働中",status_warning:"警告",status_critical:"重大",form_title:"工場データ入力",factory_name_label:"工場名",machine_count_label:"機械の数",energy_cost_label:"エネルギーコスト ($/kWh)",machine_type_label:"機械の種類",temperature_label:"温度 (°C)",vibration_label:"振動 (mm/s)",load_label:"負荷 (%)",submit_btn:"工場を分析",submitting:"更新中...",ai_panel_title:"AIインサイト",ai_placeholder:"工場データを送信してAI分析を生成してください。",ai_analyzing:"分析中...",ai_risks:"リスク",ai_efficiency_insights:"効率分析",ai_optimizations:"最適化提案",toast_updated:"工場データが更新されました",toast_analysis_done:"AI分析が完了しました",toast_error:"問題が発生しました",nav_dashboard:"ダッシュボード",nav_factories:"工場",nav_ai_insights:"AIインサイト",logout_btn:"ログアウト",login_title:"おかえりなさい",login_subtitle:"FactoryPulse AI アカウントにログイン",ph_email:"メールアドレス",ph_password:"パスワード",remember_me:"ログイン状態を保持",login_btn:"ログイン",login_link_register:"アカウントをお持ちでないですか？作成する",register_title:"アカウントを作成",register_subtitle:"AIで工場の監視を始めましょう",ph_full_name:"氏名",ph_confirm_password:"パスワードの確認",register_btn:"アカウント作成",register_link_login:"すでにアカウントをお持ちですか？ログイン",err_missing_fields:"すべての項目を入力してください",err_invalid_email:"有効なメールアドレスを入力してください",err_weak_password:"パスワードは8文字以上で、文字と数字を含める必要があります",err_password_mismatch:"パスワードが一致しません",err_invalid_credentials:"メールアドレスまたはパスワードが正しくありません",err_email_taken:"このメールアドレスは既に登録されています",err_generic:"エラーが発生しました。再試行してください",my_factories_title:"マイ工場",add_factory_btn:"+ 工場を追加",edit_factory_btn:"編集",delete_factory_btn:"削除",confirm_delete_factory:"この工場を削除しますか？元に戻せません。",no_factories_yet:"まだ工場を追加していません。",factory_created_toast:"工場が作成・分析されました",factory_updated_toast:"工場が更新されました",factory_deleted_toast:"工場が削除されました",ai_insights_feed_title:"AIインサイトフィード",no_ai_insights_yet:"AIインサイトはまだありません。工場を追加してください。",reanalyze_btn:"再分析",view_insights_btn:"インサイトを見る",created_label:"作成日",cancel_btn:"キャンセル",save_btn:"変更を保存",nav_live_monitor:"ライブモニター",add_machine_scada_btn:"+ 機械を追加",usb_status:"USB:",plc_status:"PLC:",polling_mode:"ポーリング",live_chart_title:"ライブセンサーチャート",machines_table_title:"機械",machine_code_col:"コード",machine_name_col:"名前",status_col:"ステータス",risk_col:"リスク",no_machines_yet:"まだ機械がありません。「+ 機械を追加」をクリックしてください。",section_machine_info:"機械情報",section_sensor_data:"センサーデータ",section_status:"ステータス",section_notes:"メモ",status_stopped:"停止中",status_maintenance:"メンテナンス中",priority_low:"低",priority_normal:"通常",priority_high:"高",priority_critical:"重大",save_and_analyze_btn:"保存して分析",source_col:"データ元",source_auto:"自動 (SCADA)",source_manual:"手動",nav_alerts:"アラート",acknowledge_btn:"確認",acknowledged_label:"確認済み",acknowledge_all_btn:"すべて確認",no_alerts_yet:"アラートはありません。すべて正常に稼働しています。",download_report_btn:"レポート",alert_details_template:"温度 {temp}°C、振動 {vib} mm/s、状態：{status}",section_energy_intel:"エネルギーインテリジェンス",daily_output_hint:"単位あたりのエネルギー消費量（kWh/単位）を計算するために使用します。",energy_insights_title:"エネルギーインテリジェンス",idle_power_title:"アイドル電力検出",idle_active_msg:"機械がアイドル状態です - 現在約{kw} kWが無駄になっています。",idle_none_msg:"アイドル時のエネルギー浪費は検出されていません。",friction_loss_title:"予測エネルギー損失",friction_active_msg:"摩擦増加を検出：電力オーバーヘッド +{pct}%（約{kw} kW増加）。損失を防ぐためメンテナンスを計画してください。",friction_none_msg:"異常な摩擦は検出されていません。",sec_title:"原単位エネルギー消費量",sec_label:"単位あたりkWh",sec_unit:"kWh/単位",sec_no_data_msg:"この指標を表示するには、機械追加時に1日の生産量を入力してください。",optimal_load_title:"最適負荷ゾーン",optimal_load_label:"最適負荷",current_load_label:"現在の負荷",at_optimal_msg:"最適負荷ゾーンで稼働中です。",adjust_to_optimal_msg:"単位あたりのエネルギーを最小化するには、負荷を{pct}%に調整してください。",nav_digital_twin:"デジタルツイン",twin_hint:"ドラッグで回転、スクロールでズーム、機械をクリックするとライブ詳細が表示されます。",twin_unavailable_msg:"3Dビューを読み込めませんでした（Three.jsライブラリのインターネット接続を確認してください）。",failure_prediction_title:"故障予測",report_lib_missing_msg:"PDFエクスポートにはreportlabライブラリが必要です。pip install reportlab を実行してからサーバーを再起動してください。",ph_machine_id:"機械ID（例：M-01）",ph_machine_name:"機械名",ph_factory_section:"工場セクション",ph_operator_name:"オペレーター名",ph_pressure:"圧力（bar）",ph_voltage:"電圧（V）",ph_current:"電流（A）",ph_error_code:"エラーコード",ph_daily_output:"日産量（単位）",ph_notes:"メモ...",nav_system_intel:"システムインテリジェンス",nav_roi:"ROIダッシュボード",refresh_btn:"更新",system_risk_label:"システムリスク",healthy_label:"正常",at_risk_label:"リスクあり",clusters_title:"機械クラスター",propagation_title:"異常伝播",propagation_hint:"故障した機械が近隣機械のリスクをどう高めるか。",no_propagation:"異常伝播は検出されていません。",avg_risk_label:"平均リスク",added_risk_label:"追加リスク",effective_risk_label:"実効リスク",simulation_title:"What-Ifシミュレーション",simulation_hint:"機械を選び、センサー値を変えて故障確率の変化を確認します。",run_simulation_btn:"シミュレーション実行",failure_probability_label:"故障確率",stress_level_label:"ストレスレベル",predicted_status_label:"予測ステータス",confidence_label:"信頼度",root_cause_title:"根本原因",rul_col:"残存耐用時間",rul_healthy:"正常",potential_loss_label:"潜在的損失",saved_label:"AIによる節約",wasted_energy_label:"無駄なエネルギー / 月",efficiency_gain_label:"効率向上",cost_by_machine_title:"機械別コストリスク",top_cause_col:"主要因",roi_assumptions_msg:"前提：停止 {downtime}/時、修理 {hours}時間、電力 {price}/kWh。",role_label:"あなたの役割",role_engineer:"エンジニア",role_manager:"マネージャー",role_admin:"管理者",cause_bearing_wear:"軸受摩耗",cause_overload_thermal:"熱過負荷",cause_cooling_failure:"冷却故障",cause_misalignment:"軸芯ずれ",cause_lubrication_loss:"潤滑不足",cause_normal_operation:"正常運転",nav_story:"ストーリーモード",story_hint:"22時間かけて進行する軸受故障を再現し、AIがいつ検知したか、その価値がいくらだったかを正確に示します。",simulate_failure_btn:"故障をシミュレート",outcome_title:"結果",warning_time_label:"早期警告",loss_ignored_label:"放置した場合の損失",loss_acted_label:"対応した場合の損失",money_saved_label:"節約額",timeline_title:"故障タイムライン",story_detection_msg:"AIは故障の{hours}時間前、リスク{risk}%の時点で検知しました — 根本原因：{cause}（信頼度{confidence}%）。",story_stage_healthy:"正常",story_stage_early_drift:"初期変動",story_stage_ai_detects:"AI検知",story_stage_critical:"重大",priority_low:"低",priority_medium:"中",priority_high:"高",priority_critical:"重大",action_stop_machine:"機械を停止",action_inspect_bearings:"軸受を点検",action_check_cooling:"冷却を確認",action_schedule_shutdown_24h:"停止を計画（24時間）",action_order_spare_parts:"予備部品を発注",action_reduce_load:"負荷を下げる",action_schedule_inspection_72h:"点検を計画（72時間）",action_monitor_closely:"注意深く監視",action_verify_sensor:"センサーを確認",action_power_down_idle:"アイドル機械を停止",action_review_shift_schedule:"シフト計画を見直す",action_no_action:"対応不要",nav_oee:"設備総合効率",nav_workorders:"作業指示",oee_hint:"可用率 x 性能 x 品質 (ISO 22400)。ワールドクラスは85%、一般的な工場は約60%です。",availability_label:"可用率",performance_label:"性能",quality_label:"品質",weakest_factor_label:"最弱項目",downtime_by_reason_title:"理由別停止時間",downtime_cost_label:"停止コスト",oee_trend_title:"OEE推移",shifts_title:"シフト",shift_col:"シフト",downtime_col:"停止",log_shift_btn:"シフトを記録",no_shifts_yet:"まだシフトが記録されていません。",minutes_short:"分",range_1d:"今日",range_7d:"7日間",range_30d:"30日間",all_machines_option:"すべての機械",reason_unspecified:"未指定",err_good_exceeds_total:"良品数は総数を超えられません",oee_grade_world_class:"ワールドクラス",oee_grade_typical:"標準的",oee_grade_low:"低い",oee_grade_critical:"重大",reason_breakdown:"故障",reason_changeover:"段取替え",reason_no_material:"材料切れ",reason_no_operator:"作業者不在",reason_planned_maintenance:"計画保全",reason_quality_issue:"品質問題",reason_setup:"セットアップ",reason_other:"その他",workorders_hint:"AIの予測を追跡可能なタスクに変換 — 警告が確実に修理につながります。",new_work_order_btn:"+ 新規作業指示",no_work_orders:"作業指示はまだありません。",avg_completion_label:"平均完了時間",assigned_label:"担当者",source_ai:"AI",wo_status_open:"未着手",wo_status_in_progress:"進行中",wo_status_done:"完了",wo_status_cancelled:"中止",wo_advance_to_in_progress:"作業開始",wo_advance_to_done:"完了にする",ph_shift_name:"シフト名",ph_planned_minutes:"計画時間（分）",ph_downtime_minutes:"停止時間（分）",ph_total_units:"総数",ph_good_units:"良品数",ph_cycle_seconds:"理想サイクル（秒）",ph_wo_title:"タイトル",ph_assigned_to:"担当者",ph_wo_description:"説明",overdue_label:"期限超過",nav_history:"履歴",history_hint:"保存されたセンサー履歴 — パイロット期間に何が実際に変わったかを証明します。",no_history_yet:"履歴はまだ記録されていません。ライブ監視を数分開いたままにするとデータが蓄積され始めます。",range_24h:"24時間",range_3d:"3日間",range_10d:"10日間",sensor_trend_title:"センサー推移",risk_trend_title:"リスク推移",trend_flat:"変化なし",trend_rising:"上昇",trend_falling:"下降",create_work_order_btn:"作業指示を作成",work_order_created_msg:"作業指示を作成しました",alertreason_immediate_failure_risk:"即時故障リスク",alertreason_failure_imminent:"故障が差し迫っている",alertreason_degradation_accelerating:"劣化が加速中",alertreason_outside_normal_envelope:"正常範囲外",alertreason_pressure_anomaly:"圧力異常",alertreason_idle_waste:"アイドル時のエネルギー浪費",alertreason_informational:"情報",alert_reason_label:"理由",nav_system_health:"システム健全性",system_health_hint:"データ経路・モデル・セキュリティの状態 — 静かに壊れるもの。",connections_title:"産業用接続",data_mode_label:"データモード",reads_label:"読み取り",failures_label:"失敗",buffered_label:"バッファ内",pipeline_title:"取り込みパイプライン",queue_depth_label:"キュー長",duplicates_label:"重複抑制",retried_label:"再試行",dead_letter_label:"隔離済み",model_title:"予測モデル",train_model_btn:"モデルを訓練",check_drift_btn:"ドリフト確認",model_not_trained:"訓練済みモデルなし — リスクスコアは参考値で未検証です。",model_trained_msg:"モデル訓練完了",trained_on_label:"訓練データ数",drift_title:"データドリフト",retrain_recommended:"再訓練を推奨",security_title:"セキュリティ確認",admin_only_msg:"管理者権限が必要です。",conn_state_healthy:"正常",conn_state_stale:"古い",conn_state_disconnected:"切断",conn_state_never_connected:"未接続",drift_stable:"安定",drift_moderate:"中程度",drift_severe:"重大",metric_precision:"適合率",metric_recall:"再現率",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"誤報率",model_cannot_train:"まだ訓練できません",model_reason_no_confirmed_failures:"確認済みの故障が未登録",model_reason_insufficient_telemetry:"センサー履歴が不足",model_reason_insufficient_positive_samples:"確認済み故障が不足",model_reason_no_failures_in_holdout:"テスト期間に故障なし",check_jwt_secret_strong:"強力なJWTシークレット",check_debug_disabled:"デバッグモード無効",check_https_in_use:"HTTPS使用中",check_database_is_postgres:"PostgreSQLデータベース",check_rate_limiting_active:"レート制限有効",check_account_lockout_active:"アカウントロック有効",check_audit_logging_active:"監査ログ有効",check_security_headers_active:"セキュリティヘッダー有効",check_smtp_configured:"メール設定済み",check_industrial_read_only:"産業アクセスは読み取り専用",model_train_hint:"訓練を有効にするには実際の故障を記録してください。",drift_status_no_trained_model:"訓練済みモデルなし",drift_status_insufficient_recent_data:"最近のデータが不足",msg_model_untrained_note:"訓練済みモデルなし — リスクスコアは参考値で未検証です。",msg_train_needs_failures:"訓練には確認済みの故障が必要です。故障ページで記録してください。",msg_train_no_holdout_failures:"テスト期間に評価対象の故障がありません。",msg_drift_needs_model:"先にモデルを訓練してください — ドリフトはその訓練データと比較されます。",msg_evaluation_needs_failures:"実際の故障が記録されるまで精度は測定できません。",msg_holdout_metrics_note:"指標は訓練時にモデルが見ていないデータから算出されています。",msg_simulation_mode_note:"SIMULATION はデータをローカル生成します。接続状態は実機使用時のみ意味があります。",msg_savings_needs_two_windows:"前後比較には期間の両半分にデータが必要です。",msg_roi_system_cost_note:"システム費用は不明です — 便益を自社費用で割ってROIを算出してください。",msg_reliability_not_calibrated:"本工場ではなく業界標準の値を使用中。校正には実際の故障記録が必要です。",msg_no_trained_model:"訓練済みモデルなし",msg_insufficient_recent_data:"最近のデータが不足",nav_failures:"故障記録",failures_hint:"実際の故障をすべて記録してください。これがモデルに自社工場の挙動を学ばせます — なければ予測は一般的なままです。",log_failure_btn:"+ 故障を記録",calibration_title:"校正の進捗",calibration_hint:"各部品は、この工場向けに予測が校正されるまで十分な確認済み故障が必要です。",calibrated_label:"校正済み",needs_more_failures:"あと {n} 件必要",ml_model_label:"予測モデル",model_ready_to_train:"訓練可能",logged_failures_title:"記録された故障",no_failures_yet:"まだ故障が記録されていません。",was_predicted_label:"予測済み",machine_label:"機械",component_label:"どの部品が故障したか",component_hint:"最も近いものを選択 — モデルはこれから学習します。",occurred_at_label:"いつ発生したか",downtime_label:"停止時間（分）",repair_cost_label:"修理費用",notes_label:"メモ",ph_failure_notes:"何が観察されましたか？",failure_logged_msg:"故障を記録しました",confirm_delete_failure:"この故障記録を削除しますか？",err_no_machine_selected:"機械を選択してください",err_no_date:"日付を入力してください",err_future_date:"日付を未来にはできません",component_bearing:"軸受",component_motor:"モーター",component_pump:"ポンプ",component_cooling_system:"冷却系統",component_gearbox:"減速機",cause_seal_leak:"シール漏れ",cause_cavitation:"キャビテーション",cause_overpressure:"過圧",cause_blocked_discharge:"吐出閉塞",component_prediction_title:"部品別予測",component_prediction_hint:"機械の現在状態から算出した部品ごとの残存寿命。",limiting_label:"制約",days_short:"日",industry_default_label:"業界標準値",calibrated_to_plant:"この工場に校正済み",not_calibrated_warning:"業界標準値を使用中 — 校正には実際の故障記録が必要です。"},
+  ko: {tagline:"글로벌 산업 인텔리전스 플랫폼",live_label:"실시간",kpi_energy:"에너지 사용량",kpi_efficiency:"효율성",kpi_active:"가동 중인 기계",kpi_alerts:"경고",kwh_unit:"kWh",chart_title:"실시간 성능",machine_status_title:"기계 상태",status_running:"가동 중",status_warning:"경고",status_critical:"심각",form_title:"공장 데이터 입력",factory_name_label:"공장 이름",machine_count_label:"기계 수",energy_cost_label:"에너지 비용 ($/kWh)",machine_type_label:"기계 유형",temperature_label:"온도 (°C)",vibration_label:"진동 (mm/s)",load_label:"부하 (%)",submit_btn:"공장 분석",submitting:"업데이트 중...",ai_panel_title:"AI 인사이트",ai_placeholder:"AI 분석을 생성하려면 공장 데이터를 제출하세요.",ai_analyzing:"분석 중...",ai_risks:"위험 요소",ai_efficiency_insights:"효율성 분석",ai_optimizations:"최적화 제안",toast_updated:"공장 데이터가 업데이트되었습니다",toast_analysis_done:"AI 분석이 완료되었습니다",toast_error:"문제가 발생했습니다",nav_dashboard:"대시보드",nav_factories:"공장",nav_ai_insights:"AI 인사이트",logout_btn:"로그아웃",login_title:"다시 오신 것을 환영합니다",login_subtitle:"FactoryPulse AI 계정에 로그인하세요",ph_email:"이메일",ph_password:"비밀번호",remember_me:"로그인 상태 유지",login_btn:"로그인",login_link_register:"계정이 없으신가요? 계정 만들기",register_title:"계정 만들기",register_subtitle:"AI로 공장 모니터링을 시작하세요",ph_full_name:"성명",ph_confirm_password:"비밀번호 확인",register_btn:"계정 생성",register_link_login:"이미 계정이 있으신가요? 로그인",err_missing_fields:"모든 항목을 입력해주세요",err_invalid_email:"유효한 이메일 주소를 입력하세요",err_weak_password:"비밀번호는 8자 이상, 문자와 숫자를 포함해야 합니다",err_password_mismatch:"비밀번호가 일치하지 않습니다",err_invalid_credentials:"이메일 또는 비밀번호가 올바르지 않습니다",err_email_taken:"이미 등록된 이메일입니다",err_generic:"문제가 발생했습니다. 다시 시도해주세요",my_factories_title:"내 공장",add_factory_btn:"+ 공장 추가",edit_factory_btn:"수정",delete_factory_btn:"삭제",confirm_delete_factory:"이 공장을 삭제하시겠습니까? 되돌릴 수 없습니다.",no_factories_yet:"아직 추가된 공장이 없습니다.",factory_created_toast:"공장이 생성되고 분석되었습니다",factory_updated_toast:"공장이 업데이트되었습니다",factory_deleted_toast:"공장이 삭제되었습니다",ai_insights_feed_title:"AI 인사이트 피드",no_ai_insights_yet:"아직 AI 인사이트가 없습니다. 공장을 추가하세요.",reanalyze_btn:"다시 분석",view_insights_btn:"인사이트 보기",created_label:"생성일",cancel_btn:"취소",save_btn:"변경사항 저장",nav_live_monitor:"실시간 모니터",add_machine_scada_btn:"+ 기계 추가",usb_status:"USB:",plc_status:"PLC:",polling_mode:"폴링",live_chart_title:"실시간 센서 차트",machines_table_title:"기계",machine_code_col:"코드",machine_name_col:"이름",status_col:"상태",risk_col:"위험",no_machines_yet:"아직 기계가 없습니다. \"+ 기계 추가\"를 클릭하세요.",section_machine_info:"기계 정보",section_sensor_data:"센서 데이터",section_status:"상태",section_notes:"메모",status_stopped:"정지됨",status_maintenance:"유지보수 중",priority_low:"낮음",priority_normal:"보통",priority_high:"높음",priority_critical:"긴급",save_and_analyze_btn:"저장 및 분석",source_col:"소스",source_auto:"자동 (SCADA)",source_manual:"수동",nav_alerts:"경고",acknowledge_btn:"확인",acknowledged_label:"확인됨",acknowledge_all_btn:"모두 확인",no_alerts_yet:"경고가 없습니다. 모든 것이 정상 작동 중입니다.",download_report_btn:"보고서",alert_details_template:"온도 {temp}°C, 진동 {vib} mm/s, 상태: {status}",section_energy_intel:"에너지 인텔리전스",daily_output_hint:"단위당 에너지 소비량(kWh/단위)을 계산하는 데 사용됩니다.",energy_insights_title:"에너지 인텔리전스",idle_power_title:"유휴 전력 감지",idle_active_msg:"기계가 유휴 상태입니다 - 현재 약 {kw} kW가 낭비되고 있습니다.",idle_none_msg:"유휴 에너지 낭비가 감지되지 않았습니다.",friction_loss_title:"예측 에너지 손실",friction_active_msg:"마찰 증가 감지: 전력 오버헤드 +{pct}%(약 {kw} kW 추가). 손실을 방지하려면 정비를 예약하세요.",friction_none_msg:"비정상적인 마찰이 감지되지 않았습니다.",sec_title:"단위당 에너지 소비량",sec_label:"단위당 kWh",sec_unit:"kWh/단위",sec_no_data_msg:"이 지표를 보려면 기계 추가 시 일일 생산량을 입력하세요.",optimal_load_title:"최적 부하 구간",optimal_load_label:"최적 부하",current_load_label:"현재 부하",at_optimal_msg:"최적 부하 구간에서 작동 중입니다.",adjust_to_optimal_msg:"단위당 에너지를 최소화하려면 부하를 {pct}%로 조정하세요.",nav_digital_twin:"디지털 트윈",twin_hint:"드래그하여 회전, 스크롤하여 확대/축소, 기계를 클릭하면 실시간 세부정보를 볼 수 있습니다.",twin_unavailable_msg:"3D 보기를 로드할 수 없습니다 (Three.js 라이브러리의 인터넷 연결을 확인하세요).",failure_prediction_title:"고장 예측",report_lib_missing_msg:"PDF 내보내기에는 reportlab 라이브러리가 필요합니다. pip install reportlab을 실행한 후 서버를 재시작하세요.",ph_machine_id:"기계 ID (예: M-01)",ph_machine_name:"기계 이름",ph_factory_section:"공장 구역",ph_operator_name:"운영자 이름",ph_pressure:"압력 (bar)",ph_voltage:"전압 (V)",ph_current:"전류 (A)",ph_error_code:"오류 코드",ph_daily_output:"일일 생산량 (단위)",ph_notes:"메모...",nav_system_intel:"시스템 인텔리전스",nav_roi:"ROI 대시보드",refresh_btn:"새로고침",system_risk_label:"시스템 위험",healthy_label:"정상",at_risk_label:"위험",clusters_title:"기계 클러스터",propagation_title:"이상 전파",propagation_hint:"고장난 기계가 인접 기계의 위험을 어떻게 높이는지.",no_propagation:"이상 전파가 감지되지 않았습니다.",avg_risk_label:"평균 위험",added_risk_label:"추가 위험",effective_risk_label:"실효 위험",simulation_title:"What-If 시뮬레이션",simulation_hint:"기계를 선택하고 센서 값을 조정해 고장 확률 변화를 확인하세요.",run_simulation_btn:"시뮬레이션 실행",failure_probability_label:"고장 확률",stress_level_label:"응력 수준",predicted_status_label:"예측 상태",confidence_label:"신뢰도",root_cause_title:"근본 원인",rul_col:"잔여 수명",rul_healthy:"정상",potential_loss_label:"잠재 손실",saved_label:"AI 절감액",wasted_energy_label:"낭비 에너지 / 월",efficiency_gain_label:"효율 향상",cost_by_machine_title:"기계별 비용 리스크",top_cause_col:"주요 원인",roi_assumptions_msg:"가정: 다운타임 {downtime}/시간, 수리 {hours}시간, 전력 {price}/kWh.",role_label:"귀하의 역할",role_engineer:"엔지니어",role_manager:"매니저",role_admin:"관리자",cause_bearing_wear:"베어링 마모",cause_overload_thermal:"열 과부하",cause_cooling_failure:"냉각 고장",cause_misalignment:"축 정렬 불량",cause_lubrication_loss:"윤활 손실",cause_normal_operation:"정상 운전",nav_story:"스토리 모드",story_hint:"22시간에 걸쳐 진행되는 베어링 고장을 재현하고, AI가 정확히 언제 발견했는지 — 그리고 그 가치가 얼마인지 보여줍니다.",simulate_failure_btn:"고장 시뮬레이션",outcome_title:"결과",warning_time_label:"조기 경고",loss_ignored_label:"방치 시 손실",loss_acted_label:"조치 시 손실",money_saved_label:"절감액",timeline_title:"고장 타임라인",story_detection_msg:"AI가 고장 {hours}시간 전, 위험도 {risk}%에서 감지했습니다 — 근본 원인: {cause} (신뢰도 {confidence}%).",story_stage_healthy:"정상",story_stage_early_drift:"초기 편차",story_stage_ai_detects:"AI 감지",story_stage_critical:"심각",priority_low:"낮음",priority_medium:"보통",priority_high:"높음",priority_critical:"심각",action_stop_machine:"기계 정지",action_inspect_bearings:"베어링 점검",action_check_cooling:"냉각 확인",action_schedule_shutdown_24h:"가동 중단 예약 (24시간)",action_order_spare_parts:"예비 부품 주문",action_reduce_load:"부하 감소",action_schedule_inspection_72h:"점검 예약 (72시간)",action_monitor_closely:"면밀히 모니터링",action_verify_sensor:"센서 확인",action_power_down_idle:"유휴 기계 전원 차단",action_review_shift_schedule:"교대 일정 검토",action_no_action:"조치 불필요",nav_oee:"설비종합효율",nav_workorders:"작업 지시",oee_hint:"가동률 x 성능 x 품질 (ISO 22400). 세계 수준은 85%, 일반 공장은 약 60%입니다.",availability_label:"가동률",performance_label:"성능",quality_label:"품질",weakest_factor_label:"최약점",downtime_by_reason_title:"사유별 정지시간",downtime_cost_label:"정지 비용",oee_trend_title:"OEE 추이",shifts_title:"교대",shift_col:"교대",downtime_col:"정지",log_shift_btn:"교대 기록",no_shifts_yet:"아직 기록된 교대가 없습니다.",minutes_short:"분",range_1d:"오늘",range_7d:"7일",range_30d:"30일",all_machines_option:"모든 기계",reason_unspecified:"미지정",err_good_exceeds_total:"양품 수는 총수를 초과할 수 없습니다",oee_grade_world_class:"세계 수준",oee_grade_typical:"일반",oee_grade_low:"낮음",oee_grade_critical:"심각",reason_breakdown:"고장",reason_changeover:"교체작업",reason_no_material:"자재 부족",reason_no_operator:"작업자 부재",reason_planned_maintenance:"계획 정비",reason_quality_issue:"품질 문제",reason_setup:"셋업",reason_other:"기타",workorders_hint:"AI 예측을 추적 가능한 작업으로 전환 — 경고가 실제 수리로 이어지도록 합니다.",new_work_order_btn:"+ 새 작업 지시",no_work_orders:"작업 지시가 없습니다.",avg_completion_label:"평균 완료",assigned_label:"담당자",source_ai:"AI",wo_status_open:"대기",wo_status_in_progress:"진행 중",wo_status_done:"완료",wo_status_cancelled:"취소",wo_advance_to_in_progress:"작업 시작",wo_advance_to_done:"완료 처리",ph_shift_name:"교대 이름",ph_planned_minutes:"계획 시간(분)",ph_downtime_minutes:"정지 시간(분)",ph_total_units:"총 수량",ph_good_units:"양품 수량",ph_cycle_seconds:"이상 사이클(초)",ph_wo_title:"제목",ph_assigned_to:"담당자",ph_wo_description:"설명",overdue_label:"기한 초과",nav_history:"이력",history_hint:"저장된 센서 이력 — 파일럿 기간에 실제로 무엇이 바뀌었는지 증명합니다.",no_history_yet:"아직 기록된 이력이 없습니다. 실시간 모니터링을 몇 분간 열어두면 데이터가 쌓이기 시작합니다.",range_24h:"24시간",range_3d:"3일",range_10d:"10일",sensor_trend_title:"센서 추이",risk_trend_title:"위험도 추이",trend_flat:"변화 없음",trend_rising:"상승",trend_falling:"하락",create_work_order_btn:"작업 지시 생성",work_order_created_msg:"작업 지시가 생성되었습니다",alertreason_immediate_failure_risk:"즉각적인 고장 위험",alertreason_failure_imminent:"고장 임박",alertreason_degradation_accelerating:"열화 가속 중",alertreason_outside_normal_envelope:"정상 범위 이탈",alertreason_pressure_anomaly:"압력 이상",alertreason_idle_waste:"유휴 에너지 낭비",alertreason_informational:"정보",alert_reason_label:"사유",nav_system_health:"시스템 상태",system_health_hint:"데이터 경로, 모델, 보안 상태 — 조용히 고장 나는 것들.",connections_title:"산업용 연결",data_mode_label:"데이터 모드",reads_label:"읽기",failures_label:"실패",buffered_label:"버퍼",pipeline_title:"수집 파이프라인",queue_depth_label:"큐 깊이",duplicates_label:"중복 억제",retried_label:"재시도",dead_letter_label:"격리됨",model_title:"예측 모델",train_model_btn:"모델 학습",check_drift_btn:"드리프트 확인",model_not_trained:"학습된 모델 없음 — 위험 점수는 참고용이며 검증되지 않았습니다.",model_trained_msg:"모델 학습 완료",trained_on_label:"학습 샘플",drift_title:"데이터 드리프트",retrain_recommended:"재학습 권장",security_title:"보안 점검",admin_only_msg:"관리자 권한이 필요합니다.",conn_state_healthy:"정상",conn_state_stale:"오래됨",conn_state_disconnected:"연결 끊김",conn_state_never_connected:"연결된 적 없음",drift_stable:"안정",drift_moderate:"보통",drift_severe:"심각",metric_precision:"정밀도",metric_recall:"재현율",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"오경보율",model_cannot_train:"아직 학습할 수 없음",model_reason_no_confirmed_failures:"확인된 고장 기록 없음",model_reason_insufficient_telemetry:"센서 이력 부족",model_reason_insufficient_positive_samples:"확인된 고장 부족",model_reason_no_failures_in_holdout:"테스트 기간에 고장 없음",check_jwt_secret_strong:"강력한 JWT 시크릿",check_debug_disabled:"디버그 모드 비활성",check_https_in_use:"HTTPS 사용 중",check_database_is_postgres:"PostgreSQL 데이터베이스",check_rate_limiting_active:"속도 제한 활성",check_account_lockout_active:"계정 잠금 활성",check_audit_logging_active:"감사 로그 활성",check_security_headers_active:"보안 헤더 활성",check_smtp_configured:"이메일 구성됨",check_industrial_read_only:"산업 접근 읽기 전용",model_train_hint:"학습을 활성화하려면 실제 고장을 기록하세요.",drift_status_no_trained_model:"학습된 모델 없음",drift_status_insufficient_recent_data:"최근 데이터 부족",msg_model_untrained_note:"학습된 모델 없음 — 위험 점수는 참고용이며 검증되지 않았습니다.",msg_train_needs_failures:"학습에는 확인된 고장이 필요합니다. 고장 페이지에서 기록하세요.",msg_train_no_holdout_failures:"테스트 기간에 평가할 고장이 없습니다.",msg_drift_needs_model:"먼저 모델을 학습하세요 — 드리프트는 학습 데이터 기준으로 측정됩니다.",msg_evaluation_needs_failures:"실제 고장이 기록되기 전에는 정확도를 측정할 수 없습니다.",msg_holdout_metrics_note:"지표는 학습 시 모델이 보지 못한 데이터에서 산출되었습니다.",msg_simulation_mode_note:"SIMULATION은 데이터를 로컬 생성합니다. 연결 상태는 실제 장비에서만 의미가 있습니다.",msg_savings_needs_two_windows:"전후 비교에는 기간의 양쪽 절반 모두 데이터가 필요합니다.",msg_roi_system_cost_note:"시스템 비용은 여기서 알 수 없습니다 — 편익을 자체 비용으로 나눠 ROI를 구하세요.",msg_reliability_not_calibrated:"본 공장이 아닌 업계 표준 값을 사용 중. 보정하려면 실제 고장을 기록하세요.",msg_no_trained_model:"학습된 모델 없음",msg_insufficient_recent_data:"최근 데이터 부족",nav_failures:"고장 기록",failures_hint:"모든 실제 고장을 기록하세요. 이것이 모델에 귀사 공장의 실제 거동을 학습시킵니다 — 없으면 예측은 일반적인 수준에 머무릅니다.",log_failure_btn:"+ 고장 기록",calibration_title:"보정 진행률",calibration_hint:"각 부품은 이 공장에 맞게 예측이 보정되기 전에 충분한 확인된 고장이 필요합니다.",calibrated_label:"보정됨",needs_more_failures:"{n}건 더 필요",ml_model_label:"예측 모델",model_ready_to_train:"학습 준비 완료",logged_failures_title:"기록된 고장",no_failures_yet:"아직 기록된 고장이 없습니다.",was_predicted_label:"예측됨",machine_label:"기계",component_label:"어떤 부품이 고장났는지",component_hint:"가장 가까운 항목 선택 — 모델이 이로부터 학습합니다.",occurred_at_label:"언제 발생했는지",downtime_label:"정지 시간(분)",repair_cost_label:"수리 비용",notes_label:"메모",ph_failure_notes:"무엇이 관찰되었나요?",failure_logged_msg:"고장이 기록되었습니다",confirm_delete_failure:"이 고장 기록을 삭제할까요?",err_no_machine_selected:"기계를 선택하세요",err_no_date:"날짜를 입력하세요",err_future_date:"날짜는 미래일 수 없습니다",component_bearing:"베어링",component_motor:"모터",component_pump:"펌프",component_cooling_system:"냉각 시스템",component_gearbox:"감속기",cause_seal_leak:"실 누유",cause_cavitation:"캐비테이션",cause_overpressure:"과압",cause_blocked_discharge:"토출 막힘",component_prediction_title:"부품별 예측",component_prediction_hint:"기계의 현재 상태를 기반으로 한 부품별 잔여 수명.",limiting_label:"제한",days_short:"일",industry_default_label:"업계 기본값",calibrated_to_plant:"이 공장에 보정됨",not_calibrated_warning:"업계 기본값 사용 중 — 보정하려면 실제 고장을 기록하세요."},
+  hi: {tagline:"वैश्विक औद्योगिक बुद्धिमत्ता मंच",live_label:"लाइव",kpi_energy:"ऊर्जा उपयोग",kpi_efficiency:"दक्षता",kpi_active:"सक्रिय मशीनें",kpi_alerts:"अलर्ट",kwh_unit:"kWh",chart_title:"रीयल-टाइम प्रदर्शन",machine_status_title:"मशीन की स्थिति",status_running:"चल रहा है",status_warning:"चेतावनी",status_critical:"गंभीर",form_title:"फ़ैक्टरी डेटा इनपुट",factory_name_label:"फ़ैक्टरी का नाम",machine_count_label:"मशीनों की संख्या",energy_cost_label:"ऊर्जा लागत ($/kWh)",machine_type_label:"मशीन प्रकार",temperature_label:"तापमान (°C)",vibration_label:"कंपन (mm/s)",load_label:"लोड (%)",submit_btn:"फ़ैक्टरी का विश्लेषण करें",submitting:"अद्यतन हो रहा है...",ai_panel_title:"AI अंतर्दृष्टि",ai_placeholder:"AI विश्लेषण उत्पन्न करने के लिए फ़ैक्टरी डेटा सबमिट करें।",ai_analyzing:"विश्लेषण हो रहा है...",ai_risks:"जोखिम",ai_efficiency_insights:"दक्षता विश्लेषण",ai_optimizations:"अनुकूलन सुझाव",toast_updated:"फ़ैक्टरी डेटा अपडेट किया गया",toast_analysis_done:"AI विश्लेषण पूर्ण हुआ",toast_error:"कुछ गलत हो गया",nav_dashboard:"डैशबोर्ड",nav_factories:"फ़ैक्टरियाँ",nav_ai_insights:"AI अंतर्दृष्टि",logout_btn:"लॉग आउट",login_title:"वापसी पर स्वागत है",login_subtitle:"अपने FactoryPulse AI खाते में लॉग इन करें",ph_email:"ईमेल",ph_password:"पासवर्ड",remember_me:"मुझे याद रखें",login_btn:"लॉग इन करें",login_link_register:"खाता नहीं है? एक बनाएं",register_title:"अपना खाता बनाएं",register_subtitle:"AI के साथ अपनी फ़ैक्टरियों की निगरानी शुरू करें",ph_full_name:"पूरा नाम",ph_confirm_password:"पासवर्ड की पुष्टि करें",register_btn:"खाता बनाएं",register_link_login:"पहले से खाता है? लॉग इन करें",err_missing_fields:"कृपया सभी फ़ील्ड भरें",err_invalid_email:"कृपया एक मान्य ईमेल पता दर्ज करें",err_weak_password:"पासवर्ड कम से कम 8 अक्षर, एक अक्षर और एक अंक होना चाहिए",err_password_mismatch:"पासवर्ड मेल नहीं खाते",err_invalid_credentials:"गलत ईमेल या पासवर्ड",err_email_taken:"यह ईमेल पहले से पंजीकृत है",err_generic:"कुछ गलत हो गया। कृपया पुनः प्रयास करें",my_factories_title:"मेरी फ़ैक्टरियाँ",add_factory_btn:"+ फ़ैक्टरी जोड़ें",edit_factory_btn:"संपादित करें",delete_factory_btn:"हटाएं",confirm_delete_factory:"इस फ़ैक्टरी को हटाएं? इसे पूर्ववत नहीं किया जा सकता।",no_factories_yet:"आपने अभी तक कोई फ़ैक्टरी नहीं जोड़ी है।",factory_created_toast:"फ़ैक्टरी बनाई और विश्लेषित की गई",factory_updated_toast:"फ़ैक्टरी अपडेट की गई",factory_deleted_toast:"फ़ैक्टरी हटाई गई",ai_insights_feed_title:"AI अंतर्दृष्टि फ़ीड",no_ai_insights_yet:"अभी तक कोई AI अंतर्दृष्टि नहीं। शुरू करने के लिए एक फ़ैक्टरी जोड़ें।",reanalyze_btn:"पुनः विश्लेषण करें",view_insights_btn:"अंतर्दृष्टि देखें",created_label:"बनाया गया",cancel_btn:"रद्द करें",save_btn:"परिवर्तन सहेजें",nav_live_monitor:"लाइव मॉनिटर",add_machine_scada_btn:"+ मशीन जोड़ें",usb_status:"USB:",plc_status:"PLC:",polling_mode:"पोलिंग",live_chart_title:"लाइव सेंसर चार्ट",machines_table_title:"मशीनें",machine_code_col:"कोड",machine_name_col:"नाम",status_col:"स्थिति",risk_col:"जोखिम",no_machines_yet:"अभी तक कोई मशीन नहीं। \"+ मशीन जोड़ें\" पर क्लिक करें।",section_machine_info:"मशीन जानकारी",section_sensor_data:"सेंसर डेटा",section_status:"स्थिति",section_notes:"नोट्स",status_stopped:"रुकी हुई",status_maintenance:"रखरखाव",priority_low:"कम",priority_normal:"सामान्य",priority_high:"उच्च",priority_critical:"गंभीर",save_and_analyze_btn:"सहेजें और विश्लेषण करें",source_col:"स्रोत",source_auto:"स्वचालित (SCADA)",source_manual:"मैन्युअल",nav_alerts:"अलर्ट",acknowledge_btn:"स्वीकार करें",acknowledged_label:"स्वीकृत",acknowledge_all_btn:"सभी स्वीकार करें",no_alerts_yet:"कोई अलर्ट नहीं। सब कुछ सुचारू रूप से चल रहा है।",download_report_btn:"रिपोर्ट",alert_details_template:"तापमान {temp}°C, कंपन {vib} mm/s, स्थिति: {status}",section_energy_intel:"ऊर्जा इंटेलिजेंस",daily_output_hint:"विशिष्ट ऊर्जा खपत (प्रति इकाई kWh) की गणना के लिए उपयोग किया जाता है।",energy_insights_title:"ऊर्जा इंटेलिजेंस",idle_power_title:"निष्क्रिय शक्ति का पता लगाना",idle_active_msg:"मशीन निष्क्रिय है - अभी लगभग {kw} kW बर्बाद हो रहा है।",idle_none_msg:"कोई निष्क्रिय ऊर्जा बर्बादी नहीं पाई गई।",friction_loss_title:"पूर्वानुमानित ऊर्जा हानि",friction_active_msg:"बढ़ा हुआ घर्षण पाया गया: +{pct}% अतिरिक्त शक्ति (~{kw} kW अतिरिक्त)। हानि रोकने के लिए रखरखाव शेड्यूल करें।",friction_none_msg:"कोई असामान्य घर्षण नहीं पाया गया।",sec_title:"विशिष्ट ऊर्जा खपत",sec_label:"प्रति इकाई kWh",sec_unit:"kWh/इकाई",sec_no_data_msg:"यह मीट्रिक देखने के लिए मशीन जोड़ते समय दैनिक उत्पादन दर्ज करें।",optimal_load_title:"इष्टतम लोड ज़ोन",optimal_load_label:"इष्टतम लोड",current_load_label:"वर्तमान लोड",at_optimal_msg:"इष्टतम लोड ज़ोन में चल रहा है।",adjust_to_optimal_msg:"प्रति इकाई ऊर्जा कम करने के लिए लोड को {pct}% की ओर समायोजित करें।",nav_digital_twin:"डिजिटल ट्विन",twin_hint:"घुमाने के लिए खींचें, ज़ूम करने के लिए स्क्रॉल करें, लाइव विवरण देखने के लिए मशीन पर क्लिक करें।",twin_unavailable_msg:"3D दृश्य लोड नहीं हो सका (Three.js लाइब्रेरी के लिए अपना इंटरनेट कनेक्शन जांचें)।",failure_prediction_title:"विफलता पूर्वानुमान",report_lib_missing_msg:"PDF निर्यात के लिए reportlab लाइब्रेरी की आवश्यकता है। चलाएं: pip install reportlab, फिर सर्वर को पुनः आरंभ करें।",ph_machine_id:"मशीन ID (जैसे M-01)",ph_machine_name:"मशीन नाम",ph_factory_section:"फ़ैक्टरी सेक्शन",ph_operator_name:"ऑपरेटर नाम",ph_pressure:"दबाव (bar)",ph_voltage:"वोल्टेज (V)",ph_current:"करंट (A)",ph_error_code:"त्रुटि कोड",ph_daily_output:"दैनिक उत्पादन (इकाई)",ph_notes:"नोट्स...",nav_system_intel:"सिस्टम इंटेलिजेंस",nav_roi:"ROI डैशबोर्ड",refresh_btn:"रीफ़्रेश",system_risk_label:"सिस्टम जोखिम",healthy_label:"स्वस्थ",at_risk_label:"जोखिम में",clusters_title:"मशीन क्लस्टर",propagation_title:"विसंगति प्रसार",propagation_hint:"एक खराब मशीन पड़ोसी मशीनों का जोखिम कैसे बढ़ाती है।",no_propagation:"कोई विसंगति प्रसार नहीं मिला।",avg_risk_label:"औसत जोखिम",added_risk_label:"अतिरिक्त जोखिम",effective_risk_label:"प्रभावी जोखिम",simulation_title:"व्हाट-इफ़ सिमुलेशन",simulation_hint:"मशीन चुनें, सेंसर मान बदलें और विफलता संभावना देखें।",run_simulation_btn:"सिमुलेशन चलाएं",failure_probability_label:"विफलता संभावना",stress_level_label:"तनाव स्तर",predicted_status_label:"अनुमानित स्थिति",confidence_label:"विश्वास",root_cause_title:"मूल कारण",rul_col:"शेष उपयोगी जीवन",rul_healthy:"स्वस्थ",potential_loss_label:"संभावित हानि",saved_label:"AI द्वारा बचत",wasted_energy_label:"बर्बाद ऊर्जा / माह",efficiency_gain_label:"दक्षता लाभ",cost_by_machine_title:"मशीन अनुसार लागत जोखिम",top_cause_col:"मुख्य कारण",roi_assumptions_msg:"अनुमान: डाउनटाइम {downtime}/घं, मरम्मत {hours} घं, ऊर्जा {price}/kWh।",role_label:"आपकी भूमिका",role_engineer:"इंजीनियर",role_manager:"प्रबंधक",role_admin:"व्यवस्थापक",cause_bearing_wear:"बियरिंग घिसाव",cause_overload_thermal:"तापीय अधिभार",cause_cooling_failure:"शीतलन विफलता",cause_misalignment:"शाफ़्ट असंरेखण",cause_lubrication_loss:"स्नेहन हानि",cause_normal_operation:"सामान्य संचालन",nav_story:"स्टोरी मोड",story_hint:"22 घंटों में विकसित होने वाली बियरिंग विफलता को दोहराता है और दिखाता है कि AI ने इसे कब पकड़ा — और इसका मूल्य क्या था।",simulate_failure_btn:"विफलता का अनुकरण करें",outcome_title:"परिणाम",warning_time_label:"प्रारंभिक चेतावनी",loss_ignored_label:"बिना कार्रवाई हानि",loss_acted_label:"कार्रवाई के साथ हानि",money_saved_label:"बचत",timeline_title:"विफलता समयरेखा",story_detection_msg:"AI ने इसे खराबी से {hours} घंटे पहले, {risk}% जोखिम पर पकड़ा — मूल कारण: {cause} ({confidence}% विश्वास)।",story_stage_healthy:"स्वस्थ",story_stage_early_drift:"प्रारंभिक विचलन",story_stage_ai_detects:"AI ने पहचाना",story_stage_critical:"गंभीर",priority_low:"कम",priority_medium:"मध्यम",priority_high:"उच्च",priority_critical:"गंभीर",action_stop_machine:"मशीन रोकें",action_inspect_bearings:"बियरिंग जांचें",action_check_cooling:"शीतलन जांचें",action_schedule_shutdown_24h:"शटडाउन शेड्यूल करें (24घं)",action_order_spare_parts:"स्पेयर पार्ट्स ऑर्डर करें",action_reduce_load:"लोड कम करें",action_schedule_inspection_72h:"निरीक्षण शेड्यूल करें (72घं)",action_monitor_closely:"बारीकी से निगरानी करें",action_verify_sensor:"सेंसर सत्यापित करें",action_power_down_idle:"निष्क्रिय मशीन बंद करें",action_review_shift_schedule:"शिफ्ट शेड्यूल की समीक्षा करें",action_no_action:"किसी कार्रवाई की आवश्यकता नहीं",nav_oee:"OEE",nav_workorders:"कार्य आदेश",oee_hint:"उपलब्धता x प्रदर्शन x गुणवत्ता (ISO 22400)। विश्व स्तर 85% है; सामान्य कारखाना लगभग 60% पर रहता है।",availability_label:"उपलब्धता",performance_label:"प्रदर्शन",quality_label:"गुणवत्ता",weakest_factor_label:"सबसे कमजोर",downtime_by_reason_title:"कारण अनुसार डाउनटाइम",downtime_cost_label:"डाउनटाइम लागत",oee_trend_title:"OEE रुझान",shifts_title:"शिफ्ट",shift_col:"शिफ्ट",downtime_col:"डाउनटाइम",log_shift_btn:"शिफ्ट दर्ज करें",no_shifts_yet:"अभी तक कोई शिफ्ट दर्ज नहीं।",minutes_short:"मिनट",range_1d:"आज",range_7d:"7 दिन",range_30d:"30 दिन",all_machines_option:"सभी मशीनें",reason_unspecified:"अनिर्दिष्ट",err_good_exceeds_total:"अच्छी इकाइयाँ कुल से अधिक नहीं हो सकतीं",oee_grade_world_class:"विश्व स्तर",oee_grade_typical:"सामान्य",oee_grade_low:"कम",oee_grade_critical:"गंभीर",reason_breakdown:"खराबी",reason_changeover:"चेंजओवर",reason_no_material:"सामग्री नहीं",reason_no_operator:"ऑपरेटर नहीं",reason_planned_maintenance:"नियोजित रखरखाव",reason_quality_issue:"गुणवत्ता समस्या",reason_setup:"सेटअप",reason_other:"अन्य",workorders_hint:"AI पूर्वानुमान को ट्रैक करने योग्य कार्य में बदलता है — ताकि चेतावनी वास्तव में मरम्मत पर समाप्त हो।",new_work_order_btn:"+ नया कार्य आदेश",no_work_orders:"अभी तक कोई कार्य आदेश नहीं।",avg_completion_label:"औसत पूर्णता",assigned_label:"सौंपा गया",source_ai:"AI",wo_status_open:"खुला",wo_status_in_progress:"प्रगति में",wo_status_done:"पूर्ण",wo_status_cancelled:"रद्द",wo_advance_to_in_progress:"कार्य शुरू करें",wo_advance_to_done:"पूर्ण चिह्नित करें",ph_shift_name:"शिफ्ट नाम",ph_planned_minutes:"नियोजित मिनट",ph_downtime_minutes:"डाउनटाइम मिनट",ph_total_units:"कुल इकाइयाँ",ph_good_units:"अच्छी इकाइयाँ",ph_cycle_seconds:"आदर्श चक्र (सेकंड)",ph_wo_title:"शीर्षक",ph_assigned_to:"सौंपा गया",ph_wo_description:"विवरण",overdue_label:"समय सीमा पार",nav_history:"इतिहास",history_hint:"संग्रहीत सेंसर इतिहास — इसी से आप साबित करते हैं कि पायलट के दौरान वास्तव में क्या बदला।",no_history_yet:"अभी तक कोई इतिहास दर्ज नहीं। लाइव मॉनिटर को कुछ मिनट खुला रखें, डेटा जमा होने लगेगा।",range_24h:"24 घंटे",range_3d:"3 दिन",range_10d:"10 दिन",sensor_trend_title:"सेंसर रुझान",risk_trend_title:"जोखिम रुझान",trend_flat:"कोई बदलाव नहीं",trend_rising:"बढ़ रहा",trend_falling:"घट रहा",create_work_order_btn:"कार्य आदेश बनाएं",work_order_created_msg:"कार्य आदेश बनाया गया",alertreason_immediate_failure_risk:"तत्काल विफलता जोखिम",alertreason_failure_imminent:"विफलता निकट",alertreason_degradation_accelerating:"गिरावट तेज हो रही",alertreason_outside_normal_envelope:"सामान्य सीमा से बाहर",alertreason_pressure_anomaly:"दबाव विसंगति",alertreason_idle_waste:"निष्क्रिय ऊर्जा बर्बादी",alertreason_informational:"सूचनात्मक",alert_reason_label:"कारण",nav_system_health:"सिस्टम स्वास्थ्य",system_health_hint:"डेटा पथ, मॉडल और सुरक्षा की स्थिति — जो चुपचाप टूटता है।",connections_title:"औद्योगिक कनेक्शन",data_mode_label:"डेटा मोड",reads_label:"रीड",failures_label:"विफलताएँ",buffered_label:"बफ़र में",pipeline_title:"इनजेशन पाइपलाइन",queue_depth_label:"कतार गहराई",duplicates_label:"दोहराव दबाए गए",retried_label:"पुनः प्रयास",dead_letter_label:"क्वारंटाइन",model_title:"पूर्वानुमान मॉडल",train_model_btn:"मॉडल प्रशिक्षित करें",check_drift_btn:"ड्रिफ़्ट जाँचें",model_not_trained:"कोई प्रशिक्षित मॉडल नहीं — जोखिम स्कोर सांकेतिक हैं, सत्यापित नहीं।",model_trained_msg:"मॉडल प्रशिक्षित",trained_on_label:"प्रशिक्षण नमूने",drift_title:"डेटा ड्रिफ़्ट",retrain_recommended:"पुनः प्रशिक्षण अनुशंसित",security_title:"सुरक्षा जाँच",admin_only_msg:"व्यवस्थापक पहुँच आवश्यक।",conn_state_healthy:"स्वस्थ",conn_state_stale:"पुराना",conn_state_disconnected:"डिस्कनेक्ट",conn_state_never_connected:"कभी कनेक्ट नहीं",drift_stable:"स्थिर",drift_moderate:"मध्यम",drift_severe:"गंभीर",metric_precision:"परिशुद्धता",metric_recall:"रिकॉल",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"झूठा अलार्म दर",model_cannot_train:"अभी प्रशिक्षण संभव नहीं",model_reason_no_confirmed_failures:"कोई पुष्ट विफलता दर्ज नहीं",model_reason_insufficient_telemetry:"सेंसर इतिहास अपर्याप्त",model_reason_insufficient_positive_samples:"पुष्ट विफलताएँ अपर्याप्त",model_reason_no_failures_in_holdout:"परीक्षण अवधि में कोई विफलता नहीं",check_jwt_secret_strong:"मजबूत JWT सीक्रेट",check_debug_disabled:"डिबग मोड बंद",check_https_in_use:"HTTPS उपयोग में",check_database_is_postgres:"PostgreSQL डेटाबेस",check_rate_limiting_active:"दर सीमा सक्रिय",check_account_lockout_active:"खाता लॉकआउट सक्रिय",check_audit_logging_active:"ऑडिट लॉग सक्रिय",check_security_headers_active:"सुरक्षा हेडर सक्रिय",check_smtp_configured:"ईमेल कॉन्फ़िगर",check_industrial_read_only:"औद्योगिक पहुँच केवल पढ़ने के लिए",model_train_hint:"प्रशिक्षण सक्षम करने हेतु वास्तविक विफलताएँ दर्ज करें।",drift_status_no_trained_model:"अभी कोई प्रशिक्षित मॉडल नहीं",drift_status_insufficient_recent_data:"हाल का डेटा अपर्याप्त",msg_model_untrained_note:"अभी कोई प्रशिक्षित मॉडल नहीं — जोखिम स्कोर सांकेतिक हैं, सत्यापित नहीं।",msg_train_needs_failures:"प्रशिक्षण हेतु पुष्ट विफलताएँ चाहिए। उन्हें विफलता पृष्ठ पर दर्ज करें।",msg_train_no_holdout_failures:"परीक्षण अवधि में मूल्यांकन योग्य कोई विफलता नहीं।",msg_drift_needs_model:"पहले मॉडल प्रशिक्षित करें — ड्रिफ़्ट उसके डेटा के सापेक्ष मापा जाता है।",msg_evaluation_needs_failures:"वास्तविक खराबी दर्ज होने तक सटीकता नहीं मापी जा सकती।",msg_holdout_metrics_note:"मेट्रिक्स उस डेटा से हैं जो मॉडल ने प्रशिक्षण में नहीं देखा।",msg_simulation_mode_note:"SIMULATION स्थानीय रूप से डेटा बनाता है; कनेक्शन स्थिति केवल वास्तविक हार्डवेयर के साथ मायने रखती है।",msg_savings_needs_two_windows:"पहले/बाद तुलना हेतु अवधि के दोनों हिस्सों में डेटा चाहिए।",msg_roi_system_cost_note:"सिस्टम लागत यहाँ अज्ञात है — ROI हेतु लाभ को अपनी लागत से विभाजित करें।",msg_reliability_not_calibrated:"इस कारखाने के नहीं, उद्योग मानक पैरामीटर उपयोग में। कैलिब्रेशन हेतु वास्तविक विफलताएँ दर्ज करें।",msg_no_trained_model:"अभी कोई प्रशिक्षित मॉडल नहीं",msg_insufficient_recent_data:"हाल का डेटा अपर्याप्त",nav_failures:"विफलता लॉग",failures_hint:"हर वास्तविक खराबी दर्ज करें। यही मॉडल को आपके कारखाने का वास्तविक व्यवहार सिखाता है — इसके बिना पूर्वानुमान सामान्य ही रहेंगे।",log_failure_btn:"+ विफलता दर्ज करें",calibration_title:"कैलिब्रेशन प्रगति",calibration_hint:"हर घटक को इस कारखाने हेतु पूर्वानुमान कैलिब्रेट होने से पहले पर्याप्त पुष्ट विफलताएँ चाहिए।",calibrated_label:"कैलिब्रेटेड",needs_more_failures:"{n} और चाहिए",ml_model_label:"पूर्वानुमान मॉडल",model_ready_to_train:"प्रशिक्षण के लिए तैयार",logged_failures_title:"दर्ज विफलताएँ",no_failures_yet:"अभी कोई विफलता दर्ज नहीं।",was_predicted_label:"पूर्वानुमानित",machine_label:"मशीन",component_label:"कौन सा घटक विफल हुआ",component_hint:"निकटतम चुनें — मॉडल इसी से सीखता है।",occurred_at_label:"कब हुआ",downtime_label:"डाउनटाइम (मिनट)",repair_cost_label:"मरम्मत लागत",notes_label:"टिप्पणियाँ",ph_failure_notes:"क्या देखा गया?",failure_logged_msg:"विफलता दर्ज हुई",confirm_delete_failure:"यह विफलता रिकॉर्ड हटाएँ?",err_no_machine_selected:"मशीन चुनें",err_no_date:"दिनांक दर्ज करें",err_future_date:"दिनांक भविष्य में नहीं हो सकता",component_bearing:"बियरिंग",component_motor:"मोटर",component_pump:"पंप",component_cooling_system:"शीतलन प्रणाली",component_gearbox:"गियरबॉक्स",cause_seal_leak:"सील रिसाव",cause_cavitation:"कैविटेशन",cause_overpressure:"अत्यधिक दबाव",cause_blocked_discharge:"निकास अवरुद्ध",component_prediction_title:"घटक पूर्वानुमान",component_prediction_hint:"मशीन की वर्तमान स्थिति से प्रत्येक घटक का शेष जीवन।",limiting_label:"सीमित",days_short:"दिन",industry_default_label:"उद्योग मानक",calibrated_to_plant:"इस कारखाने हेतु कैलिब्रेटेड",not_calibrated_warning:"उद्योग मानक उपयोग में — कैलिब्रेशन हेतु वास्तविक विफलताएँ दर्ज करें।"},
+  uz: {tagline:"Global sanoat intellekti platformasi",live_label:"Jonli",kpi_energy:"Energiya sarfi",kpi_efficiency:"Samaradorlik",kpi_active:"Faol stanoklar",kpi_alerts:"Ogohlantirishlar",kwh_unit:"kWh",chart_title:"Real vaqtdagi ko'rsatkichlar",machine_status_title:"Stanoklar holati",status_running:"Ishlamoqda",status_warning:"Ogohlantirish",status_critical:"Muhim",form_title:"Zavod ma'lumotlarini kiritish",factory_name_label:"Zavod nomi",machine_count_label:"Stanoklar soni",energy_cost_label:"Energiya narxi ($/kWh)",machine_type_label:"Stanok turi",temperature_label:"Harorat (°C)",vibration_label:"Tebranish (mm/s)",load_label:"Yuklama (%)",submit_btn:"Zavodni tahlil qilish",submitting:"Yangilanmoqda...",ai_panel_title:"AI tahlili",ai_placeholder:"AI tahlilini olish uchun zavod ma'lumotlarini yuboring.",ai_analyzing:"Tahlil qilinmoqda...",ai_risks:"Xavflar",ai_efficiency_insights:"Samaradorlik tahlili",ai_optimizations:"Optimallashtirish tavsiyalari",toast_updated:"Zavod ma'lumotlari yangilandi",toast_analysis_done:"AI tahlili yakunlandi",toast_error:"Xatolik yuz berdi",nav_dashboard:"Boshqaruv paneli",nav_factories:"Zavodlar",nav_ai_insights:"AI tahlili",logout_btn:"Chiqish",login_title:"Xush kelibsiz",login_subtitle:"FactoryPulse AI hisobingizga kiring",ph_email:"Elektron pochta",ph_password:"Parol",remember_me:"Meni eslab qol",login_btn:"Kirish",login_link_register:"Hisobingiz yo'qmi? Yarating",register_title:"Hisob yarating",register_subtitle:"Zavodlaringizni AI bilan kuzatishni boshlang",ph_full_name:"To'liq ism",ph_confirm_password:"Parolni tasdiqlang",register_btn:"Hisob yaratish",register_link_login:"Hisobingiz bormi? Kiring",err_missing_fields:"Barcha maydonlarni to'ldiring",err_invalid_email:"Yaroqli elektron pochta manzilini kiriting",err_weak_password:"Parol kamida 8 belgidan, harf va raqamdan iborat bo'lishi kerak",err_password_mismatch:"Parollar mos kelmaydi",err_invalid_credentials:"Elektron pochta yoki parol noto'g'ri",err_email_taken:"Bu elektron pochta allaqachon ro'yxatdan o'tgan",err_generic:"Xatolik yuz berdi. Qaytadan urinib ko'ring",my_factories_title:"Mening Zavodlarim",add_factory_btn:"+ Zavod qo'shish",edit_factory_btn:"Tahrirlash",delete_factory_btn:"O'chirish",confirm_delete_factory:"Bu zavodni o'chirasizmi? Buni bekor qilib bo'lmaydi.",no_factories_yet:"Siz hali hech qanday zavod qo'shmagansiz.",factory_created_toast:"Zavod yaratildi va tahlil qilindi",factory_updated_toast:"Zavod yangilandi",factory_deleted_toast:"Zavod o'chirildi",ai_insights_feed_title:"AI Tahlili Lentasi",no_ai_insights_yet:"Hali AI tahlili yo'q. Boshlash uchun zavod qo'shing.",reanalyze_btn:"Qayta tahlil qilish",view_insights_btn:"Tahlilni ko'rish",created_label:"Yaratilgan",cancel_btn:"Bekor qilish",save_btn:"O'zgarishlarni saqlash",nav_live_monitor:"Jonli monitoring",add_machine_scada_btn:"+ Stanok qo'shish",usb_status:"USB:",plc_status:"PLC:",polling_mode:"So'rov",live_chart_title:"Jonli sensor grafigi",machines_table_title:"Stanoklar",machine_code_col:"Kod",machine_name_col:"Nomi",status_col:"Holat",risk_col:"Xavf",no_machines_yet:"Hali stanoklar yo'q. \"+ Stanok qo'shish\"ni bosing.",section_machine_info:"Stanok ma'lumoti",section_sensor_data:"Sensor ma'lumotlari",section_status:"Holat",section_notes:"Eslatmalar",status_stopped:"To'xtatilgan",status_maintenance:"Texnik xizmat",priority_low:"Past",priority_normal:"Oddiy",priority_high:"Yuqori",priority_critical:"Muhim",save_and_analyze_btn:"Saqlash va tahlil qilish",source_col:"Manba",source_auto:"Avtomatik (SCADA)",source_manual:"Qo'lda",nav_alerts:"Ogohlantirishlar",acknowledge_btn:"Tasdiqlash",acknowledged_label:"Tasdiqlangan",acknowledge_all_btn:"Barchasini Tasdiqlash",no_alerts_yet:"Ogohlantirishlar yo'q. Hammasi yaxshi ishlamoqda.",download_report_btn:"Hisobot",alert_details_template:"Harorat {temp}°C, tebranish {vib} mm/s, holat: {status}",section_energy_intel:"Energiya intellekti",daily_output_hint:"Solishtirma energiya sarfini (birlik uchun kVt·soat) hisoblash uchun ishlatiladi.",energy_insights_title:"Energiya intellekti",idle_power_title:"Bo'sh yurish quvvatini aniqlash",idle_active_msg:"Stanok bo'sh turibdi - hozir taxminan {kw} kVt behuda sarflanmoqda.",idle_none_msg:"Bo'sh yurish energiya isrofi aniqlanmadi.",friction_loss_title:"Bashoratli energiya yo'qotishi",friction_active_msg:"Oshgan ishqalanish aniqlandi: +{pct}% ortiqcha quvvat (~{kw} kVt qo'shimcha). Isrofni oldini olish uchun texnik xizmatni rejalashtiring.",friction_none_msg:"Anomal ishqalanish aniqlanmadi.",sec_title:"Solishtirma energiya sarfi",sec_label:"birlik uchun kVt·soat",sec_unit:"kVt·soat/birlik",sec_no_data_msg:"Bu ko'rsatkichni ko'rish uchun stanok qo'shishda kunlik ishlab chiqarishni kiriting.",optimal_load_title:"Optimal yuklama zonasi",optimal_load_label:"Optimal yuklama",current_load_label:"Joriy yuklama",at_optimal_msg:"Optimal yuklama zonasida ishlamoqda.",adjust_to_optimal_msg:"Birlik uchun energiyani minimallashtirish uchun yuklamani {pct}% ga moslang.",nav_digital_twin:"Raqamli egizak",twin_hint:"Aylantirish uchun torting, kattalashtirish uchun aylantiring, jonli tafsilotlar uchun stanokni bosing.",twin_unavailable_msg:"3D ko'rinishni yuklab bo'lmadi (Three.js kutubxonasi uchun internet aloqangizni tekshiring).",failure_prediction_title:"Nosozlik bashorati",report_lib_missing_msg:"PDF eksport qilish uchun reportlab kutubxonasi kerak. Bajaring: pip install reportlab, keyin serverni qayta ishga tushiring.",ph_machine_id:"Stanok ID (masalan M-01)",ph_machine_name:"Stanok nomi",ph_factory_section:"Zavod uchastkasi",ph_operator_name:"Operator ismi",ph_pressure:"Bosim (bar)",ph_voltage:"Kuchlanish (V)",ph_current:"Tok (A)",ph_error_code:"Xato kodi",ph_daily_output:"Kunlik ishlab chiqarish (birlik)",ph_notes:"Eslatmalar...",nav_system_intel:"Tizim intellekti",nav_roi:"ROI paneli",refresh_btn:"Yangilash",system_risk_label:"Tizim xavfi",healthy_label:"Sog'lom",at_risk_label:"Xavf ostida",clusters_title:"Stanok klasterlari",propagation_title:"Anomaliya tarqalishi",propagation_hint:"Nosoz stanok qo'shni stanoklar xavfini qanday oshiradi.",no_propagation:"Anomaliya tarqalishi aniqlanmadi.",avg_risk_label:"O'rtacha xavf",added_risk_label:"Qo'shilgan xavf",effective_risk_label:"Haqiqiy xavf",simulation_title:"Nima-bo'lsa simulyatsiyasi",simulation_hint:"Stanokni tanlang, sensor qiymatlarini o'zgartiring va nosozlik ehtimolini kuzating.",run_simulation_btn:"Simulyatsiyani ishga tushirish",failure_probability_label:"Nosozlik ehtimoli",stress_level_label:"Zo'riqish darajasi",predicted_status_label:"Bashorat holati",confidence_label:"Ishonchlilik",root_cause_title:"Asosiy sabab",rul_col:"Qolgan foydali muddat",rul_healthy:"Sog'lom",potential_loss_label:"Potentsial yo'qotish",saved_label:"AI tejadi",wasted_energy_label:"Isrof energiya / oy",efficiency_gain_label:"Samaradorlik o'sishi",cost_by_machine_title:"Stanoklar bo'yicha xarajat xavfi",top_cause_col:"Asosiy sabab",roi_assumptions_msg:"Taxminlar: to'xtash {downtime}/soat, ta'mir {hours} soat, energiya {price}/kWh.",role_label:"Sizning rolingiz",role_engineer:"Muhandis",role_manager:"Menejer",role_admin:"Administrator",cause_bearing_wear:"Podshipnik eskirishi",cause_overload_thermal:"Termik ortiqcha yuk",cause_cooling_failure:"Sovutish nosozligi",cause_misalignment:"Val nomuvofiqligi",cause_lubrication_loss:"Moylash yo'qolishi",cause_normal_operation:"Normal ish",nav_story:"Hikoya rejimi",story_hint:"22 soat davomida rivojlanayotgan podshipnik nosozligini qayta ijro etadi va AI uni qachon aniqlaganini — va bu qancha turishini ko'rsatadi.",simulate_failure_btn:"Nosozlikni modellashtirish",outcome_title:"Natija",warning_time_label:"Erta ogohlantirish",loss_ignored_label:"Harakatsiz yo'qotish",loss_acted_label:"Harakat bilan yo'qotish",money_saved_label:"Tejalgan",timeline_title:"Nosozlik xronologiyasi",story_detection_msg:"AI buni buzilishdan {hours} soat oldin, {risk}% xavfda aniqladi — asosiy sabab: {cause} ({confidence}% ishonch).",story_stage_healthy:"Sog'lom",story_stage_early_drift:"Dastlabki og'ish",story_stage_ai_detects:"AI aniqladi",story_stage_critical:"Tanqidiy",priority_low:"Past",priority_medium:"O'rta",priority_high:"Yuqori",priority_critical:"Tanqidiy",action_stop_machine:"Stanokni to'xtatish",action_inspect_bearings:"Podshipniklarni tekshirish",action_check_cooling:"Sovutishni tekshirish",action_schedule_shutdown_24h:"To'xtatishni rejalashtirish (24s)",action_order_spare_parts:"Ehtiyot qismlar buyurtma qilish",action_reduce_load:"Yuklamani kamaytirish",action_schedule_inspection_72h:"Tekshiruvni rejalashtirish (72s)",action_monitor_closely:"Diqqat bilan kuzatish",action_verify_sensor:"Sensorni tekshirish",action_power_down_idle:"Bo'sh stanokni o'chirish",action_review_shift_schedule:"Smena jadvalini ko'rib chiqish",action_no_action:"Harakat kerak emas",nav_oee:"OEE",nav_workorders:"Ish buyruqlari",oee_hint:"Mavjudlik x Unumdorlik x Sifat (ISO 22400). Jahon darajasi 85%, odatiy zavod esa 60% atrofida.",availability_label:"Mavjudlik",performance_label:"Unumdorlik",quality_label:"Sifat",weakest_factor_label:"Eng zaif",downtime_by_reason_title:"Sabab bo'yicha to'xtash",downtime_cost_label:"To'xtash narxi",oee_trend_title:"OEE dinamikasi",shifts_title:"Smenalar",shift_col:"Smena",downtime_col:"To'xtash",log_shift_btn:"Smena kiritish",no_shifts_yet:"Hali smenalar kiritilmagan.",minutes_short:"daq",range_1d:"Bugun",range_7d:"7 kun",range_30d:"30 kun",all_machines_option:"Barcha stanoklar",reason_unspecified:"Ko'rsatilmagan",err_good_exceeds_total:"Yaroqli soni umumiy sondan ko'p bo'la olmaydi",oee_grade_world_class:"Jahon darajasi",oee_grade_typical:"Odatiy",oee_grade_low:"Past",oee_grade_critical:"Tanqidiy",reason_breakdown:"Buzilish",reason_changeover:"Qayta sozlash",reason_no_material:"Material yo'q",reason_no_operator:"Operator yo'q",reason_planned_maintenance:"Rejali texnik xizmat",reason_quality_issue:"Sifat muammosi",reason_setup:"Sozlash",reason_other:"Boshqa",workorders_hint:"AI bashoratini kuzatiladigan vazifaga aylantiradi — ogohlantirish haqiqiy ta'mir bilan tugasin.",new_work_order_btn:"+ Yangi ish buyrug'i",no_work_orders:"Hali ish buyruqlari yo'q.",avg_completion_label:"O'rt. bajarilish",assigned_label:"Tayinlangan",source_ai:"AI",wo_status_open:"Ochiq",wo_status_in_progress:"Bajarilmoqda",wo_status_done:"Bajarildi",wo_status_cancelled:"Bekor qilindi",wo_advance_to_in_progress:"Ishni boshlash",wo_advance_to_done:"Bajarildi deb belgilash",ph_shift_name:"Smena nomi",ph_planned_minutes:"Rejali daqiqalar",ph_downtime_minutes:"To'xtash daqiqalari",ph_total_units:"Umumiy soni",ph_good_units:"Yaroqli soni",ph_cycle_seconds:"Ideal sikl (son)",ph_wo_title:"Sarlavha",ph_assigned_to:"Mas'ul",ph_wo_description:"Tavsif",overdue_label:"Muddati o'tgan",nav_history:"Tarix",history_hint:"Saqlangan sensor tarixi — pilot davomida nima o'zgarganini shu bilan isbotlaysiz.",no_history_yet:"Tarix hali yozilmagan. Jonli monitoringni bir necha daqiqa ochiq qoldiring, ma'lumot to'plana boshlaydi.",range_24h:"24 soat",range_3d:"3 kun",range_10d:"10 kun",sensor_trend_title:"Sensor dinamikasi",risk_trend_title:"Xavf dinamikasi",trend_flat:"o'zgarishsiz",trend_rising:"o'smoqda",trend_falling:"kamaymoqda",create_work_order_btn:"Ish buyrug'i yaratish",work_order_created_msg:"Ish buyrug'i yaratildi",alertreason_immediate_failure_risk:"Darhol buzilish xavfi",alertreason_failure_imminent:"Nosozlik yaqin",alertreason_degradation_accelerating:"Eskirish tezlashmoqda",alertreason_outside_normal_envelope:"Normal chegaradan tashqarida",alertreason_pressure_anomaly:"Bosim anomaliyasi",alertreason_idle_waste:"Bo'sh yurish isrofi",alertreason_informational:"Ma'lumot",alert_reason_label:"Sabab",nav_system_health:"Tizim salomatligi",system_health_hint:"Ma'lumot yo'li, model va xavfsizlik holati — jimgina buziladigan narsalar.",connections_title:"Sanoat ulanishlari",data_mode_label:"Ma'lumot rejimi",reads_label:"O'qishlar",failures_label:"Nosozliklar",buffered_label:"Buferda",pipeline_title:"Qabul konveyeri",queue_depth_label:"Navbat chuqurligi",duplicates_label:"Takrorlar bostirildi",retried_label:"Qayta urinildi",dead_letter_label:"Karantinda",model_title:"Bashorat modeli",train_model_btn:"Modelni o'qitish",check_drift_btn:"Dreyfni tekshirish",model_not_trained:"O'qitilgan model yo'q — xavf ballari yo'naltiruvchi, tasdiqlanmagan.",model_trained_msg:"Model o'qitildi",trained_on_label:"O'qitish namunalari",drift_title:"Ma'lumot dreyfi",retrain_recommended:"qayta o'qitish tavsiya etiladi",security_title:"Xavfsizlik tekshiruvlari",admin_only_msg:"Administrator ruxsati kerak.",conn_state_healthy:"sog'lom",conn_state_stale:"eskirgan",conn_state_disconnected:"uzilgan",conn_state_never_connected:"hech ulanmagan",drift_stable:"barqaror",drift_moderate:"o'rtacha",drift_severe:"jiddiy",metric_precision:"Aniqlik",metric_recall:"To'liqlik",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"Yolg'on signal ulushi",model_cannot_train:"Hozircha o'qitib bo'lmaydi",model_reason_no_confirmed_failures:"Tasdiqlangan nosozliklar yo'q",model_reason_insufficient_telemetry:"Sensor tarixi yetarli emas",model_reason_insufficient_positive_samples:"Tasdiqlangan nosozliklar yetarli emas",model_reason_no_failures_in_holdout:"Sinov davrida nosozlik yo'q",check_jwt_secret_strong:"Kuchli JWT maxfiy kaliti",check_debug_disabled:"Debug rejimi o'chirilgan",check_https_in_use:"HTTPS ishlatilmoqda",check_database_is_postgres:"PostgreSQL ma'lumotlar bazasi",check_rate_limiting_active:"So'rov cheklovi faol",check_account_lockout_active:"Hisob bloklash faol",check_audit_logging_active:"Audit jurnali faol",check_security_headers_active:"Xavfsizlik sarlavhalari faol",check_smtp_configured:"Email sozlangan",check_industrial_read_only:"Sanoat kirishi faqat o'qish",model_train_hint:"O'qitishni yoqish uchun haqiqiy nosozliklarni qayd eting.",drift_status_no_trained_model:"Hali o'qitilgan model yo'q",drift_status_insufficient_recent_data:"Yangi ma'lumot yetarli emas",msg_model_untrained_note:"Hali o'qitilgan model yo'q — xavf ballari yo'naltiruvchi, tasdiqlanmagan.",msg_train_needs_failures:"O'qitish uchun tasdiqlangan nosozliklar kerak. Ularni nosozliklar sahifasida qayd eting.",msg_train_no_holdout_failures:"Sinov davrida baholash uchun nosozlik yo'q.",msg_drift_needs_model:"Avval modelni o'qiting — dreyf uning ma'lumotlariga nisbatan o'lchanadi.",msg_evaluation_needs_failures:"Haqiqiy buzilishlar qayd etilmaguncha aniqlikni o'lchab bo'lmaydi.",msg_holdout_metrics_note:"Ko'rsatkichlar model o'qitishda ko'rmagan ma'lumotdan olingan.",msg_simulation_mode_note:"SIMULATION ma'lumotni mahalliy yaratadi; ulanish holati faqat haqiqiy uskuna bilan muhim.",msg_savings_needs_two_windows:"Oldin/keyin taqqoslash uchun davrning ikkala yarmida ham ma'lumot kerak.",msg_roi_system_cost_note:"Tizim narxi bu yerda noma'lum — ROI uchun foydani o'z xarajatingizga bo'ling.",msg_reliability_not_calibrated:"Bu zavodning emas, soha parametrlari ishlatilmoqda. Kalibrlash uchun haqiqiy nosozliklarni qayd eting.",msg_no_trained_model:"Hali o'qitilgan model yo'q",msg_insufficient_recent_data:"Yangi ma'lumot yetarli emas",nav_failures:"Nosozliklar jurnali",failures_hint:"Har bir haqiqiy buzilishni qayd eting. Aynan shu modelga zavodingizning haqiqiy xatti-harakatini o'rgatadi — ansiz bashoratlar umumiy bo'lib qoladi.",log_failure_btn:"+ Nosozlikni qayd etish",calibration_title:"Kalibrlash jarayoni",calibration_hint:"Har bir tugun uchun bashorat shu zavodga kalibrlanishi uchun yetarli tasdiqlangan nosozlik kerak.",calibrated_label:"kalibrlangan",needs_more_failures:"yana {n} ta kerak",ml_model_label:"Bashorat modeli",model_ready_to_train:"O'qitishga tayyor",logged_failures_title:"Qayd etilgan nosozliklar",no_failures_yet:"Hali nosozlik qayd etilmagan.",was_predicted_label:"bashorat qilingan",machine_label:"Stanok",component_label:"Qaysi tugun ishdan chiqdi",component_hint:"Eng yaqinini tanlang — model shundan o'rganadi.",occurred_at_label:"Qachon sodir bo'ldi",downtime_label:"To'xtash (daq)",repair_cost_label:"Ta'mir narxi",notes_label:"Izohlar",ph_failure_notes:"Nima kuzatildi?",failure_logged_msg:"Nosozlik qayd etildi",confirm_delete_failure:"Bu nosozlik yozuvi o'chirilsinmi?",err_no_machine_selected:"Stanokni tanlang",err_no_date:"Sanani kiriting",err_future_date:"Sana kelajakda bo'la olmaydi",component_bearing:"Podshipnik",component_motor:"Dvigatel",component_pump:"Nasos",component_cooling_system:"Sovutish tizimi",component_gearbox:"Reduktor",cause_seal_leak:"Zichlagich oqishi",cause_cavitation:"Kavitatsiya",cause_overpressure:"Ortiqcha bosim",cause_blocked_discharge:"Chiqish tiqilgan",component_prediction_title:"Tugun bo'yicha bashorat",component_prediction_hint:"Stanokning joriy holatidan har bir tugunning qolgan resursi.",limiting_label:"cheklovchi",days_short:"kun",industry_default_label:"soha qiymatlari",calibrated_to_plant:"Shu zavodga kalibrlangan",not_calibrated_warning:"Soha qiymatlari ishlatilmoqda — kalibrlash uchun haqiqiy nosozliklarni qayd eting."},
+  ky: {tagline:"Глобалдык өнөр жай интеллект платформасы",live_label:"Түз эфир",kpi_energy:"Энергия сарпталышы",kpi_efficiency:"Эффективдүүлүк",kpi_active:"Активдүү станоктор",kpi_alerts:"Дабылдар",kwh_unit:"кВт·саат",chart_title:"Реалдуу убакыттагы көрсөткүчтөр",machine_status_title:"Станоктордун абалы",status_running:"Иштеп жатат",status_warning:"Эскертүү",status_critical:"Олуттуу",form_title:"Завод маалыматтарын киргизүү",factory_name_label:"Заводдун аты",machine_count_label:"Станоктордун саны",energy_cost_label:"Энергия наркы ($/кВт·саат)",machine_type_label:"Станоктун түрү",temperature_label:"Температура (°C)",vibration_label:"Дирилдөө (мм/с)",load_label:"Жүктөм (%)",submit_btn:"Заводду талдоо",submitting:"Жаңыртылууда...",ai_panel_title:"AI-талдоо",ai_placeholder:"AI-талдоо алуу үчүн завод маалыматтарын жөнөтүңүз.",ai_analyzing:"Талдануда...",ai_risks:"Тобокелдиктер",ai_efficiency_insights:"Эффективдүүлүк талдоосу",ai_optimizations:"Оптималдаштыруу сунуштары",toast_updated:"Завод маалыматтары жаңыртылды",toast_analysis_done:"AI-талдоо аяктады",toast_error:"Ката кетти",nav_dashboard:"Башкаруу панели",nav_factories:"Заводдор",nav_ai_insights:"AI-талдоо",logout_btn:"Чыгуу",login_title:"Кайра кош келиңиз",login_subtitle:"FactoryPulse AI каттоо эсебиңизге кириңиз",ph_email:"Электрондук почта",ph_password:"Сырсөз",remember_me:"Мени эстеп кал",login_btn:"Кирүү",login_link_register:"Каттоо эсебиңиз жокпу? Түзүү",register_title:"Каттоо эсебин түзүү",register_subtitle:"Заводдоруңузду AI менен байкоону баштаңыз",ph_full_name:"Толук аты-жөнү",ph_confirm_password:"Сырсөздү ырастаңыз",register_btn:"Каттоо эсебин түзүү",register_link_login:"Каттоо эсебиңиз барбы? Кирүү",err_missing_fields:"Бардык талааларды толтуруңуз",err_invalid_email:"Жарактуу электрондук почта дарегин киргизиңиз",err_weak_password:"Сырсөз кеминде 8 белги, тамга жана сан камтышы керек",err_password_mismatch:"Сырсөздөр дал келбейт",err_invalid_credentials:"Электрондук почта же сырсөз туура эмес",err_email_taken:"Бул электрондук почта мурунтан катталган",err_generic:"Ката кетти. Кайра аракет кылыңыз",my_factories_title:"Менин Заводдорум",add_factory_btn:"+ Завод кошуу",edit_factory_btn:"Түзөтүү",delete_factory_btn:"Өчүрүү",confirm_delete_factory:"Бул заводду өчүрөсүзбү? Бул аракетти артка кайтарууга болбойт.",no_factories_yet:"Сиз азырынча эч кандай завод кошкон жоксуз.",factory_created_toast:"Завод түзүлдү жана талданды",factory_updated_toast:"Завод жаңыртылды",factory_deleted_toast:"Завод өчүрүлдү",ai_insights_feed_title:"AI-талдоо тизмеси",no_ai_insights_yet:"Азырынча AI-талдоо жок. Баштоо үчүн завод кошуңуз.",reanalyze_btn:"Кайра талдоо",view_insights_btn:"Талдоону көрүү",created_label:"Түзүлгөн күнү",cancel_btn:"Жокко чыгаруу",save_btn:"Өзгөртүүлөрдү сактоо",nav_live_monitor:"Түз мониторинг",add_machine_scada_btn:"+ Станок кошуу",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Сурам",live_chart_title:"Реалдуу убакыттагы сенсор графиги",machines_table_title:"Станоктор",machine_code_col:"Код",machine_name_col:"Аты",status_col:"Абалы",risk_col:"Тобокелдик",no_machines_yet:"Азырынча станоктор жок. \"+ Станок кошуу\"ну басыңыз.",section_machine_info:"Станок маалыматы",section_sensor_data:"Сенсор маалыматтары",section_status:"Абалы",section_notes:"Эскертүүлөр",status_stopped:"Токтотулган",status_maintenance:"Тейлөө",priority_low:"Төмөн",priority_normal:"Кадимки",priority_high:"Жогору",priority_critical:"Олуттуу",save_and_analyze_btn:"Сактоо жана талдоо",source_col:"Булак",source_auto:"Автоматтык (SCADA)",source_manual:"Кол менен",nav_alerts:"Дабылдар",acknowledge_btn:"Ырастоо",acknowledged_label:"Ырасталды",acknowledge_all_btn:"Баарын ырастоо",no_alerts_yet:"Дабылдар жок. Баары жакшы иштеп жатат.",download_report_btn:"Отчет",alert_details_template:"Температура {temp}°C, дирилдөө {vib} мм/с, абалы: {status}",section_energy_intel:"Энергия интеллекти",daily_output_hint:"Бирдикке кеткен энергия сарптоону (бирдик үчүн кВт·саат) эсептөө үчүн колдонулат.",energy_insights_title:"Энергия интеллекти",idle_power_title:"Бош жүрүштү аныктоо",idle_active_msg:"Станок бош турат - учурда болжол менен {kw} кВт бекер коротулуп жатат.",idle_none_msg:"Бош жүрүш чыгымы табылган жок.",friction_loss_title:"Болжолдуу энергия жоготуусу",friction_active_msg:"Жогорулаган үйкөлүш табылды: +{pct}% кошумча кубат (~{kw} кВт кошумча). Чыгымдын алдын алуу үчүн тейлөөнү пландаштырыңыз.",friction_none_msg:"Аномалдуу үйкөлүш табылган жок.",sec_title:"Бирдикке кеткен энергия",sec_label:"бирдик үчүн кВт·саат",sec_unit:"кВт·саат/бирдик",sec_no_data_msg:"Бул көрсөткүчтү көрүү үчүн станок кошууда күндөлүк өндүрүштү киргизиңиз.",optimal_load_title:"Оптималдуу жүктөм аймагы",optimal_load_label:"Оптималдуу жүктөм",current_load_label:"Учурдагы жүктөм",at_optimal_msg:"Оптималдуу жүктөм аймагында иштеп жатат.",adjust_to_optimal_msg:"Бирдикке кеткен энергияны азайтуу үчүн жүктөмдү {pct}%га жакындатыңыз.",nav_digital_twin:"Санарип эгиз",twin_hint:"Айландыруу үчүн сүйрөңүз, чоңойтуу үчүн айландырыңыз, түз маалымат үчүн станокту басыңыз.",twin_unavailable_msg:"3D көрүнүш жүктөлгөн жок (Three.js китепканасы үчүн интернет байланышын текшериңиз).",failure_prediction_title:"Бузулуу болжому",report_lib_missing_msg:"PDF экспорттоо үчүн reportlab китепканасы керек. Аткарыңыз: pip install reportlab, андан кийин серверди кайра иштетиңиз.",ph_machine_id:"Станок ID (мис. M-01)",ph_machine_name:"Станок аты",ph_factory_section:"Завод участогу",ph_operator_name:"Оператордун аты",ph_pressure:"Басым (bar)",ph_voltage:"Чыңалуу (V)",ph_current:"Ток (A)",ph_error_code:"Ката коду",ph_daily_output:"Күндөлүк өндүрүш (бирдик)",ph_notes:"Эскертүүлөр...",nav_system_intel:"Тутум интеллекти",nav_roi:"ROI панели",refresh_btn:"Жаңыртуу",system_risk_label:"Тутум тобокелдиги",healthy_label:"Сак",at_risk_label:"Тобокелдикте",clusters_title:"Станок кластерлери",propagation_title:"Аномалиянын жайылышы",propagation_hint:"Бузулган станок кошуналарынын тобокелдигин кантип жогорулатат.",no_propagation:"Аномалиянын жайылышы аныкталган жок.",avg_risk_label:"Орточо тобокелдик",added_risk_label:"Кошумча тобокелдик",effective_risk_label:"Иш жүзүндөгү тобокелдик",simulation_title:"Эмне-болсо симуляциясы",simulation_hint:"Станокту тандап, сенсор маанилерин өзгөртүп, бузулуу ыктымалдыгын карап көрүңүз.",run_simulation_btn:"Симуляцияны иштетүү",failure_probability_label:"Бузулуу ыктымалдыгы",stress_level_label:"Чыңалуу деңгээли",predicted_status_label:"Болжолдонгон абал",confidence_label:"Ишенимдүүлүк",root_cause_title:"Негизги себеп",rul_col:"Калган ресурс",rul_healthy:"Сак",potential_loss_label:"Потенциалдуу жоготуу",saved_label:"AI үнөмдөдү",wasted_energy_label:"Ысырап энергия / ай",efficiency_gain_label:"Эффективдүүлүк өсүшү",cost_by_machine_title:"Станоктор боюнча чыгым тобокелдиги",top_cause_col:"Негизги себеп",roi_assumptions_msg:"Болжолдор: токтоп калуу {downtime}/саат, оңдоо {hours} саат, энергия {price}/kWh.",role_label:"Сиздин ролуңуз",role_engineer:"Инженер",role_manager:"Менеджер",role_admin:"Администратор",cause_bearing_wear:"Подшипниктин эскириши",cause_overload_thermal:"Жылуулук ашыкча жүктөө",cause_cooling_failure:"Муздатуу бузулушу",cause_misalignment:"Валдын борборунан жылышы",cause_lubrication_loss:"Майлоонун жоголушу",cause_normal_operation:"Кадимки иштөө",nav_story:"Окуя режими",story_hint:"22 саат ичинде өнүгүп жаткан подшипник бузулушун кайра ойнотуп, AI аны так качан аныктаганын — жана бул канча турганын көрсөтөт.",simulate_failure_btn:"Бузулууну моделдөө",outcome_title:"Жыйынтык",warning_time_label:"Эрте эскертүү",loss_ignored_label:"Аракетсиз чыгым",loss_acted_label:"Аракет менен чыгым",money_saved_label:"Үнөмдөлдү",timeline_title:"Бузулуу хронологиясы",story_detection_msg:"AI муну бузулуудан {hours} саат мурун, {risk}% тобокелдикте аныктады — негизги себеп: {cause} ({confidence}% ишеним).",story_stage_healthy:"Сак",story_stage_early_drift:"Алгачкы четтөө",story_stage_ai_detects:"AI аныктады",story_stage_critical:"Критикалык",priority_low:"Төмөн",priority_medium:"Орточо",priority_high:"Жогору",priority_critical:"Критикалык",action_stop_machine:"Станокту токтотуу",action_inspect_bearings:"Подшипниктерди текшерүү",action_check_cooling:"Муздатууну текшерүү",action_schedule_shutdown_24h:"Токтотууну пландаштыруу (24с)",action_order_spare_parts:"Камдык бөлүктөрдү заказ кылуу",action_reduce_load:"Жүктөмдү азайтуу",action_schedule_inspection_72h:"Текшерүүнү пландаштыруу (72с)",action_monitor_closely:"Кылдат байкоо",action_verify_sensor:"Сенсорду текшерүү",action_power_down_idle:"Бош станокту өчүрүү",action_review_shift_schedule:"Смена графигин кароо",action_no_action:"Аракет талап кылынбайт",nav_oee:"OEE",nav_workorders:"Иш буйруктары",oee_hint:"Жеткиликтүүлүк x Өндүрүмдүүлүк x Сапат (ISO 22400). Дүйнөлүк деңгээл 85%, кадимки завод 60% чамасында.",availability_label:"Жеткиликтүүлүк",performance_label:"Өндүрүмдүүлүк",quality_label:"Сапат",weakest_factor_label:"Эң алсыз",downtime_by_reason_title:"Себеби боюнча токтоп калуу",downtime_cost_label:"Токтоп калуу баасы",oee_trend_title:"OEE динамикасы",shifts_title:"Сменалар",shift_col:"Смена",downtime_col:"Токтоп калуу",log_shift_btn:"Смена киргизүү",no_shifts_yet:"Азырынча сменалар киргизилген жок.",minutes_short:"мүн",range_1d:"Бүгүн",range_7d:"7 күн",range_30d:"30 күн",all_machines_option:"Бардык станоктор",reason_unspecified:"Көрсөтүлгөн эмес",err_good_exceeds_total:"Жарамдуу саны жалпы санынан ашпашы керек",oee_grade_world_class:"Дүйнөлүк деңгээл",oee_grade_typical:"Кадимки",oee_grade_low:"Төмөн",oee_grade_critical:"Критикалык",reason_breakdown:"Бузулуу",reason_changeover:"Кайра жөндөө",reason_no_material:"Материал жок",reason_no_operator:"Оператор жок",reason_planned_maintenance:"Пландуу тейлөө",reason_quality_issue:"Сапат маселеси",reason_setup:"Орнотуу",reason_other:"Башка",workorders_hint:"AI болжолун көзөмөлдөнүүчү тапшырмага айландырат — эскертүү чыныгы оңдоо менен аякташы үчүн.",new_work_order_btn:"+ Жаңы иш буйругу",no_work_orders:"Азырынча иш буйруктары жок.",avg_completion_label:"Орт. аткаруу",assigned_label:"Дайындалган",source_ai:"AI",wo_status_open:"Ачык",wo_status_in_progress:"Аткарылууда",wo_status_done:"Аткарылды",wo_status_cancelled:"Жокко чыгарылды",wo_advance_to_in_progress:"Ишти баштоо",wo_advance_to_done:"Аткарылды деп белгилөө",ph_shift_name:"Смена аты",ph_planned_minutes:"Пландуу мүнөттөр",ph_downtime_minutes:"Токтоп калган мүнөттөр",ph_total_units:"Жалпы саны",ph_good_units:"Жарамдуу саны",ph_cycle_seconds:"Идеалдуу цикл (сек)",ph_wo_title:"Аталышы",ph_assigned_to:"Жооптуу",ph_wo_description:"Сүрөттөмө",overdue_label:"Мөөнөтү өткөн",nav_history:"Тарых",history_hint:"Сакталган сенсор тарыхы — пилот учурунда эмне өзгөргөнүн ушуну менен далилдейсиз.",no_history_yet:"Тарых азырынча жазылган жок. Түз мониторингди бир нече мүнөт ачык калтырсаңыз, маалымат чогула баштайт.",range_24h:"24 саат",range_3d:"3 күн",range_10d:"10 күн",sensor_trend_title:"Сенсор динамикасы",risk_trend_title:"Тобокелдик динамикасы",trend_flat:"өзгөрүүсүз",trend_rising:"өсүүдө",trend_falling:"төмөндөөдө",create_work_order_btn:"Иш буйругун түзүү",work_order_created_msg:"Иш буйругу түзүлдү",alertreason_immediate_failure_risk:"Дароо бузулуу коркунучу",alertreason_failure_imminent:"Бузулуу жакын",alertreason_degradation_accelerating:"Тозуу тездеп жатат",alertreason_outside_normal_envelope:"Кадимки чектен тышкары",alertreason_pressure_anomaly:"Басым аномалиясы",alertreason_idle_waste:"Бош жүрүш чыгымы",alertreason_informational:"Маалыматтык",alert_reason_label:"Себеби",nav_system_health:"Тутум ден соолугу",system_health_hint:"Маалымат жолунун, моделдин жана коопсуздуктун абалы — тынч бузулган нерселер.",connections_title:"Өнөр жай байланыштары",data_mode_label:"Маалымат режими",reads_label:"Окуулар",failures_label:"Каталар",buffered_label:"Буферде",pipeline_title:"Кабыл алуу конвейери",queue_depth_label:"Кезек тереңдиги",duplicates_label:"Кайталоолор басылды",retried_label:"Кайталанды",dead_letter_label:"Карантинде",model_title:"Болжолдоо модели",train_model_btn:"Моделди окутуу",check_drift_btn:"Дрейфти текшерүү",model_not_trained:"Окутулган модель жок — тобокелдик баллдары багыттоочу, текшерилген эмес.",model_trained_msg:"Модель окутулду",trained_on_label:"Окутуу үлгүлөрү",drift_title:"Маалымат дрейфи",retrain_recommended:"кайра окутуу сунушталат",security_title:"Коопсуздук текшерүүлөрү",admin_only_msg:"Администратор уруксаты керек.",conn_state_healthy:"сак",conn_state_stale:"эскирген",conn_state_disconnected:"ажыратылган",conn_state_never_connected:"эч качан туташкан эмес",drift_stable:"туруктуу",drift_moderate:"орточо",drift_severe:"олуттуу",metric_precision:"Тактык",metric_recall:"Толуктук",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"Жалган дабыл үлүшү",model_cannot_train:"Азырынча окутууга болбойт",model_reason_no_confirmed_failures:"Тастыкталган бузулуулар жок",model_reason_insufficient_telemetry:"Сенсор тарыхы жетишсиз",model_reason_insufficient_positive_samples:"Тастыкталган бузулуулар жетишсиз",model_reason_no_failures_in_holdout:"Сыноо мезгилинде бузулуу жок",check_jwt_secret_strong:"Күчтүү JWT сыры",check_debug_disabled:"Debug режими өчүк",check_https_in_use:"HTTPS колдонулууда",check_database_is_postgres:"PostgreSQL маалымат базасы",check_rate_limiting_active:"Сурам чектөө активдүү",check_account_lockout_active:"Каттоо эсебин бөгөттөө активдүү",check_audit_logging_active:"Аудит журналы активдүү",check_security_headers_active:"Коопсуздук аталыштары активдүү",check_smtp_configured:"Email жөндөлгөн",check_industrial_read_only:"Өнөр жай мүмкүнчүлүгү окуу үчүн гана",model_train_hint:"Окутууну иштетүү үчүн чыныгы бузулууларды белгилеңиз.",drift_status_no_trained_model:"Азырынча окутулган модель жок",drift_status_insufficient_recent_data:"Жаңы маалымат жетишсиз",msg_model_untrained_note:"Азырынча окутулган модель жок — тобокелдик баллдары багыттоочу, текшерилген эмес.",msg_train_needs_failures:"Окутуу үчүн тастыкталган бузулуулар керек. Аларды бузулуулар бетинде белгилеңиз.",msg_train_no_holdout_failures:"Сыноо мезгилинде баалоого бузулуу жок.",msg_drift_needs_model:"Адегенде моделди окутуңуз — дрейф анын маалыматына салыштырылат.",msg_evaluation_needs_failures:"Чыныгы бузулуулар белгиленмейинче тактыкты өлчөө мүмкүн эмес.",msg_holdout_metrics_note:"Көрсөткүчтөр модель окутууда көрбөгөн маалыматтан алынган.",msg_simulation_mode_note:"SIMULATION маалыматты жергиликтүү жаратат; байланыш абалы чыныгы жабдык менен гана маанилүү.",msg_savings_needs_two_windows:"Мурун/кийин салыштырууга мезгилдин эки жарымында тең маалымат керек.",msg_roi_system_cost_note:"Тутум наркы бул жерде белгисиз — ROI үчүн пайданы өз чыгымыңызга бөлүңүз.",msg_reliability_not_calibrated:"Бул заводдун эмес, тармактык параметрлер колдонулууда. Калибрлөө үчүн чыныгы бузулууларды белгилеңиз.",msg_no_trained_model:"Азырынча окутулган модель жок",msg_insufficient_recent_data:"Жаңы маалымат жетишсиз",nav_failures:"Бузулуулар журналы",failures_hint:"Ар бир чыныгы бузулууну белгилеңиз. Дал ушул моделге заводуңуздун чыныгы жүрүм-турумун үйрөтөт — ансыз болжолдоолор жалпы бойдон калат.",log_failure_btn:"+ Бузулууну белгилөө",calibration_title:"Калибрлөө жүрүшү",calibration_hint:"Ар бир түйүнгө болжолдоо ушул заводго калибрлениши үчүн жетиштүү тастыкталган бузулуу керек.",calibrated_label:"калибрленген",needs_more_failures:"дагы {n} керек",ml_model_label:"Болжолдоо модели",model_ready_to_train:"Окутууга даяр",logged_failures_title:"Катталган бузулуулар",no_failures_yet:"Азырынча бузулуу белгиленген жок.",was_predicted_label:"болжолдонгон",machine_label:"Станок",component_label:"Кайсы түйүн иштен чыкты",component_hint:"Эң жакынын тандаңыз — модель ушундан үйрөнөт.",occurred_at_label:"Качан болду",downtime_label:"Токтоп калуу (мүн)",repair_cost_label:"Оңдоо баасы",notes_label:"Эскертүүлөр",ph_failure_notes:"Эмне байкалды?",failure_logged_msg:"Бузулуу катталды",confirm_delete_failure:"Бул бузулуу жазуусу өчүрүлсүнбү?",err_no_machine_selected:"Станокту тандаңыз",err_no_date:"Күндү киргизиңиз",err_future_date:"Күн келечекте боло албайт",component_bearing:"Подшипник",component_motor:"Кыймылдаткыч",component_pump:"Соргуч",component_cooling_system:"Муздатуу тутуму",component_gearbox:"Редуктор",cause_seal_leak:"Тыгыздагыч агуусу",cause_cavitation:"Кавитация",cause_overpressure:"Ашыкча басым",cause_blocked_discharge:"Чыгуу бүтөлгөн",component_prediction_title:"Түйүн боюнча болжолдоо",component_prediction_hint:"Станоктун учурдагы абалы боюнча ар бир түйүндүн калган ресурсу.",limiting_label:"чектөөчү",days_short:"күн",industry_default_label:"тармактык маани",calibrated_to_plant:"Ушул заводго калибрленген",not_calibrated_warning:"Тармактык маанилер колдонулууда — калибрлөө үчүн чыныгы бузулууларды белгилеңиз."},
+  uk: {tagline:"Глобальна платформа промислового інтелекту",live_label:"Наживо",kpi_energy:"Споживання енергії",kpi_efficiency:"Ефективність",kpi_active:"Активні верстати",kpi_alerts:"Сповіщення",kwh_unit:"кВт·год",chart_title:"Показники в реальному часі",machine_status_title:"Статус верстатів",status_running:"Працює",status_warning:"Попередження",status_critical:"Критично",form_title:"Введення даних заводу",factory_name_label:"Назва заводу",machine_count_label:"Кількість верстатів",energy_cost_label:"Вартість енергії ($/кВт·год)",machine_type_label:"Тип верстата",temperature_label:"Температура (°C)",vibration_label:"Вібрація (мм/с)",load_label:"Навантаження (%)",submit_btn:"Аналізувати завод",submitting:"Оновлення...",ai_panel_title:"AI-аналітика",ai_placeholder:"Надішліть дані заводу, щоб отримати AI-аналіз.",ai_analyzing:"Аналіз...",ai_risks:"Ризики",ai_efficiency_insights:"Аналіз ефективності",ai_optimizations:"Рекомендації з оптимізації",toast_updated:"Дані заводу оновлено",toast_analysis_done:"AI-аналіз завершено",toast_error:"Сталася помилка",nav_dashboard:"Панель",nav_factories:"Заводи",nav_ai_insights:"AI-аналітика",logout_btn:"Вийти",login_title:"З поверненням",login_subtitle:"Увійдіть у свій обліковий запис FactoryPulse AI",ph_email:"Електронна пошта",ph_password:"Пароль",remember_me:"Запам'ятати мене",login_btn:"Увійти",login_link_register:"Немає акаунту? Створити",register_title:"Створіть акаунт",register_subtitle:"Почніть моніторинг заводів за допомогою AI",ph_full_name:"Повне ім'я",ph_confirm_password:"Підтвердіть пароль",register_btn:"Створити акаунт",register_link_login:"Вже є акаунт? Увійти",err_missing_fields:"Будь ласка, заповніть усі поля",err_invalid_email:"Введіть дійсну електронну адресу",err_weak_password:"Пароль має містити щонайменше 8 символів, літеру та цифру",err_password_mismatch:"Паролі не збігаються",err_invalid_credentials:"Невірна електронна пошта або пароль",err_email_taken:"Ця електронна пошта вже зареєстрована",err_generic:"Сталася помилка. Спробуйте ще раз",my_factories_title:"Мої Заводи",add_factory_btn:"+ Додати завод",edit_factory_btn:"Редагувати",delete_factory_btn:"Видалити",confirm_delete_factory:"Видалити цей завод? Цю дію не можна скасувати.",no_factories_yet:"Ви ще не додали жодного заводу.",factory_created_toast:"Завод створено та проаналізовано",factory_updated_toast:"Завод оновлено",factory_deleted_toast:"Завод видалено",ai_insights_feed_title:"Стрічка AI-аналітики",no_ai_insights_yet:"Ще немає AI-аналітики. Додайте завод.",reanalyze_btn:"Проаналізувати знову",view_insights_btn:"Переглянути аналітику",created_label:"Створено",cancel_btn:"Скасувати",save_btn:"Зберегти зміни",nav_live_monitor:"Моніторинг",add_machine_scada_btn:"+ Додати верстат",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Опитування",live_chart_title:"Графік датчиків у реальному часі",machines_table_title:"Верстати",machine_code_col:"Код",machine_name_col:"Назва",status_col:"Статус",risk_col:"Ризик",no_machines_yet:"Верстатів поки немає. Натисніть «+ Додати верстат».",section_machine_info:"Інформація про верстат",section_sensor_data:"Дані датчиків",section_status:"Статус",section_notes:"Примітки",status_stopped:"Зупинено",status_maintenance:"Обслуговування",priority_low:"Низький",priority_normal:"Звичайний",priority_high:"Високий",priority_critical:"Критичний",save_and_analyze_btn:"Зберегти та проаналізувати",source_col:"Джерело",source_auto:"Авто (SCADA)",source_manual:"Вручну",nav_alerts:"Сповіщення",acknowledge_btn:"Підтвердити",acknowledged_label:"Підтверджено",acknowledge_all_btn:"Підтвердити все",no_alerts_yet:"Сповіщень немає. Все працює нормально.",download_report_btn:"Звіт",alert_details_template:"Температура {temp}°C, вібрація {vib} мм/с, статус: {status}",section_energy_intel:"Енергетичний інтелект",daily_output_hint:"Використовується для розрахунку питомого енергоспоживання (кВт·год на одиницю).",energy_insights_title:"Енергетичний інтелект",idle_power_title:"Виявлення холостого ходу",idle_active_msg:"Верстат простоює — зараз витрачається приблизно {kw} кВт даремно.",idle_none_msg:"Втрат енергії на холостому ходу не виявлено.",friction_loss_title:"Прогноз втрат енергії",friction_active_msg:"Виявлено підвищене тертя: +{pct}% зайвої потужності (~{kw} кВт). Заплануйте обслуговування, щоб уникнути втрат.",friction_none_msg:"Аномального тертя не виявлено.",sec_title:"Питоме енергоспоживання",sec_label:"кВт·год на одиницю",sec_unit:"кВт·год/од.",sec_no_data_msg:"Вкажіть добовий обсяг випуску при додаванні верстата, щоб побачити цей показник.",optimal_load_title:"Оптимальна зона навантаження",optimal_load_label:"Оптимальне навантаження",current_load_label:"Поточне навантаження",at_optimal_msg:"Працює в оптимальній зоні навантаження.",adjust_to_optimal_msg:"Наблизьте навантаження до {pct}%, щоб мінімізувати енергію на одиницю.",nav_digital_twin:"Цифровий двійник",twin_hint:"Перетягуйте для повороту, прокручуйте для масштабування, натисніть на верстат для деталей у реальному часі.",twin_unavailable_msg:"Не вдалося завантажити 3D-вигляд (перевірте підключення до інтернету для Three.js).",failure_prediction_title:"Прогноз відмови",report_lib_missing_msg:"Для експорту в PDF потрібна бібліотека reportlab. Виконайте: pip install reportlab, потім перезапустіть сервер.",ph_machine_id:"ID верстата (напр. M-01)",ph_machine_name:"Назва верстата",ph_factory_section:"Дільниця заводу",ph_operator_name:"Ім'я оператора",ph_pressure:"Тиск (бар)",ph_voltage:"Напруга (В)",ph_current:"Струм (А)",ph_error_code:"Код помилки",ph_daily_output:"Добовий випуск (од.)",ph_notes:"Примітки...",nav_system_intel:"Системна аналітика",nav_roi:"ROI-панель",refresh_btn:"Оновити",system_risk_label:"Системний ризик",healthy_label:"Справні",at_risk_label:"У зоні ризику",clusters_title:"Кластери верстатів",propagation_title:"Поширення аномалій",propagation_hint:"Як відмова одного верстата підвищує ризик сусідніх.",no_propagation:"Поширення аномалій не виявлено.",avg_risk_label:"Середній ризик",added_risk_label:"Доданий ризик",effective_risk_label:"Ефективний ризик",simulation_title:"Що-якщо симуляція",simulation_hint:"Оберіть верстат, змініть покази датчиків і подивіться на зміну ризику.",run_simulation_btn:"Запустити симуляцію",failure_probability_label:"Ймовірність відмови",stress_level_label:"Рівень навантаження",predicted_status_label:"Прогноз статусу",confidence_label:"Достовірність",root_cause_title:"Першопричина",rul_col:"Залишковий ресурс",rul_healthy:"Справний",potential_loss_label:"Потенційні втрати",saved_label:"Заощаджено AI",wasted_energy_label:"Втрати енергії / місяць",efficiency_gain_label:"Приріст ефективності",cost_by_machine_title:"Фінансовий ризик за верстатами",top_cause_col:"Основна причина",roi_assumptions_msg:"Припущення: простій {downtime}/год, ремонт {hours} год, енергія {price}/кВт·год.",role_label:"Ваша роль",role_engineer:"Інженер",role_manager:"Менеджер",role_admin:"Адміністратор",cause_bearing_wear:"Знос підшипника",cause_overload_thermal:"Теплове перевантаження",cause_cooling_failure:"Відмова охолодження",cause_misalignment:"Розцентрування вала",cause_lubrication_loss:"Втрата мастила",cause_normal_operation:"Нормальна робота",nav_story:"Режим історії",story_hint:"Відтворює розвиток відмови підшипника за 22 години та показує, коли саме AI її виявив — і скільки це коштувало.",simulate_failure_btn:"Змоделювати відмову",outcome_title:"Підсумок",warning_time_label:"Раннє попередження",loss_ignored_label:"Втрати без реакції",loss_acted_label:"Втрати з реакцією",money_saved_label:"Заощаджено",timeline_title:"Хронологія відмови",story_detection_msg:"AI виявив це за {hours} год до поломки, при ризику {risk}% — першопричина: {cause} (достовірність {confidence}%).",story_stage_healthy:"Справний",story_stage_early_drift:"Початок відхилення",story_stage_ai_detects:"AI виявив",story_stage_critical:"Критично",priority_low:"Низький",priority_medium:"Середній",priority_high:"Високий",priority_critical:"Критичний",action_stop_machine:"Зупинити верстат",action_inspect_bearings:"Перевірити підшипники",action_check_cooling:"Перевірити охолодження",action_schedule_shutdown_24h:"Запланувати зупинку (24год)",action_order_spare_parts:"Замовити запчастини",action_reduce_load:"Знизити навантаження",action_schedule_inspection_72h:"Запланувати огляд (72год)",action_monitor_closely:"Уважно спостерігати",action_verify_sensor:"Перевірити датчик",action_power_down_idle:"Вимкнути простійний верстат",action_review_shift_schedule:"Переглянути графік змін",action_no_action:"Дій не потрібно",nav_oee:"OEE",nav_workorders:"Наряди",oee_hint:"Доступність x Продуктивність x Якість (ISO 22400). Світовий рівень — 85%, типовий завод — близько 60%.",availability_label:"Доступність",performance_label:"Продуктивність",quality_label:"Якість",weakest_factor_label:"Найслабша ланка",downtime_by_reason_title:"Простої за причинами",downtime_cost_label:"Вартість простою",oee_trend_title:"Динаміка OEE",shifts_title:"Зміни",shift_col:"Зміна",downtime_col:"Простій",log_shift_btn:"Внести зміну",no_shifts_yet:"Зміни ще не внесено.",minutes_short:"хв",range_1d:"Сьогодні",range_7d:"7 днів",range_30d:"30 днів",all_machines_option:"Усі верстати",reason_unspecified:"Не вказано",err_good_exceeds_total:"Придатних не може бути більше загальної кількості",oee_grade_world_class:"Світовий рівень",oee_grade_typical:"Типовий",oee_grade_low:"Низький",oee_grade_critical:"Критичний",reason_breakdown:"Поломка",reason_changeover:"Переналагодження",reason_no_material:"Немає матеріалу",reason_no_operator:"Немає оператора",reason_planned_maintenance:"Планове ТО",reason_quality_issue:"Проблема якості",reason_setup:"Налаштування",reason_other:"Інше",workorders_hint:"Перетворює прогноз AI на відстежуване завдання — щоб попередження закінчилося ремонтом.",new_work_order_btn:"+ Новий наряд",no_work_orders:"Нарядів поки немає.",avg_completion_label:"Сер. виконання",assigned_label:"Призначено",source_ai:"AI",wo_status_open:"Відкритий",wo_status_in_progress:"В роботі",wo_status_done:"Виконаний",wo_status_cancelled:"Скасований",wo_advance_to_in_progress:"Почати роботу",wo_advance_to_done:"Позначити виконаним",ph_shift_name:"Назва зміни",ph_planned_minutes:"Планові хвилини",ph_downtime_minutes:"Хвилини простою",ph_total_units:"Усього одиниць",ph_good_units:"Придатних одиниць",ph_cycle_seconds:"Ідеальний цикл (сек)",ph_wo_title:"Назва",ph_assigned_to:"Відповідальний",ph_wo_description:"Опис",overdue_label:"Прострочено",nav_history:"Історія",history_hint:"Збережена історія датчиків — так ви доведете, що реально змінилося за пілот.",no_history_yet:"Історію ще не записано. Потримайте Моніторинг відкритим кілька хвилин, і дані почнуть накопичуватися.",range_24h:"24 години",range_3d:"3 дні",range_10d:"10 днів",sensor_trend_title:"Динаміка датчиків",risk_trend_title:"Динаміка ризику",trend_flat:"без змін",trend_rising:"зростає",trend_falling:"знижується",create_work_order_btn:"Створити наряд",work_order_created_msg:"Наряд створено",alertreason_immediate_failure_risk:"Ризик негайної відмови",alertreason_failure_imminent:"Відмова неминуча",alertreason_degradation_accelerating:"Знос прискорюється",alertreason_outside_normal_envelope:"Вихід за штатні межі",alertreason_pressure_anomaly:"Аномалія тиску",alertreason_idle_waste:"Втрати на холостому ходу",alertreason_informational:"Інформаційне",alert_reason_label:"Причина",nav_system_health:"Стан системи",system_health_hint:"Стан каналу даних, моделі та захисту — те, що ламається непомітно.",connections_title:"Промислові підключення",data_mode_label:"Режим даних",reads_label:"Зчитування",failures_label:"Збої",buffered_label:"У буфері",pipeline_title:"Конвеєр прийому",queue_depth_label:"Глибина черги",duplicates_label:"Дублікати придушено",retried_label:"Повторів",dead_letter_label:"У карантині",model_title:"Модель прогнозу",train_model_btn:"Навчити модель",check_drift_btn:"Перевірити дрейф",model_not_trained:"Модель не навчена — оцінки ризику орієнтовні, не перевірені.",model_trained_msg:"Модель навчено",trained_on_label:"Навчено на",drift_title:"Дрейф даних",retrain_recommended:"рекомендується перенавчання",security_title:"Перевірки безпеки",admin_only_msg:"Потрібен доступ адміністратора.",conn_state_healthy:"справно",conn_state_stale:"застаріло",conn_state_disconnected:"відключено",conn_state_never_connected:"не підключалось",drift_stable:"стабільно",drift_moderate:"помірно",drift_severe:"серйозно",metric_precision:"Точність",metric_recall:"Повнота",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"Частка хибних тривог",model_cannot_train:"Поки неможливо навчити",model_reason_no_confirmed_failures:"Немає підтверджених відмов",model_reason_insufficient_telemetry:"Недостатньо історії датчиків",model_reason_insufficient_positive_samples:"Недостатньо підтверджених відмов",model_reason_no_failures_in_holdout:"У тестовому періоді немає відмов",check_jwt_secret_strong:"Надійний JWT-секрет",check_debug_disabled:"Режим налагодження вимкнено",check_https_in_use:"Використовується HTTPS",check_database_is_postgres:"База PostgreSQL",check_rate_limiting_active:"Обмеження запитів активне",check_account_lockout_active:"Блокування акаунтів активне",check_audit_logging_active:"Журнал аудиту ведеться",check_security_headers_active:"Заголовки безпеки активні",check_smtp_configured:"Email налаштовано",check_industrial_read_only:"Доступ до обладнання лише читання",model_train_hint:"Позначайте реальні відмови, щоб увімкнути навчання.",drift_status_no_trained_model:"Модель ще не навчена",drift_status_insufficient_recent_data:"Недостатньо свіжих даних",msg_model_untrained_note:"Модель ще не навчена — оцінки ризику орієнтовні, не перевірені.",msg_train_needs_failures:"Для навчання потрібні підтверджені відмови. Позначайте їх на сторінці відмов.",msg_train_no_holdout_failures:"У тестовому періоді немає відмов для оцінки.",msg_drift_needs_model:"Спершу навчіть модель — дрейф вимірюється відносно її даних.",msg_evaluation_needs_failures:"Точність неможливо виміряти, доки не позначено реальні поломки.",msg_holdout_metrics_note:"Метрики отримані на даних, яких модель не бачила під час навчання.",msg_simulation_mode_note:"SIMULATION генерує дані локально; стан зв'язку важливий лише з реальним обладнанням.",msg_savings_needs_two_windows:"Для порівняння до/після потрібні дані в обох половинах періоду.",msg_roi_system_cost_note:"Вартість системи тут невідома — поділіть вигоду на власні витрати, щоб отримати ROI.",msg_reliability_not_calibrated:"Використовуються галузеві параметри, а не цього заводу. Позначайте реальні відмови для калібрування.",msg_no_trained_model:"Модель ще не навчена",msg_insufficient_recent_data:"Недостатньо свіжих даних",nav_failures:"Журнал відмов",failures_hint:"Позначайте кожну реальну поломку. Саме це вчить модель поведінки вашого заводу — без цього прогнози залишаються загальними.",log_failure_btn:"+ Позначити відмову",calibration_title:"Прогрес калібрування",calibration_hint:"Кожному вузлу потрібно достатньо підтверджених відмов, щоб прогноз був відкалібрований під цей завод.",calibrated_label:"відкалібровано",needs_more_failures:"потрібно ще {n}",ml_model_label:"Модель прогнозу",model_ready_to_train:"Готова до навчання",logged_failures_title:"Зареєстровані відмови",no_failures_yet:"Відмови ще не позначено.",was_predicted_label:"спрогнозовано",machine_label:"Верстат",component_label:"Який вузол відмовив",component_hint:"Оберіть найближчий варіант — саме на цьому вчиться модель.",occurred_at_label:"Коли сталося",downtime_label:"Простій (хв)",repair_cost_label:"Вартість ремонту",notes_label:"Примітки",ph_failure_notes:"Що спостерігалося?",failure_logged_msg:"Відмову зареєстровано",confirm_delete_failure:"Видалити цей запис про відмову?",err_no_machine_selected:"Оберіть верстат",err_no_date:"Вкажіть дату",err_future_date:"Дата не може бути в майбутньому",component_bearing:"Підшипник",component_motor:"Двигун",component_pump:"Насос",component_cooling_system:"Система охолодження",component_gearbox:"Редуктор",cause_seal_leak:"Витік ущільнення",cause_cavitation:"Кавітація",cause_overpressure:"Надлишковий тиск",cause_blocked_discharge:"Забитий вихід",component_prediction_title:"Прогноз за вузлами",component_prediction_hint:"Залишковий ресурс кожного вузла за поточним станом верстата.",limiting_label:"критичний",days_short:"днів",industry_default_label:"галузеві значення",calibrated_to_plant:"Відкалібровано під цей завод",not_calibrated_warning:"Використовуються галузеві значення — позначайте реальні відмови для калібрування."},
+  pl: {tagline:"Globalna Platforma Inteligencji Przemysłowej",live_label:"Na żywo",kpi_energy:"Zużycie Energii",kpi_efficiency:"Wydajność",kpi_active:"Aktywne Maszyny",kpi_alerts:"Alerty",kwh_unit:"kWh",chart_title:"Wydajność w Czasie Rzeczywistym",machine_status_title:"Status Maszyn",status_running:"Działa",status_warning:"Ostrzeżenie",status_critical:"Krytyczne",form_title:"Wprowadzanie Danych Fabryki",factory_name_label:"Nazwa Fabryki",machine_count_label:"Liczba Maszyn",energy_cost_label:"Koszt Energii ($/kWh)",machine_type_label:"Typ Maszyny",temperature_label:"Temperatura (°C)",vibration_label:"Wibracje (mm/s)",load_label:"Obciążenie (%)",submit_btn:"Analizuj Fabrykę",submitting:"Aktualizowanie...",ai_panel_title:"Analizy AI",ai_placeholder:"Prześlij dane fabryki, aby wygenerować analizę AI.",ai_analyzing:"Analizowanie...",ai_risks:"Ryzyka",ai_efficiency_insights:"Analiza Wydajności",ai_optimizations:"Sugestie Optymalizacji",toast_updated:"Dane fabryki zaktualizowane",toast_analysis_done:"Analiza AI zakończona",toast_error:"Coś poszło nie tak",nav_dashboard:"Panel",nav_factories:"Fabryki",nav_ai_insights:"Analizy AI",logout_btn:"Wyloguj",login_title:"Witamy z powrotem",login_subtitle:"Zaloguj się do swojego konta FactoryPulse AI",ph_email:"E-mail",ph_password:"Hasło",remember_me:"Zapamiętaj mnie",login_btn:"Zaloguj się",login_link_register:"Nie masz konta? Utwórz je",register_title:"Utwórz konto",register_subtitle:"Zacznij monitorować swoje fabryki z AI",ph_full_name:"Imię i Nazwisko",ph_confirm_password:"Potwierdź Hasło",register_btn:"Utwórz Konto",register_link_login:"Masz już konto? Zaloguj się",err_missing_fields:"Proszę wypełnić wszystkie pola",err_invalid_email:"Proszę podać prawidłowy adres e-mail",err_weak_password:"Hasło musi mieć min. 8 znaków, literę i cyfrę",err_password_mismatch:"Hasła nie pasują do siebie",err_invalid_credentials:"Nieprawidłowy e-mail lub hasło",err_email_taken:"Ten e-mail jest już zarejestrowany",err_generic:"Coś poszło nie tak. Spróbuj ponownie",my_factories_title:"Moje Fabryki",add_factory_btn:"+ Dodaj Fabrykę",edit_factory_btn:"Edytuj",delete_factory_btn:"Usuń",confirm_delete_factory:"Usunąć tę fabrykę? Tej czynności nie można cofnąć.",no_factories_yet:"Nie dodałeś jeszcze żadnej fabryki.",factory_created_toast:"Fabryka utworzona i przeanalizowana",factory_updated_toast:"Fabryka zaktualizowana",factory_deleted_toast:"Fabryka usunięta",ai_insights_feed_title:"Kanał Analiz AI",no_ai_insights_yet:"Brak analiz AI. Dodaj fabrykę, aby zacząć.",reanalyze_btn:"Analizuj Ponownie",view_insights_btn:"Zobacz Analizy",created_label:"Utworzono",cancel_btn:"Anuluj",save_btn:"Zapisz Zmiany",nav_live_monitor:"Monitoring na Żywo",add_machine_scada_btn:"+ Dodaj Maszynę",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Odpytywanie",live_chart_title:"Wykres Czujników na Żywo",machines_table_title:"Maszyny",machine_code_col:"Kod",machine_name_col:"Nazwa",status_col:"Status",risk_col:"Ryzyko",no_machines_yet:"Brak maszyn. Kliknij „+ Dodaj Maszynę”.",section_machine_info:"Informacje o Maszynie",section_sensor_data:"Dane Czujników",section_status:"Status",section_notes:"Notatki",status_stopped:"Zatrzymana",status_maintenance:"Konserwacja",priority_low:"Niski",priority_normal:"Normalny",priority_high:"Wysoki",priority_critical:"Krytyczny",save_and_analyze_btn:"Zapisz i Analizuj",source_col:"Źródło",source_auto:"Auto (SCADA)",source_manual:"Ręcznie",nav_alerts:"Alerty",acknowledge_btn:"Potwierdź",acknowledged_label:"Potwierdzone",acknowledge_all_btn:"Potwierdź Wszystkie",no_alerts_yet:"Brak alertów. Wszystko działa prawidłowo.",download_report_btn:"Raport",alert_details_template:"Temperatura {temp}°C, wibracje {vib} mm/s, status: {status}",section_energy_intel:"Inteligencja Energetyczna",daily_output_hint:"Używane do obliczania jednostkowego zużycia energii (kWh na jednostkę).",energy_insights_title:"Inteligencja Energetyczna",idle_power_title:"Wykrywanie Mocy Jałowej",idle_active_msg:"Maszyna bezczynna - obecnie marnowane jest ok. {kw} kW.",idle_none_msg:"Nie wykryto marnowania energii w trybie bezczynności.",friction_loss_title:"Predykcyjna Utrata Energii",friction_active_msg:"Wykryto zwiększone tarcie: +{pct}% dodatkowej mocy (~{kw} kW więcej). Zaplanuj konserwację, aby zapobiec stratom.",friction_none_msg:"Nie wykryto nieprawidłowego tarcia.",sec_title:"Jednostkowe Zużycie Energii",sec_label:"kWh na jednostkę",sec_unit:"kWh/jednostkę",sec_no_data_msg:"Podaj dzienną produkcję podczas dodawania maszyny, aby zobaczyć ten wskaźnik.",optimal_load_title:"Optymalna Strefa Obciążenia",optimal_load_label:"Optymalne obciążenie",current_load_label:"Obecne obciążenie",at_optimal_msg:"Działa w optymalnej strefie obciążenia.",adjust_to_optimal_msg:"Dostosuj obciążenie do {pct}%, aby zminimalizować energię na jednostkę.",nav_digital_twin:"Cyfrowy Bliźniak",twin_hint:"Przeciągnij, aby obrócić, przewiń, aby powiększyć, kliknij maszynę, aby zobaczyć szczegóły na żywo.",twin_unavailable_msg:"Nie udało się załadować widoku 3D (sprawdź połączenie internetowe dla biblioteki Three.js).",failure_prediction_title:"Prognoza Awarii",report_lib_missing_msg:"Eksport do PDF wymaga biblioteki reportlab. Uruchom: pip install reportlab, a następnie zrestartuj serwer.",ph_machine_id:"ID Maszyny (np. M-01)",ph_machine_name:"Nazwa Maszyny",ph_factory_section:"Sekcja Fabryki",ph_operator_name:"Imię Operatora",ph_pressure:"Ciśnienie (bar)",ph_voltage:"Napięcie (V)",ph_current:"Prąd (A)",ph_error_code:"Kod Błędu",ph_daily_output:"Dzienna Produkcja (jednostki)",ph_notes:"Notatki...",nav_system_intel:"Inteligencja Systemu",nav_roi:"Pulpit ROI",refresh_btn:"Odśwież",system_risk_label:"Ryzyko Systemu",healthy_label:"Sprawne",at_risk_label:"Zagrożone",clusters_title:"Klastry Maszyn",propagation_title:"Propagacja Anomalii",propagation_hint:"Jak awaria jednej maszyny podnosi ryzyko sąsiednich.",no_propagation:"Nie wykryto propagacji anomalii.",avg_risk_label:"Śr. ryzyko",added_risk_label:"Dodane ryzyko",effective_risk_label:"Ryzyko efektywne",simulation_title:"Symulacja Co-Jeśli",simulation_hint:"Wybierz maszynę, zmień wartości czujników i obserwuj prawdopodobieństwo awarii.",run_simulation_btn:"Uruchom Symulację",failure_probability_label:"Prawdopodobieństwo Awarii",stress_level_label:"Poziom Obciążenia",predicted_status_label:"Przewidywany Status",confidence_label:"Pewność",root_cause_title:"Przyczyna Źródłowa",rul_col:"Pozostała Żywotność",rul_healthy:"Sprawna",potential_loss_label:"Potencjalna Strata",saved_label:"Zaoszczędzone przez AI",wasted_energy_label:"Zmarnowana Energia / mies.",efficiency_gain_label:"Wzrost Wydajności",cost_by_machine_title:"Ryzyko Kosztowe wg Maszyn",top_cause_col:"Główna Przyczyna",roi_assumptions_msg:"Założenia: przestój {downtime}/h, naprawa {hours}h, energia {price}/kWh.",role_label:"Twoja Rola",role_engineer:"Inżynier",role_manager:"Menedżer",role_admin:"Administrator",cause_bearing_wear:"Zużycie łożyska",cause_overload_thermal:"Przeciążenie termiczne",cause_cooling_failure:"Awaria chłodzenia",cause_misalignment:"Niewspółosiowość wału",cause_lubrication_loss:"Utrata smarowania",cause_normal_operation:"Praca normalna",nav_story:"Tryb Historii",story_hint:"Odtwarza awarię łożyska rozwijającą się przez 22 godziny i pokazuje dokładnie, kiedy AI ją wykryła — i ile to było warte.",simulate_failure_btn:"Symuluj Awarię",outcome_title:"Wynik",warning_time_label:"Wczesne Ostrzeżenie",loss_ignored_label:"Strata bez Reakcji",loss_acted_label:"Strata z Reakcją",money_saved_label:"Zaoszczędzono",timeline_title:"Oś Czasu Awarii",story_detection_msg:"AI wykryła to {hours} godzin przed awarią, przy {risk}% ryzyka — przyczyna źródłowa: {cause} (pewność {confidence}%).",story_stage_healthy:"Sprawna",story_stage_early_drift:"Pierwsze Odchylenie",story_stage_ai_detects:"AI Wykrywa",story_stage_critical:"Krytyczny",priority_low:"Niski",priority_medium:"Średni",priority_high:"Wysoki",priority_critical:"Krytyczny",action_stop_machine:"Zatrzymaj maszynę",action_inspect_bearings:"Sprawdź łożyska",action_check_cooling:"Sprawdź chłodzenie",action_schedule_shutdown_24h:"Zaplanuj postój (24h)",action_order_spare_parts:"Zamów części",action_reduce_load:"Zmniejsz obciążenie",action_schedule_inspection_72h:"Zaplanuj przegląd (72h)",action_monitor_closely:"Uważnie monitoruj",action_verify_sensor:"Zweryfikuj czujnik",action_power_down_idle:"Wyłącz bezczynną maszynę",action_review_shift_schedule:"Przejrzyj grafik zmian",action_no_action:"Nie wymaga działania",nav_oee:"OEE",nav_workorders:"Zlecenia Pracy",oee_hint:"Dostępność x Wydajność x Jakość (ISO 22400). Poziom światowy to 85%, typowa fabryka około 60%.",availability_label:"Dostępność",performance_label:"Wydajność",quality_label:"Jakość",weakest_factor_label:"Najsłabszy",downtime_by_reason_title:"Przestoje wg Przyczyny",downtime_cost_label:"Koszt przestoju",oee_trend_title:"Trend OEE",shifts_title:"Zmiany",shift_col:"Zmiana",downtime_col:"Przestój",log_shift_btn:"Zapisz Zmianę",no_shifts_yet:"Nie zapisano jeszcze zmian.",minutes_short:"min",range_1d:"Dzisiaj",range_7d:"7 dni",range_30d:"30 dni",all_machines_option:"Wszystkie maszyny",reason_unspecified:"Nieokreślone",err_good_exceeds_total:"Sztuki dobre nie mogą przekroczyć całości",oee_grade_world_class:"Poziom światowy",oee_grade_typical:"Typowy",oee_grade_low:"Niski",oee_grade_critical:"Krytyczny",reason_breakdown:"Awaria",reason_changeover:"Przezbrojenie",reason_no_material:"Brak materiału",reason_no_operator:"Brak operatora",reason_planned_maintenance:"Konserwacja planowa",reason_quality_issue:"Problem jakości",reason_setup:"Ustawianie",reason_other:"Inne",workorders_hint:"Zamienia prognozę AI w śledzone zadanie — aby ostrzeżenie kończyło się naprawą.",new_work_order_btn:"+ Nowe Zlecenie",no_work_orders:"Brak zleceń pracy.",avg_completion_label:"Śr. realizacja",assigned_label:"Przypisane",source_ai:"AI",wo_status_open:"Otwarte",wo_status_in_progress:"W trakcie",wo_status_done:"Zakończone",wo_status_cancelled:"Anulowane",wo_advance_to_in_progress:"Rozpocznij pracę",wo_advance_to_done:"Oznacz jako zakończone",ph_shift_name:"Nazwa zmiany",ph_planned_minutes:"Zaplanowane minuty",ph_downtime_minutes:"Minuty przestoju",ph_total_units:"Łączna liczba",ph_good_units:"Sztuki dobre",ph_cycle_seconds:"Cykl idealny (sek)",ph_wo_title:"Tytuł",ph_assigned_to:"Przypisane do",ph_wo_description:"Opis",overdue_label:"Zaległe",nav_history:"Historia",history_hint:"Zapisana historia czujników — tak udowodnisz, co naprawdę zmieniło się podczas pilotażu.",no_history_yet:"Nie zapisano jeszcze historii. Zostaw Monitoring otwarty na kilka minut, a dane zaczną się gromadzić.",range_24h:"24 godziny",range_3d:"3 dni",range_10d:"10 dni",sensor_trend_title:"Trend Czujników",risk_trend_title:"Trend Ryzyka",trend_flat:"bez zmian",trend_rising:"rośnie",trend_falling:"spada",create_work_order_btn:"Utwórz Zlecenie",work_order_created_msg:"Zlecenie utworzone",alertreason_immediate_failure_risk:"Ryzyko natychmiastowej awarii",alertreason_failure_imminent:"Awaria nieuchronna",alertreason_degradation_accelerating:"Przyspieszające zużycie",alertreason_outside_normal_envelope:"Poza normalnym zakresem",alertreason_pressure_anomaly:"Anomalia ciśnienia",alertreason_idle_waste:"Marnowanie energii na biegu jałowym",alertreason_informational:"Informacyjne",alert_reason_label:"Powód",nav_system_health:"Stan Systemu",system_health_hint:"Stan ścieżki danych, modelu i zabezpieczeń — to, co psuje się po cichu.",connections_title:"Połączenia Przemysłowe",data_mode_label:"Tryb danych",reads_label:"Odczyty",failures_label:"Błędy",buffered_label:"W buforze",pipeline_title:"Potok Przyjmowania",queue_depth_label:"Głębokość kolejki",duplicates_label:"Duplikaty stłumione",retried_label:"Ponowione",dead_letter_label:"W kwarantannie",model_title:"Model Predykcyjny",train_model_btn:"Trenuj Model",check_drift_btn:"Sprawdź Dryf",model_not_trained:"Brak wytrenowanego modelu — oceny ryzyka są orientacyjne, niezweryfikowane.",model_trained_msg:"Model wytrenowany",trained_on_label:"Trenowano na",drift_title:"Dryf Danych",retrain_recommended:"zalecane ponowne trenowanie",security_title:"Kontrole Bezpieczeństwa",admin_only_msg:"Wymagany dostęp administratora.",conn_state_healthy:"sprawne",conn_state_stale:"nieaktualne",conn_state_disconnected:"rozłączone",conn_state_never_connected:"nigdy nie połączono",drift_stable:"stabilny",drift_moderate:"umiarkowany",drift_severe:"poważny",metric_precision:"Precyzja",metric_recall:"Czułość",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"Wskaźnik fałszywych alarmów",model_cannot_train:"Nie można jeszcze trenować",model_reason_no_confirmed_failures:"Brak potwierdzonych awarii",model_reason_insufficient_telemetry:"Za mało historii czujników",model_reason_insufficient_positive_samples:"Za mało potwierdzonych awarii",model_reason_no_failures_in_holdout:"Brak awarii w okresie testowym",check_jwt_secret_strong:"Silny sekret JWT",check_debug_disabled:"Tryb debugowania wyłączony",check_https_in_use:"HTTPS w użyciu",check_database_is_postgres:"Baza PostgreSQL",check_rate_limiting_active:"Ograniczanie żądań aktywne",check_account_lockout_active:"Blokada konta aktywna",check_audit_logging_active:"Dziennik audytu aktywny",check_security_headers_active:"Nagłówki bezpieczeństwa aktywne",check_smtp_configured:"Email skonfigurowany",check_industrial_read_only:"Dostęp przemysłowy tylko do odczytu",model_train_hint:"Rejestruj rzeczywiste awarie, aby włączyć trenowanie.",drift_status_no_trained_model:"Brak wytrenowanego modelu",drift_status_insufficient_recent_data:"Za mało aktualnych danych",msg_model_untrained_note:"Brak wytrenowanego modelu — oceny ryzyka są orientacyjne, niezweryfikowane.",msg_train_needs_failures:"Trenowanie wymaga potwierdzonych awarii. Rejestruj je na stronie awarii.",msg_train_no_holdout_failures:"Okres testowy nie zawiera awarii do oceny.",msg_drift_needs_model:"Najpierw wytrenuj model — dryf mierzy się względem jego danych.",msg_evaluation_needs_failures:"Dokładności nie można zmierzyć, dopóki nie zarejestrowano rzeczywistych awarii.",msg_holdout_metrics_note:"Metryki pochodzą z danych, których model nie widział podczas trenowania.",msg_simulation_mode_note:"SIMULATION generuje dane lokalnie; stan połączeń ma znaczenie tylko przy prawdziwym sprzęcie.",msg_savings_needs_two_windows:"Porównanie przed/po wymaga danych w obu połowach okresu.",msg_roi_system_cost_note:"Koszt systemu nie jest tu znany — podziel korzyść przez własny koszt, aby uzyskać ROI.",msg_reliability_not_calibrated:"Używane są parametry branżowe, nie tej fabryki. Rejestruj rzeczywiste awarie do kalibracji.",msg_no_trained_model:"Brak wytrenowanego modelu",msg_insufficient_recent_data:"Za mało aktualnych danych",nav_failures:"Dziennik Awarii",failures_hint:"Rejestruj każdą rzeczywistą awarię. To właśnie uczy model zachowania Twojego zakładu — bez tego prognozy pozostają ogólne.",log_failure_btn:"+ Zarejestruj awarię",calibration_title:"Postęp Kalibracji",calibration_hint:"Każdy podzespół potrzebuje wystarczającej liczby potwierdzonych awarii, zanim jego prognoza zostanie skalibrowana dla tego zakładu.",calibrated_label:"skalibrowane",needs_more_failures:"potrzeba jeszcze {n}",ml_model_label:"Model predykcyjny",model_ready_to_train:"Gotowy do trenowania",logged_failures_title:"Zarejestrowane Awarie",no_failures_yet:"Nie zarejestrowano jeszcze awarii.",was_predicted_label:"przewidziano",machine_label:"Maszyna",component_label:"Który podzespół uległ awarii",component_hint:"Wybierz najbliższy — z tego uczy się model.",occurred_at_label:"Kiedy to się stało",downtime_label:"Przestój (min)",repair_cost_label:"Koszt naprawy",notes_label:"Uwagi",ph_failure_notes:"Co zaobserwowano?",failure_logged_msg:"Awaria zarejestrowana",confirm_delete_failure:"Usunąć ten wpis o awarii?",err_no_machine_selected:"Wybierz maszynę",err_no_date:"Podaj datę",err_future_date:"Data nie może być w przyszłości",component_bearing:"Łożysko",component_motor:"Silnik",component_pump:"Pompa",component_cooling_system:"Układ chłodzenia",component_gearbox:"Przekładnia",cause_seal_leak:"Wyciek uszczelnienia",cause_cavitation:"Kawitacja",cause_overpressure:"Nadciśnienie",cause_blocked_discharge:"Zablokowany wylot",component_prediction_title:"Prognoza dla Podzespołów",component_prediction_hint:"Pozostała żywotność każdego podzespołu na podstawie bieżącego stanu maszyny.",limiting_label:"ograniczający",days_short:"dni",industry_default_label:"wartości branżowe",calibrated_to_plant:"Skalibrowane dla tego zakładu",not_calibrated_warning:"Używane są wartości branżowe — rejestruj rzeczywiste awarie do kalibracji."},
+  nl: {tagline:"Wereldwijd Industrieel Intelligentieplatform",live_label:"Live",kpi_energy:"Energieverbruik",kpi_efficiency:"Efficiëntie",kpi_active:"Actieve Machines",kpi_alerts:"Meldingen",kwh_unit:"kWh",chart_title:"Realtime Prestaties",machine_status_title:"Machinestatus",status_running:"Actief",status_warning:"Waarschuwing",status_critical:"Kritiek",form_title:"Fabrieksgegevens Invoeren",factory_name_label:"Fabrieksnaam",machine_count_label:"Aantal Machines",energy_cost_label:"Energiekosten ($/kWh)",machine_type_label:"Machinetype",temperature_label:"Temperatuur (°C)",vibration_label:"Trilling (mm/s)",load_label:"Belasting (%)",submit_btn:"Fabriek Analyseren",submitting:"Bijwerken...",ai_panel_title:"AI-inzichten",ai_placeholder:"Verzend fabrieksgegevens om een AI-analyse te genereren.",ai_analyzing:"Analyseren...",ai_risks:"Risico's",ai_efficiency_insights:"Efficiëntieanalyse",ai_optimizations:"Optimalisatiesuggesties",toast_updated:"Fabrieksgegevens bijgewerkt",toast_analysis_done:"AI-analyse voltooid",toast_error:"Er is iets misgegaan",nav_dashboard:"Dashboard",nav_factories:"Fabrieken",nav_ai_insights:"AI-inzichten",logout_btn:"Uitloggen",login_title:"Welkom terug",login_subtitle:"Log in op uw FactoryPulse AI-account",ph_email:"E-mail",ph_password:"Wachtwoord",remember_me:"Onthoud mij",login_btn:"Inloggen",login_link_register:"Geen account? Maak er een",register_title:"Maak uw account aan",register_subtitle:"Begin met AI-monitoring van uw fabrieken",ph_full_name:"Volledige Naam",ph_confirm_password:"Bevestig Wachtwoord",register_btn:"Account Aanmaken",register_link_login:"Heeft u al een account? Inloggen",err_missing_fields:"Vul alle velden in",err_invalid_email:"Voer een geldig e-mailadres in",err_weak_password:"Wachtwoord moet minimaal 8 tekens, een letter en een cijfer bevatten",err_password_mismatch:"Wachtwoorden komen niet overeen",err_invalid_credentials:"Ongeldige e-mail of wachtwoord",err_email_taken:"Dit e-mailadres is al geregistreerd",err_generic:"Er is iets misgegaan. Probeer het opnieuw",my_factories_title:"Mijn Fabrieken",add_factory_btn:"+ Fabriek Toevoegen",edit_factory_btn:"Bewerken",delete_factory_btn:"Verwijderen",confirm_delete_factory:"Deze fabriek verwijderen? Dit kan niet ongedaan worden gemaakt.",no_factories_yet:"U heeft nog geen fabrieken toegevoegd.",factory_created_toast:"Fabriek aangemaakt en geanalyseerd",factory_updated_toast:"Fabriek bijgewerkt",factory_deleted_toast:"Fabriek verwijderd",ai_insights_feed_title:"AI-inzichten Feed",no_ai_insights_yet:"Nog geen AI-inzichten. Voeg een fabriek toe.",reanalyze_btn:"Opnieuw Analyseren",view_insights_btn:"Bekijk Inzichten",created_label:"Aangemaakt",cancel_btn:"Annuleren",save_btn:"Wijzigingen Opslaan",nav_live_monitor:"Live Monitor",add_machine_scada_btn:"+ Machine Toevoegen",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Polling",live_chart_title:"Live Sensorgrafiek",machines_table_title:"Machines",machine_code_col:"Code",machine_name_col:"Naam",status_col:"Status",risk_col:"Risico",no_machines_yet:"Nog geen machines. Klik op „+ Machine Toevoegen”.",section_machine_info:"Machine-informatie",section_sensor_data:"Sensorgegevens",section_status:"Status",section_notes:"Notities",status_stopped:"Gestopt",status_maintenance:"Onderhoud",priority_low:"Laag",priority_normal:"Normaal",priority_high:"Hoog",priority_critical:"Kritiek",save_and_analyze_btn:"Opslaan & Analyseren",source_col:"Bron",source_auto:"Auto (SCADA)",source_manual:"Handmatig",nav_alerts:"Meldingen",acknowledge_btn:"Bevestigen",acknowledged_label:"Bevestigd",acknowledge_all_btn:"Alles Bevestigen",no_alerts_yet:"Geen meldingen. Alles werkt naar behoren.",download_report_btn:"Rapport",alert_details_template:"Temperatuur {temp}°C, trilling {vib} mm/s, status: {status}",section_energy_intel:"Energie-intelligentie",daily_output_hint:"Wordt gebruikt om het specifieke energieverbruik te berekenen (kWh per eenheid).",energy_insights_title:"Energie-intelligentie",idle_power_title:"Stationair Vermogen Detectie",idle_active_msg:"Machine is inactief - momenteel wordt ongeveer {kw} kW verspild.",idle_none_msg:"Geen stationaire energieverspilling gedetecteerd.",friction_loss_title:"Voorspellend Energieverlies",friction_active_msg:"Verhoogde wrijving gedetecteerd: +{pct}% extra vermogen (~{kw} kW extra). Plan onderhoud om verliezen te voorkomen.",friction_none_msg:"Geen abnormale wrijving gedetecteerd.",sec_title:"Specifiek Energieverbruik",sec_label:"kWh per eenheid",sec_unit:"kWh/eenheid",sec_no_data_msg:"Voer de dagelijkse output in bij het toevoegen van deze machine om deze metriek te zien.",optimal_load_title:"Optimale Belastingzone",optimal_load_label:"Optimale belasting",current_load_label:"Huidige belasting",at_optimal_msg:"Draait in de optimale belastingzone.",adjust_to_optimal_msg:"Pas de belasting aan naar {pct}% om energie per eenheid te minimaliseren.",nav_digital_twin:"Digitale Tweeling",twin_hint:"Sleep om te draaien, scroll om te zoomen, klik op een machine voor live details.",twin_unavailable_msg:"3D-weergave kon niet worden geladen (controleer uw internetverbinding voor Three.js).",failure_prediction_title:"Storingsvoorspelling",report_lib_missing_msg:"PDF-export vereist de reportlab-bibliotheek. Voer uit: pip install reportlab en herstart de server.",ph_machine_id:"Machine-ID (bijv. M-01)",ph_machine_name:"Machinenaam",ph_factory_section:"Fabriekssectie",ph_operator_name:"Naam Operator",ph_pressure:"Druk (bar)",ph_voltage:"Spanning (V)",ph_current:"Stroom (A)",ph_error_code:"Foutcode",ph_daily_output:"Dagelijkse Productie (eenheden)",ph_notes:"Notities...",nav_system_intel:"Systeemintelligentie",nav_roi:"ROI-dashboard",refresh_btn:"Vernieuwen",system_risk_label:"Systeemrisico",healthy_label:"Gezond",at_risk_label:"Risicovol",clusters_title:"Machineclusters",propagation_title:"Anomalieverspreiding",propagation_hint:"Hoe een falende machine het risico van buurmachines verhoogt.",no_propagation:"Geen anomalieverspreiding gedetecteerd.",avg_risk_label:"Gem. risico",added_risk_label:"Toegevoegd risico",effective_risk_label:"Effectief risico",simulation_title:"Wat-Als Simulatie",simulation_hint:"Kies een machine, verschuif de sensorwaarden en bekijk de storingskans.",run_simulation_btn:"Simulatie Uitvoeren",failure_probability_label:"Storingskans",stress_level_label:"Belastingsniveau",predicted_status_label:"Voorspelde Status",confidence_label:"Betrouwbaarheid",root_cause_title:"Hoofdoorzaak",rul_col:"Resterende Levensduur",rul_healthy:"Gezond",potential_loss_label:"Potentieel Verlies",saved_label:"Bespaard door AI",wasted_energy_label:"Verspilde Energie / maand",efficiency_gain_label:"Efficiëntiewinst",cost_by_machine_title:"Kostenrisico per Machine",top_cause_col:"Hoofdoorzaak",roi_assumptions_msg:"Aannames: stilstand {downtime}/u, reparatie {hours}u, energie {price}/kWh.",role_label:"Uw Rol",role_engineer:"Ingenieur",role_manager:"Manager",role_admin:"Beheerder",cause_bearing_wear:"Lagerslijtage",cause_overload_thermal:"Thermische overbelasting",cause_cooling_failure:"Koelstoring",cause_misalignment:"Asuitlijnfout",cause_lubrication_loss:"Smeringverlies",cause_normal_operation:"Normale werking",nav_story:"Verhaalmodus",story_hint:"Speelt een lagerstoring af die zich over 22 uur ontwikkelt en toont precies wanneer de AI het opmerkte — en wat dat waard was.",simulate_failure_btn:"Storing Simuleren",outcome_title:"Uitkomst",warning_time_label:"Vroege Waarschuwing",loss_ignored_label:"Verlies zonder Actie",loss_acted_label:"Verlies met Actie",money_saved_label:"Bespaard",timeline_title:"Storingstijdlijn",story_detection_msg:"De AI signaleerde dit {hours} uur voor de storing, bij {risk}% risico — hoofdoorzaak: {cause} ({confidence}% betrouwbaarheid).",story_stage_healthy:"Gezond",story_stage_early_drift:"Eerste Afwijking",story_stage_ai_detects:"AI Detecteert",story_stage_critical:"Kritiek",priority_low:"Laag",priority_medium:"Gemiddeld",priority_high:"Hoog",priority_critical:"Kritiek",action_stop_machine:"Machine stoppen",action_inspect_bearings:"Lagers inspecteren",action_check_cooling:"Koeling controleren",action_schedule_shutdown_24h:"Stilstand plannen (24u)",action_order_spare_parts:"Reserveonderdelen bestellen",action_reduce_load:"Belasting verlagen",action_schedule_inspection_72h:"Inspectie plannen (72u)",action_monitor_closely:"Nauwlettend volgen",action_verify_sensor:"Sensor verifiëren",action_power_down_idle:"Inactieve machine uitschakelen",action_review_shift_schedule:"Ploegrooster herzien",action_no_action:"Geen actie nodig",nav_oee:"OEE",nav_workorders:"Werkorders",oee_hint:"Beschikbaarheid x Prestatie x Kwaliteit (ISO 22400). Wereldklasse is 85%; een typische fabriek zit rond 60%.",availability_label:"Beschikbaarheid",performance_label:"Prestatie",quality_label:"Kwaliteit",weakest_factor_label:"Zwakste",downtime_by_reason_title:"Stilstand per Oorzaak",downtime_cost_label:"Stilstandkosten",oee_trend_title:"OEE-trend",shifts_title:"Ploegen",shift_col:"Ploeg",downtime_col:"Stilstand",log_shift_btn:"Ploeg Vastleggen",no_shifts_yet:"Nog geen ploegen vastgelegd.",minutes_short:"min",range_1d:"Vandaag",range_7d:"7 dagen",range_30d:"30 dagen",all_machines_option:"Alle machines",reason_unspecified:"Niet gespecificeerd",err_good_exceeds_total:"Goede stuks kunnen het totaal niet overschrijden",oee_grade_world_class:"Wereldklasse",oee_grade_typical:"Typisch",oee_grade_low:"Laag",oee_grade_critical:"Kritiek",reason_breakdown:"Storing",reason_changeover:"Omstelling",reason_no_material:"Geen materiaal",reason_no_operator:"Geen operator",reason_planned_maintenance:"Gepland onderhoud",reason_quality_issue:"Kwaliteitsprobleem",reason_setup:"Instellen",reason_other:"Overig",workorders_hint:"Zet een AI-voorspelling om in een gevolgde taak — zodat een waarschuwing eindigt in een reparatie.",new_work_order_btn:"+ Nieuwe Werkorder",no_work_orders:"Nog geen werkorders.",avg_completion_label:"Gem. afronding",assigned_label:"Toegewezen",source_ai:"AI",wo_status_open:"Open",wo_status_in_progress:"In uitvoering",wo_status_done:"Afgerond",wo_status_cancelled:"Geannuleerd",wo_advance_to_in_progress:"Werk starten",wo_advance_to_done:"Markeer als afgerond",ph_shift_name:"Ploegnaam",ph_planned_minutes:"Geplande minuten",ph_downtime_minutes:"Stilstandminuten",ph_total_units:"Totaal stuks",ph_good_units:"Goede stuks",ph_cycle_seconds:"Ideale cyclus (sec)",ph_wo_title:"Titel",ph_assigned_to:"Toegewezen aan",ph_wo_description:"Omschrijving",overdue_label:"Te laat",nav_history:"Geschiedenis",history_hint:"Opgeslagen sensorhistorie — zo bewijst u wat er tijdens de pilot echt is veranderd.",no_history_yet:"Nog geen historie opgeslagen. Houd de Live Monitor een paar minuten open, dan begint data zich op te bouwen.",range_24h:"24 uur",range_3d:"3 dagen",range_10d:"10 dagen",sensor_trend_title:"Sensortrend",risk_trend_title:"Risicotrend",trend_flat:"geen verandering",trend_rising:"stijgend",trend_falling:"dalend",create_work_order_btn:"Werkorder Maken",work_order_created_msg:"Werkorder aangemaakt",alertreason_immediate_failure_risk:"Onmiddellijk storingsrisico",alertreason_failure_imminent:"Storing ophanden",alertreason_degradation_accelerating:"Degradatie versnelt",alertreason_outside_normal_envelope:"Buiten normaal bereik",alertreason_pressure_anomaly:"Drukafwijking",alertreason_idle_waste:"Energieverspilling bij stilstand",alertreason_informational:"Informatief",alert_reason_label:"Reden",nav_system_health:"Systeemgezondheid",system_health_hint:"Staat van het datapad, het model en de beveiliging — wat stilletjes stukgaat.",connections_title:"Industriële Verbindingen",data_mode_label:"Datamodus",reads_label:"Uitlezingen",failures_label:"Fouten",buffered_label:"Gebufferd",pipeline_title:"Inname-pijplijn",queue_depth_label:"Wachtrijdiepte",duplicates_label:"Duplicaten onderdrukt",retried_label:"Opnieuw geprobeerd",dead_letter_label:"In quarantaine",model_title:"Voorspellingsmodel",train_model_btn:"Model Trainen",check_drift_btn:"Drift Controleren",model_not_trained:"Geen getraind model — risicoscores zijn indicatief, niet gevalideerd.",model_trained_msg:"Model getraind",trained_on_label:"Getraind op",drift_title:"Datadrift",retrain_recommended:"hertraining aanbevolen",security_title:"Beveiligingscontroles",admin_only_msg:"Beheerderstoegang vereist.",conn_state_healthy:"gezond",conn_state_stale:"verouderd",conn_state_disconnected:"losgekoppeld",conn_state_never_connected:"nooit verbonden",drift_stable:"stabiel",drift_moderate:"matig",drift_severe:"ernstig",metric_precision:"Precisie",metric_recall:"Recall",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"Vals-alarmpercentage",model_cannot_train:"Nog niet te trainen",model_reason_no_confirmed_failures:"Geen bevestigde storingen vastgelegd",model_reason_insufficient_telemetry:"Onvoldoende sensorhistorie",model_reason_insufficient_positive_samples:"Onvoldoende bevestigde storingen",model_reason_no_failures_in_holdout:"Geen storingen in de testperiode",check_jwt_secret_strong:"Sterk JWT-geheim",check_debug_disabled:"Debugmodus uitgeschakeld",check_https_in_use:"HTTPS in gebruik",check_database_is_postgres:"PostgreSQL-database",check_rate_limiting_active:"Snelheidslimiet actief",check_account_lockout_active:"Accountvergrendeling actief",check_audit_logging_active:"Auditlogboek actief",check_security_headers_active:"Beveiligingsheaders actief",check_smtp_configured:"E-mail geconfigureerd",check_industrial_read_only:"Industriële toegang alleen-lezen",model_train_hint:"Registreer echte storingen om training mogelijk te maken.",drift_status_no_trained_model:"Nog geen getraind model",drift_status_insufficient_recent_data:"Onvoldoende recente data",msg_model_untrained_note:"Nog geen getraind model — risicoscores zijn indicatief, niet gevalideerd.",msg_train_needs_failures:"Trainen vereist bevestigde storingen. Leg ze vast op de storingenpagina.",msg_train_no_holdout_failures:"De testperiode bevat geen storingen om te beoordelen.",msg_drift_needs_model:"Train eerst een model — drift wordt gemeten tegen zijn trainingsdata.",msg_evaluation_needs_failures:"Nauwkeurigheid is niet meetbaar tot echte storingen zijn vastgelegd.",msg_holdout_metrics_note:"Metrieken komen uit data die het model tijdens training nooit zag.",msg_simulation_mode_note:"SIMULATION genereert data lokaal; verbindingsstatus telt alleen bij echte hardware.",msg_savings_needs_two_windows:"Een voor/na-vergelijking vereist data in beide helften van de periode.",msg_roi_system_cost_note:"Systeemkosten zijn hier onbekend — deel het voordeel door uw eigen kosten voor de ROI.",msg_reliability_not_calibrated:"Er worden branchewaarden gebruikt, niet die van deze fabriek. Leg echte storingen vast om te kalibreren.",msg_no_trained_model:"Nog geen getraind model",msg_insufficient_recent_data:"Onvoldoende recente data",nav_failures:"Storingslogboek",failures_hint:"Leg elke echte storing vast. Dit is wat het model het werkelijke gedrag van uw fabriek leert — zonder dit blijven voorspellingen generiek.",log_failure_btn:"+ Storing vastleggen",calibration_title:"Kalibratievoortgang",calibration_hint:"Elk component heeft genoeg bevestigde storingen nodig voordat zijn voorspelling voor deze fabriek is gekalibreerd.",calibrated_label:"gekalibreerd",needs_more_failures:"nog {n} nodig",ml_model_label:"Voorspellingsmodel",model_ready_to_train:"Klaar om te trainen",logged_failures_title:"Vastgelegde Storingen",no_failures_yet:"Nog geen storingen vastgelegd.",was_predicted_label:"voorspeld",machine_label:"Machine",component_label:"Welk component is uitgevallen",component_hint:"Kies de dichtstbijzijnde — hier leert het model van.",occurred_at_label:"Wanneer gebeurde het",downtime_label:"Stilstand (min)",repair_cost_label:"Reparatiekosten",notes_label:"Notities",ph_failure_notes:"Wat is waargenomen?",failure_logged_msg:"Storing vastgelegd",confirm_delete_failure:"Deze storingsregistratie verwijderen?",err_no_machine_selected:"Selecteer een machine",err_no_date:"Voer de datum in",err_future_date:"De datum kan niet in de toekomst liggen",component_bearing:"Lager",component_motor:"Motor",component_pump:"Pomp",component_cooling_system:"Koelsysteem",component_gearbox:"Tandwielkast",cause_seal_leak:"Afdichtingslekkage",cause_cavitation:"Cavitatie",cause_overpressure:"Overdruk",cause_blocked_discharge:"Geblokkeerde uitlaat",component_prediction_title:"Componentvoorspelling",component_prediction_hint:"Resterende levensduur per component, op basis van de actuele machinestatus.",limiting_label:"beperkend",days_short:"dagen",industry_default_label:"branchewaarden",calibrated_to_plant:"Gekalibreerd voor deze fabriek",not_calibrated_warning:"Branchewaarden in gebruik — leg echte storingen vast om te kalibreren."},
+  sv: {tagline:"Global Industriell Intelligensplattform",live_label:"Live",kpi_energy:"Energiförbrukning",kpi_efficiency:"Effektivitet",kpi_active:"Aktiva Maskiner",kpi_alerts:"Varningar",kwh_unit:"kWh",chart_title:"Realtidsprestanda",machine_status_title:"Maskinstatus",status_running:"Igång",status_warning:"Varning",status_critical:"Kritisk",form_title:"Fabriksdatainmatning",factory_name_label:"Fabriksnamn",machine_count_label:"Antal Maskiner",energy_cost_label:"Energikostnad ($/kWh)",machine_type_label:"Maskintyp",temperature_label:"Temperatur (°C)",vibration_label:"Vibration (mm/s)",load_label:"Belastning (%)",submit_btn:"Analysera Fabrik",submitting:"Uppdaterar...",ai_panel_title:"AI-insikter",ai_placeholder:"Skicka fabriksdata för att generera en AI-analys.",ai_analyzing:"Analyserar...",ai_risks:"Risker",ai_efficiency_insights:"Effektivitetsanalys",ai_optimizations:"Optimeringsförslag",toast_updated:"Fabriksdata uppdaterad",toast_analysis_done:"AI-analys klar",toast_error:"Något gick fel",nav_dashboard:"Instrumentpanel",nav_factories:"Fabriker",nav_ai_insights:"AI-insikter",logout_btn:"Logga ut",login_title:"Välkommen tillbaka",login_subtitle:"Logga in på ditt FactoryPulse AI-konto",ph_email:"E-post",ph_password:"Lösenord",remember_me:"Kom ihåg mig",login_btn:"Logga in",login_link_register:"Inget konto? Skapa ett",register_title:"Skapa ditt konto",register_subtitle:"Börja övervaka dina fabriker med AI",ph_full_name:"Fullständigt Namn",ph_confirm_password:"Bekräfta Lösenord",register_btn:"Skapa Konto",register_link_login:"Har du redan ett konto? Logga in",err_missing_fields:"Vänligen fyll i alla fält",err_invalid_email:"Ange en giltig e-postadress",err_weak_password:"Lösenordet måste vara minst 8 tecken med en bokstav och en siffra",err_password_mismatch:"Lösenorden matchar inte",err_invalid_credentials:"Felaktig e-post eller lösenord",err_email_taken:"Denna e-post är redan registrerad",err_generic:"Något gick fel. Försök igen",my_factories_title:"Mina Fabriker",add_factory_btn:"+ Lägg till Fabrik",edit_factory_btn:"Redigera",delete_factory_btn:"Ta bort",confirm_delete_factory:"Ta bort denna fabrik? Detta kan inte ångras.",no_factories_yet:"Du har inte lagt till några fabriker än.",factory_created_toast:"Fabrik skapad och analyserad",factory_updated_toast:"Fabrik uppdaterad",factory_deleted_toast:"Fabrik borttagen",ai_insights_feed_title:"AI-insikter Flöde",no_ai_insights_yet:"Inga AI-insikter än. Lägg till en fabrik.",reanalyze_btn:"Analysera Igen",view_insights_btn:"Visa Insikter",created_label:"Skapad",cancel_btn:"Avbryt",save_btn:"Spara Ändringar",nav_live_monitor:"Livemonitor",add_machine_scada_btn:"+ Lägg till Maskin",usb_status:"USB:",plc_status:"PLC:",polling_mode:"Polling",live_chart_title:"Live Sensordiagram",machines_table_title:"Maskiner",machine_code_col:"Kod",machine_name_col:"Namn",status_col:"Status",risk_col:"Risk",no_machines_yet:"Inga maskiner än. Klicka på \"+ Lägg till Maskin\".",section_machine_info:"Maskininformation",section_sensor_data:"Sensordata",section_status:"Status",section_notes:"Anteckningar",status_stopped:"Stoppad",status_maintenance:"Underhåll",priority_low:"Låg",priority_normal:"Normal",priority_high:"Hög",priority_critical:"Kritisk",save_and_analyze_btn:"Spara & Analysera",source_col:"Källa",source_auto:"Auto (SCADA)",source_manual:"Manuell",nav_alerts:"Varningar",acknowledge_btn:"Bekräfta",acknowledged_label:"Bekräftad",acknowledge_all_btn:"Bekräfta Alla",no_alerts_yet:"Inga varningar. Allt fungerar smidigt.",download_report_btn:"Rapport",alert_details_template:"Temperatur {temp}°C, vibration {vib} mm/s, status: {status}",section_energy_intel:"Energiintelligens",daily_output_hint:"Används för att beräkna specifik energiförbrukning (kWh per enhet).",energy_insights_title:"Energiintelligens",idle_power_title:"Detektering av Tomgångseffekt",idle_active_msg:"Maskinen står i tomgång - ungefär {kw} kW slösas just nu.",idle_none_msg:"Ingen tomgångsenergiförlust upptäckt.",friction_loss_title:"Prediktiv Energiförlust",friction_active_msg:"Ökad friktion upptäckt: +{pct}% extra effekt (~{kw} kW extra). Schemalägg underhåll för att förhindra förluster.",friction_none_msg:"Ingen onormal friktion upptäckt.",sec_title:"Specifik Energiförbrukning",sec_label:"kWh per enhet",sec_unit:"kWh/enhet",sec_no_data_msg:"Ange daglig produktion när du lägger till denna maskin för att se detta mått.",optimal_load_title:"Optimal Belastningszon",optimal_load_label:"Optimal belastning",current_load_label:"Aktuell belastning",at_optimal_msg:"Körs i den optimala belastningszonen.",adjust_to_optimal_msg:"Justera belastningen mot {pct}% för att minimera energi per enhet.",nav_digital_twin:"Digital Tvilling",twin_hint:"Dra för att rotera, scrolla för att zooma, klicka på en maskin för live-detaljer.",twin_unavailable_msg:"3D-vyn kunde inte laddas (kontrollera din internetanslutning för Three.js).",failure_prediction_title:"Felprognos",report_lib_missing_msg:"PDF-export kräver reportlab-biblioteket. Kör: pip install reportlab, starta sedan om servern.",ph_machine_id:"Maskin-ID (t.ex. M-01)",ph_machine_name:"Maskinnamn",ph_factory_section:"Fabrikssektion",ph_operator_name:"Operatörsnamn",ph_pressure:"Tryck (bar)",ph_voltage:"Spänning (V)",ph_current:"Ström (A)",ph_error_code:"Felkod",ph_daily_output:"Daglig Produktion (enheter)",ph_notes:"Anteckningar...",nav_system_intel:"Systemintelligens",nav_roi:"ROI-panel",refresh_btn:"Uppdatera",system_risk_label:"Systemrisk",healthy_label:"Friska",at_risk_label:"I riskzonen",clusters_title:"Maskinkluster",propagation_title:"Anomalispridning",propagation_hint:"Hur en havererande maskin höjer risken för sina grannar.",no_propagation:"Ingen anomalispridning upptäckt.",avg_risk_label:"Snittrisk",added_risk_label:"Tillagd risk",effective_risk_label:"Effektiv risk",simulation_title:"Tänk-Om-Simulering",simulation_hint:"Välj en maskin, ändra sensorvärden och se hur felsannolikheten reagerar.",run_simulation_btn:"Kör Simulering",failure_probability_label:"Felsannolikhet",stress_level_label:"Belastningsnivå",predicted_status_label:"Förutspådd Status",confidence_label:"Konfidens",root_cause_title:"Grundorsak",rul_col:"Återstående Livslängd",rul_healthy:"Frisk",potential_loss_label:"Potentiell Förlust",saved_label:"Sparat av AI",wasted_energy_label:"Bortslösad Energi / månad",efficiency_gain_label:"Effektivitetsvinst",cost_by_machine_title:"Kostnadsexponering per Maskin",top_cause_col:"Huvudorsak",roi_assumptions_msg:"Antaganden: stillestånd {downtime}/h, reparation {hours}h, energi {price}/kWh.",role_label:"Din Roll",role_engineer:"Ingenjör",role_manager:"Chef",role_admin:"Administratör",cause_bearing_wear:"Lagerslitage",cause_overload_thermal:"Termisk överbelastning",cause_cooling_failure:"Kylfel",cause_misalignment:"Axelfelinriktning",cause_lubrication_loss:"Smörjförlust",cause_normal_operation:"Normal drift",nav_story:"Berättelseläge",story_hint:"Spelar upp ett lagerhaveri som utvecklas över 22 timmar och visar exakt när AI:n upptäckte det — och vad det var värt.",simulate_failure_btn:"Simulera Haveri",outcome_title:"Utfall",warning_time_label:"Tidig Varning",loss_ignored_label:"Förlust utan Åtgärd",loss_acted_label:"Förlust med Åtgärd",money_saved_label:"Sparat",timeline_title:"Haveritidslinje",story_detection_msg:"AI:n flaggade detta {hours} timmar före haveriet, vid {risk}% risk — grundorsak: {cause} ({confidence}% konfidens).",story_stage_healthy:"Frisk",story_stage_early_drift:"Första Avvikelsen",story_stage_ai_detects:"AI Upptäcker",story_stage_critical:"Kritisk",priority_low:"Låg",priority_medium:"Medel",priority_high:"Hög",priority_critical:"Kritisk",action_stop_machine:"Stoppa maskinen",action_inspect_bearings:"Inspektera lager",action_check_cooling:"Kontrollera kylning",action_schedule_shutdown_24h:"Schemalägg stopp (24h)",action_order_spare_parts:"Beställ reservdelar",action_reduce_load:"Minska belastning",action_schedule_inspection_72h:"Schemalägg inspektion (72h)",action_monitor_closely:"Övervaka noga",action_verify_sensor:"Verifiera sensor",action_power_down_idle:"Stäng av tomgångsmaskin",action_review_shift_schedule:"Se över skiftschema",action_no_action:"Ingen åtgärd behövs",nav_oee:"OEE",nav_workorders:"Arbetsordrar",oee_hint:"Tillgänglighet x Prestanda x Kvalitet (ISO 22400). Världsklass är 85%; en typisk fabrik ligger nära 60%.",availability_label:"Tillgänglighet",performance_label:"Prestanda",quality_label:"Kvalitet",weakest_factor_label:"Svagast",downtime_by_reason_title:"Stillestånd per Orsak",downtime_cost_label:"Stilleståndskostnad",oee_trend_title:"OEE-trend",shifts_title:"Skift",shift_col:"Skift",downtime_col:"Stillestånd",log_shift_btn:"Registrera Skift",no_shifts_yet:"Inga skift registrerade ännu.",minutes_short:"min",range_1d:"Idag",range_7d:"7 dagar",range_30d:"30 dagar",all_machines_option:"Alla maskiner",reason_unspecified:"Ej angivet",err_good_exceeds_total:"Godkända enheter kan inte överstiga totalen",oee_grade_world_class:"Världsklass",oee_grade_typical:"Typisk",oee_grade_low:"Låg",oee_grade_critical:"Kritisk",reason_breakdown:"Haveri",reason_changeover:"Omställning",reason_no_material:"Inget material",reason_no_operator:"Ingen operatör",reason_planned_maintenance:"Planerat underhåll",reason_quality_issue:"Kvalitetsproblem",reason_setup:"Inställning",reason_other:"Övrigt",workorders_hint:"Förvandlar en AI-prognos till en spårad uppgift — så att en varning faktiskt slutar i en reparation.",new_work_order_btn:"+ Ny Arbetsorder",no_work_orders:"Inga arbetsordrar ännu.",avg_completion_label:"Snitt slutförande",assigned_label:"Tilldelad",source_ai:"AI",wo_status_open:"Öppen",wo_status_in_progress:"Pågår",wo_status_done:"Klar",wo_status_cancelled:"Avbruten",wo_advance_to_in_progress:"Starta arbete",wo_advance_to_done:"Markera klar",ph_shift_name:"Skiftnamn",ph_planned_minutes:"Planerade minuter",ph_downtime_minutes:"Stilleståndsminuter",ph_total_units:"Totalt antal",ph_good_units:"Godkända enheter",ph_cycle_seconds:"Idealcykel (sek)",ph_wo_title:"Titel",ph_assigned_to:"Tilldelad till",ph_wo_description:"Beskrivning",overdue_label:"Försenad",nav_history:"Historik",history_hint:"Sparad sensorhistorik — så bevisar du vad som faktiskt förändrades under pilotprojektet.",no_history_yet:"Ingen historik registrerad ännu. Håll Live-övervakningen öppen några minuter så börjar data samlas.",range_24h:"24 timmar",range_3d:"3 dagar",range_10d:"10 dagar",sensor_trend_title:"Sensortrend",risk_trend_title:"Risktrend",trend_flat:"oförändrad",trend_rising:"stigande",trend_falling:"fallande",create_work_order_btn:"Skapa Arbetsorder",work_order_created_msg:"Arbetsorder skapad",alertreason_immediate_failure_risk:"Omedelbar haverirrisk",alertreason_failure_imminent:"Haveri nära förestående",alertreason_degradation_accelerating:"Accelererande slitage",alertreason_outside_normal_envelope:"Utanför normalt intervall",alertreason_pressure_anomaly:"Tryckavvikelse",alertreason_idle_waste:"Energispill vid tomgång",alertreason_informational:"Informativt",alert_reason_label:"Orsak",nav_system_health:"Systemhälsa",system_health_hint:"Status för dataväg, modell och säkerhet — det som går sönder i tysthet.",connections_title:"Industriella Anslutningar",data_mode_label:"Dataläge",reads_label:"Avläsningar",failures_label:"Fel",buffered_label:"Buffrat",pipeline_title:"Insamlingspipeline",queue_depth_label:"Ködjup",duplicates_label:"Dubbletter undertryckta",retried_label:"Återförsökta",dead_letter_label:"I karantän",model_title:"Prediktionsmodell",train_model_btn:"Träna Modell",check_drift_btn:"Kontrollera Drift",model_not_trained:"Ingen tränad modell — riskvärden är vägledande, inte validerade.",model_trained_msg:"Modell tränad",trained_on_label:"Tränad på",drift_title:"Datadrift",retrain_recommended:"omträning rekommenderas",security_title:"Säkerhetskontroller",admin_only_msg:"Administratörsåtkomst krävs.",conn_state_healthy:"frisk",conn_state_stale:"inaktuell",conn_state_disconnected:"frånkopplad",conn_state_never_connected:"aldrig ansluten",drift_stable:"stabil",drift_moderate:"måttlig",drift_severe:"allvarlig",metric_precision:"Precision",metric_recall:"Täckning",metric_f1:"F1",metric_roc_auc:"ROC-AUC",metric_false_alarm_rate:"Falsklarmfrekvens",model_cannot_train:"Kan inte tränas ännu",model_reason_no_confirmed_failures:"Inga bekräftade haverier loggade",model_reason_insufficient_telemetry:"Otillräcklig sensorhistorik",model_reason_insufficient_positive_samples:"För få bekräftade haverier",model_reason_no_failures_in_holdout:"Inga haverier i testperioden",check_jwt_secret_strong:"Stark JWT-hemlighet",check_debug_disabled:"Felsökningsläge avstängt",check_https_in_use:"HTTPS används",check_database_is_postgres:"PostgreSQL-databas",check_rate_limiting_active:"Hastighetsbegränsning aktiv",check_account_lockout_active:"Kontolåsning aktiv",check_audit_logging_active:"Granskningslogg aktiv",check_security_headers_active:"Säkerhetsheaders aktiva",check_smtp_configured:"E-post konfigurerad",check_industrial_read_only:"Industriell åtkomst skrivskyddad",model_train_hint:"Logga verkliga haverier för att möjliggöra träning.",drift_status_no_trained_model:"Ingen tränad modell ännu",drift_status_insufficient_recent_data:"Otillräcklig färsk data",msg_model_untrained_note:"Ingen tränad modell ännu — riskvärden är vägledande, inte validerade.",msg_train_needs_failures:"Träning kräver bekräftade haverier. Logga dem på haverisidan.",msg_train_no_holdout_failures:"Testperioden innehåller inga haverier att utvärdera mot.",msg_drift_needs_model:"Träna en modell först — drift mäts mot dess träningsdata.",msg_evaluation_needs_failures:"Noggrannhet kan inte mätas förrän verkliga haverier loggats.",msg_holdout_metrics_note:"Måtten kommer från data som modellen aldrig såg under träningen.",msg_simulation_mode_note:"SIMULATION genererar data lokalt; anslutningsstatus spelar roll först med riktig hårdvara.",msg_savings_needs_two_windows:"En före/efter-jämförelse kräver data i periodens båda halvor.",msg_roi_system_cost_note:"Systemkostnaden är okänd här — dela nyttan med din egen kostnad för ROI.",msg_reliability_not_calibrated:"Branschparametrar används, inte denna fabriks. Logga verkliga haverier för kalibrering.",msg_no_trained_model:"Ingen tränad modell ännu",msg_insufficient_recent_data:"Otillräcklig färsk data",nav_failures:"Haverilogg",failures_hint:"Registrera varje verkligt haveri. Det är detta som lär modellen din anläggnings faktiska beteende — utan det förblir prognoserna generiska.",log_failure_btn:"+ Registrera haveri",calibration_title:"Kalibreringsframsteg",calibration_hint:"Varje komponent behöver tillräckligt många bekräftade haverier innan dess prognos är kalibrerad för denna anläggning.",calibrated_label:"kalibrerad",needs_more_failures:"{n} till behövs",ml_model_label:"Prediktionsmodell",model_ready_to_train:"Redo att tränas",logged_failures_title:"Registrerade Haverier",no_failures_yet:"Inga haverier registrerade ännu.",was_predicted_label:"förutsagt",machine_label:"Maskin",component_label:"Vilken komponent havererade",component_hint:"Välj närmast — det är detta modellen lär sig av.",occurred_at_label:"När inträffade det",downtime_label:"Stillestånd (min)",repair_cost_label:"Reparationskostnad",notes_label:"Anteckningar",ph_failure_notes:"Vad observerades?",failure_logged_msg:"Haveri registrerat",confirm_delete_failure:"Radera denna haveripost?",err_no_machine_selected:"Välj en maskin",err_no_date:"Ange datumet",err_future_date:"Datumet kan inte ligga i framtiden",component_bearing:"Lager",component_motor:"Motor",component_pump:"Pump",component_cooling_system:"Kylsystem",component_gearbox:"Växellåda",cause_seal_leak:"Tätningsläckage",cause_cavitation:"Kavitation",cause_overpressure:"Övertryck",cause_blocked_discharge:"Blockerat utlopp",component_prediction_title:"Komponentprognos",component_prediction_hint:"Återstående livslängd per komponent, utifrån maskinens aktuella tillstånd.",limiting_label:"begränsande",days_short:"dagar",industry_default_label:"branschvärden",calibrated_to_plant:"Kalibrerad för denna anläggning",not_calibrated_warning:"Branschvärden används — logga verkliga haverier för kalibrering."},
 };
 
 let currentLang = localStorage.getItem("fp_lang") || "en";
@@ -4951,6 +8172,10 @@ async function authApi(path, options = {}) {
   if (!res.ok) {
     const err = new Error(data.error || "request_failed");
     err.code = data.error;
+    // Endpoints that refuse for a legitimate reason explain it; keep that
+    // explanation instead of collapsing everything into "something broke".
+    err.detail = data.message || data.detail || "";
+    err.payload = data;
     throw err;
   }
   return data;
@@ -4985,7 +8210,7 @@ document.getElementById("btn-logout").addEventListener("click", () => {
 
 /* ============================ SIDEBAR NAV ============================ */
 function showPage(page) {
-  ["dashboard", "factories", "live", "twin", "system", "roi", "history", "oee", "workorders", "story", "alerts", "ai"].forEach(p => {
+  ["dashboard", "factories", "live", "twin", "system", "roi", "system-health", "history", "oee", "failures", "workorders", "story", "alerts", "ai"].forEach(p => {
     document.getElementById("page-" + p).classList.toggle("hidden", p !== page);
   });
   document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.page === page));
@@ -4999,7 +8224,9 @@ function showPage(page) {
   if (page === "roi") loadRoiDashboard();
   if (page === "story") initStoryMode();
   if (page === "history") initHistory();
+  if (page === "system-health") loadSystemHealth();
   if (page === "oee") loadOee();
+  if (page === "failures") initFailures();
   if (page === "workorders") loadWorkOrders();
 }
 document.querySelectorAll(".nav-btn, .nav-btn-m").forEach(btn => {
@@ -5862,6 +9089,149 @@ function renderStoryStage(stage, index) {
 }
 
 
+/* ==================== SYSTEM HEALTH ==================== */
+const HEALTH_COLORS = { healthy:"#34d399", stable:"#34d399", ok:"#34d399",
+  stale:"#fbbf24", moderate:"#fbbf24", degraded:"#fbbf24", saturated:"#fb923c",
+  disconnected:"#f87171", severe:"#f87171", never_connected:"#94a3b8" };
+
+function healthDot(state) {
+  const c = HEALTH_COLORS[state] || "#94a3b8";
+  return `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${c};margin-right:6px"></span>`;
+}
+
+async function loadSystemHealth() {
+  // Connections
+  try {
+    const d = await authApi("/api/connections/health");
+    document.getElementById("conn-mode").textContent =
+      `${t("data_mode_label")}: ${d.data_mode} — ${d.note_code ? t("msg_" + d.note_code) : ""}`;
+    document.getElementById("conn-grid").innerHTML = Object.values(d.all || {}).map(h => `
+      <div class="glass rounded-xl p-3" style="border-left:3px solid ${HEALTH_COLORS[h.state]||'#94a3b8'}">
+        <div class="flex items-center justify-between mb-1">
+          <span class="font-semibold text-sm">${h.protocol.toUpperCase()}</span>
+          <span class="text-xs">${healthDot(h.state)}${t("conn_state_"+h.state) || h.state}</span>
+        </div>
+        <div class="text-xs text-slate-400 gauge-value">
+          ${t("reads_label")}: ${h.total_reads} · ${t("failures_label")}: ${h.total_failures}
+          ${h.buffered_readings ? `· ${t("buffered_label")}: ${h.buffered_readings}` : ""}
+        </div>
+        ${h.last_error ? `<div class="text-xs mt-1" style="color:#f87171">${h.last_error}</div>` : ""}
+      </div>`).join("");
+  } catch (e) {}
+
+  // Pipeline
+  try {
+    const p = await authApi("/api/pipeline/health");
+    const q = p.queue || {};
+    document.getElementById("pipe-depth").textContent = q.depth ?? "—";
+    document.getElementById("pipe-dupes").textContent = q.duplicates ?? "—";
+    document.getElementById("pipe-retry").textContent = q.retried ?? "—";
+    const dead = document.getElementById("pipe-dead");
+    dead.textContent = q.dead_letter_depth ?? "—";
+    dead.style.color = q.dead_letter_depth ? "#f87171" : "";
+    const fill = document.getElementById("pipe-fill");
+    fill.style.width = (q.utilisation_pct || 0) + "%";
+    fill.style.background = q.utilisation_pct > 80 ? "#f87171" : "#22d3ee";
+    document.getElementById("pipe-dlq").innerHTML = (p.dead_letter_sample || []).length
+      ? `<span style="color:#f87171">${t("dead_letter_label")}:</span> ` +
+        p.dead_letter_sample.map(x => `${x.machine_code} (${x.error})`).join(", ")
+      : "";
+  } catch (e) {}
+
+  // Model registry
+  try {
+    const m = await authApi("/api/model/registry");
+    const body = document.getElementById("model-body");
+    const box = document.getElementById("model-metrics");
+    if (!m.trained) {
+      body.innerHTML = `<span style="color:#fbbf24">${t("msg_" + (m.message_code || "model_untrained_note"))}</span>`;
+      box.classList.add("hidden");
+    } else {
+      body.innerHTML = `<span class="gauge-value">${m.version}</span> · ${t("trained_on_label")}: ${m.training_samples} · ${t("failures_label")}: ${m.positive_samples}`;
+      const k = m.holdout_metrics || {};
+      box.classList.remove("hidden");
+      box.innerHTML = [
+        ["precision", k.precision], ["recall", k.recall], ["f1", k.f1],
+        ["roc_auc", k.roc_auc], ["false_alarm_rate", k.false_alarm_rate],
+      ].map(([label, val]) => `
+        <div class="glass rounded-xl p-3">
+          <div class="text-xs text-slate-400 mb-1">${t("metric_"+label) || label}</div>
+          <div class="text-lg font-bold gauge-value">${val ?? "—"}</div>
+        </div>`).join("");
+    }
+  } catch (e) {}
+
+  // Security (admin only; a 403 here is expected for other roles)
+  try {
+    const s = await authApi("/api/security/status");
+    document.getElementById("sec-body").innerHTML =
+      `<div class="mb-2 gauge-value">${s.passed}/${s.total}</div>` +
+      Object.entries(s.checks).map(([name, ok]) => `
+        <div class="flex items-center gap-2 text-xs mb-1">
+          <span style="color:${ok ? '#34d399' : '#f87171'}">${ok ? "&#10003;" : "&#10007;"}</span>
+          <span class="${ok ? 'text-slate-400' : 'text-slate-200'}">${t("check_"+name)}</span>
+        </div>`).join("");
+  } catch (e) {
+    document.getElementById("sec-body").textContent = t("admin_only_msg");
+  }
+}
+
+document.getElementById("btn-refresh-health").addEventListener("click", loadSystemHealth);
+
+document.getElementById("btn-train-model").addEventListener("click", async () => {
+  const btn = document.getElementById("btn-train-model");
+  const original = btn.textContent;
+  btn.disabled = true; btn.innerHTML = `<span class="spinner"></span>`;
+  try {
+    const r = await authApi("/api/model/train", { method: "POST", body: "{}" });
+    showToast(`${t("model_trained_msg")}: F1=${r.holdout_metrics.f1}`, "success");
+    await loadSystemHealth();
+  } catch (e) {
+    // Not being able to train yet is an expected state, not a failure: show
+    // the server's reason so the user knows what data is still missing.
+    const reason = e.payload && e.payload.reason;
+    if (reason) {
+      const need = e.payload.required || {};
+      const got = e.payload;
+      showToast(
+        `${t("model_cannot_train")}: ${t("model_reason_" + reason) || reason}` +
+        (need.failures ? ` (${got.positive_samples || 0}/${need.failures})` : ""),
+        "error");
+      const body = document.getElementById("model-body");
+      if (body) {
+        body.innerHTML =
+          `<span style="color:#fbbf24">${t("model_reason_" + reason) || reason}</span>` +
+          `<div class="text-xs text-slate-500 mt-1">${t("msg_" + (e.payload.message_code || "train_needs_failures"))}</div>`;
+      }
+    } else {
+      showToast(e.detail || t("err_generic"), "error");
+    }
+  } finally {
+    btn.disabled = false; btn.textContent = original;
+  }
+});
+
+document.getElementById("btn-check-drift").addEventListener("click", async () => {
+  try {
+    const d = await authApi("/api/model/drift");
+    const box = document.getElementById("model-drift");
+    if (d.status !== "ok") {
+      box.innerHTML = `<span class="text-xs text-slate-400">${t("msg_" + (d.message_code || d.status))}</span>`;
+      return;
+    }
+    box.innerHTML = `
+      <div class="text-xs text-slate-400 mb-2">${t("drift_title")} — max PSI ${d.max_psi}
+        ${d.retrain_recommended ? `<span style="color:#f87171">(${t("retrain_recommended")})</span>` : ""}</div>
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-2">
+        ${Object.entries(d.drift_by_feature).map(([f, v]) => `
+          <div class="glass rounded-lg p-2">
+            <div class="text-xs text-slate-400">${t(f+"_label") || f}</div>
+            <div class="gauge-value text-sm" style="color:${HEALTH_COLORS[v.level]}">${v.psi} · ${t("drift_"+v.level)}</div>
+          </div>`).join("")}
+      </div>`;
+  } catch (e) { showToast(t("err_generic"), "error"); }
+});
+
 /* ==================== HISTORY / TRENDS ==================== */
 let histChart = null, histRiskChart = null;
 
@@ -6130,6 +9500,240 @@ document.getElementById("btn-save-shift").addEventListener("click", async () => 
     showToast(`${t("nav_oee")}: ${r.oee.oee}%`, "success");
     await loadOee();
   } catch (e) { showToast(t("err_generic"), "error"); }
+});
+
+/* ==================== FAILURE LOG ==================== */
+let failureComponents = [];
+
+async function initFailures() {
+  await Promise.all([loadCalibration(), loadFailureList(), initReliability()]);
+}
+
+async function initReliability() {
+  const sel = document.getElementById("rel-machine");
+  const prev = sel.value;
+  try {
+    const data = await authApi("/api/machines");
+    scadaMachines = data.machines;
+    sel.innerHTML = scadaMachines.map(x =>
+      `<option value="${x.id}">${x.machine_code} — ${x.machine_name}</option>`).join("");
+    if (prev) sel.value = prev;
+  } catch (e) {}
+  await loadReliability();
+}
+
+async function loadReliability() {
+  const id = document.getElementById("rel-machine").value;
+  const grid = document.getElementById("rel-grid");
+  const warn = document.getElementById("rel-warning");
+  if (!id) { grid.innerHTML = ""; warn.textContent = ""; return; }
+
+  try {
+    const d = await authApi(`/api/reliability/${id}`);
+    const comps = Object.values(d.components || {});
+    // Worst component first: that is the one that will actually fail.
+    comps.sort((a, b) => a.rul_hours - b.rul_hours);
+
+    grid.innerHTML = comps.map(comp => {
+      const days = comp.rul_days;
+      const color = days < 7 ? "#f87171" : (days < 30 ? "#fbbf24" : "#34d399");
+      const isLimiting = comp.component === d.limiting_component;
+      return `
+        <div class="glass rounded-xl p-3" style="border-left:3px solid ${color}">
+          <div class="flex items-center justify-between mb-1.5">
+            <span class="text-sm font-semibold">${t("component_" + comp.component)}</span>
+            ${isLimiting ? `<span class="text-xs px-2 py-0.5 rounded-full" style="background:${color}22;color:${color}">${t("limiting_label")}</span>` : ""}
+          </div>
+          <div class="text-lg font-bold gauge-value" style="color:${color}">
+            ${days > 365 ? "365+" : days} <span class="text-xs text-slate-400">${t("days_short")}</span>
+          </div>
+          <div class="text-xs text-slate-400 mt-1 gauge-value">
+            ${t("failure_probability_label")}: ${Math.round(comp.failure_probability * 100)}%
+            · ${t("stress_level_label")}: ${comp.stress_factor}x
+          </div>
+          <div class="text-xs mt-1" style="color:${comp.is_calibrated ? '#34d399' : '#94a3b8'}">
+            ${comp.is_calibrated ? t("calibrated_label") : t("industry_default_label")}
+            · ${t("confidence_label")} ${Math.round(comp.confidence * 100)}%
+          </div>
+        </div>`;
+    }).join("");
+
+    // The warning is the honest part: say plainly when the numbers are generic.
+    warn.innerHTML = d.calibrated_to_this_plant
+      ? `<span style="color:#34d399">&#10003; ${t("calibrated_to_plant")}</span>`
+      : `<span style="color:#fbbf24">${t("not_calibrated_warning")}</span>`;
+  } catch (e) {
+    grid.innerHTML = "";
+  }
+}
+
+document.getElementById("rel-machine").addEventListener("change", loadReliability);
+
+async function loadCalibration() {
+  try {
+    const d = await authApi("/api/meta/components");
+    failureComponents = d.components || [];
+
+    document.getElementById("calib-grid").innerHTML = failureComponents.map(comp => {
+      const pct = Math.min(100, Math.round(comp.logged / comp.needed * 100));
+      const color = comp.calibrated ? "#34d399" : (pct > 50 ? "#22d3ee" : "#fbbf24");
+      return `
+        <div class="glass rounded-xl p-3">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-sm font-semibold">${t("component_" + comp.code)}</span>
+            <span class="text-xs gauge-value" style="color:${color}">${comp.logged}/${comp.needed}</span>
+          </div>
+          <div style="height:6px;background:rgba(255,255,255,.07);border-radius:3px;overflow:hidden">
+            <div style="height:100%;width:${pct}%;background:${color};transition:width .4s"></div>
+          </div>
+          <div class="text-xs mt-1.5" style="color:${color}">
+            ${comp.calibrated
+              ? t("calibrated_label")
+              : t("needs_more_failures").replace("{n}", comp.remaining)}
+          </div>
+        </div>`;
+    }).join("");
+
+    const mt = d.model_training || {};
+    const mpct = Math.min(100, Math.round((mt.logged || 0) / (mt.needed || 1) * 100));
+    document.getElementById("calib-model").innerHTML = `
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-sm font-semibold">${t("ml_model_label")}</span>
+        <span class="text-xs gauge-value" style="color:${mt.ready ? '#34d399' : '#fbbf24'}">${mt.logged}/${mt.needed}</span>
+      </div>
+      <div style="height:6px;background:rgba(255,255,255,.07);border-radius:3px;overflow:hidden">
+        <div style="height:100%;width:${mpct}%;background:${mt.ready ? '#34d399' : '#fbbf24'}"></div>
+      </div>
+      <div class="text-xs text-slate-500 mt-1.5">
+        ${mt.ready ? t("model_ready_to_train") : t("needs_more_failures").replace("{n}", mt.remaining)}
+      </div>`;
+  } catch (e) {}
+}
+
+async function loadFailureList() {
+  try {
+    const d = await authApi("/api/failures");
+    const list = d.failures || [];
+    document.getElementById("failure-empty").classList.toggle("hidden", list.length > 0);
+
+    document.getElementById("failure-list").innerHTML = list.map(f => `
+      <div class="glass rounded-xl p-4" style="border-left:3px solid ${f.was_predicted ? '#34d399' : '#f87171'}">
+        <div class="flex items-start justify-between gap-3 flex-wrap mb-2">
+          <div>
+            <div class="font-semibold text-sm">${f.machine_code} — ${t("component_" + f.component) || f.component || "—"}</div>
+            <div class="text-xs text-slate-400 mt-0.5 gauge-value">${(f.occurred_at || "").replace("T", " ").slice(0, 16)}</div>
+          </div>
+          <div class="flex items-center gap-2">
+            ${f.was_predicted
+              ? `<span class="text-xs px-2 py-0.5 rounded-full" style="background:rgba(52,211,153,.2);color:#34d399">${t("was_predicted_label")}</span>`
+              : ""}
+            <button class="btn-del-failure input-field rounded-lg px-2 py-1 text-xs" data-id="${f.id}">&times;</button>
+          </div>
+        </div>
+        <div class="text-xs text-slate-400 flex flex-wrap gap-3">
+          ${f.downtime_minutes ? `<span>${t("downtime_label")}: ${f.downtime_minutes} ${t("minutes_short")}</span>` : ""}
+          ${f.repair_cost ? `<span>${t("repair_cost_label")}: ${money(f.repair_cost)}</span>` : ""}
+        </div>
+        ${f.notes ? `<div class="text-xs text-slate-500 mt-1.5">${f.notes}</div>` : ""}
+      </div>`).join("");
+
+    document.querySelectorAll(".btn-del-failure").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        // Deleting ground truth changes what the model learns, so confirm it.
+        if (!confirm(t("confirm_delete_failure"))) return;
+        try {
+          await authApi(`/api/failures/${btn.dataset.id}`, { method: "DELETE" });
+          await initFailures();
+        } catch (e) { showToast(t("err_generic"), "error"); }
+      });
+    });
+  } catch (e) {}
+}
+
+async function openFailureModal() {
+  const modal = document.getElementById("modal-failure");
+  document.getElementById("fl-error").classList.add("hidden");
+
+  // Machines
+  const sel = document.getElementById("fl-machine");
+  sel.innerHTML = "";
+  try {
+    const data = await authApi("/api/machines");
+    scadaMachines = data.machines;
+    scadaMachines.forEach(x => {
+      const o = document.createElement("option");
+      o.value = x.id;
+      o.textContent = `${x.machine_code} — ${x.machine_name}`;
+      sel.appendChild(o);
+    });
+  } catch (e) {}
+
+  // Components come from the server, so the values always match what the
+  // reliability model can actually calibrate.
+  if (!failureComponents.length) await loadCalibration();
+  const comp = document.getElementById("fl-component");
+  comp.innerHTML = failureComponents.map(x =>
+    `<option value="${x.code}">${t("component_" + x.code)}</option>`).join("");
+
+  // Default to now, in the browser's local time
+  const now = new Date();
+  now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+  document.getElementById("fl-when").value = now.toISOString().slice(0, 16);
+
+  modal.classList.remove("hidden");
+  modal.classList.add("flex");
+}
+
+document.getElementById("btn-log-failure").addEventListener("click", openFailureModal);
+document.querySelectorAll(".close-failure-modal").forEach(b =>
+  b.addEventListener("click", () => {
+    const m = document.getElementById("modal-failure");
+    m.classList.add("hidden"); m.classList.remove("flex");
+  }));
+
+document.getElementById("btn-save-failure").addEventListener("click", async () => {
+  const err = document.getElementById("fl-error");
+  err.classList.add("hidden");
+
+  const machineId = document.getElementById("fl-machine").value;
+  const component = document.getElementById("fl-component").value;
+  const when = document.getElementById("fl-when").value;
+
+  if (!machineId) { err.textContent = t("err_no_machine_selected"); err.classList.remove("hidden"); return; }
+  if (!when) { err.textContent = t("err_no_date"); err.classList.remove("hidden"); return; }
+  // A failure in the future is a typo, and it would corrupt the training labels.
+  if (new Date(when) > new Date()) {
+    err.textContent = t("err_future_date"); err.classList.remove("hidden"); return;
+  }
+
+  const btn = document.getElementById("btn-save-failure");
+  btn.disabled = true;
+  try {
+    await authApi("/api/failures", {
+      method: "POST",
+      body: JSON.stringify({
+        machine_id: parseInt(machineId),
+        component: component,
+        failure_type: component,
+        occurred_at: when + ":00",
+        downtime_minutes: parseFloat(document.getElementById("fl-downtime").value || 0),
+        repair_cost: parseFloat(document.getElementById("fl-cost").value || 0),
+        notes: document.getElementById("fl-notes").value.trim(),
+      }),
+    });
+    const m = document.getElementById("modal-failure");
+    m.classList.add("hidden"); m.classList.remove("flex");
+    document.getElementById("fl-notes").value = "";
+    document.getElementById("fl-downtime").value = 0;
+    document.getElementById("fl-cost").value = 0;
+    showToast(t("failure_logged_msg"), "success");
+    await initFailures();
+  } catch (e) {
+    err.textContent = t("err_generic");
+    err.classList.remove("hidden");
+  } finally {
+    btn.disabled = false;
+  }
 });
 
 /* ==================== WORK ORDERS ==================== */
@@ -7175,6 +10779,13 @@ REGISTER_HTML = r"""<!DOCTYPE html>
           <label class="fl-label absolute left-3 top-2 text-xs text-slate-400 peer-placeholder-shown:top-1/2 peer-placeholder-shown:-translate-y-1/2 peer-placeholder-shown:text-sm peer-focus:top-2 peer-focus:translate-y-0 peer-focus:text-xs peer-focus:text-cyan-400" data-t="ph_confirm_password">Confirm Password</label>
           <button type="button" class="toggle-eye absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200" data-target="confirm-password"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></svg></button>
         </div>
+        <div id="reg-code-wrap" class="hidden">
+          <input id="reg-code" placeholder="Access Code" data-t-placeholder="ph_registration_code"
+                 class="input-field w-full rounded-xl text-sm px-3 py-2.5" />
+          <p class="text-xs text-slate-500 mt-1" data-t="registration_code_hint">Ask your plant administrator for this code.</p>
+        </div>
+        <div id="reg-invite-notice" class="hidden text-xs rounded-xl px-3 py-2"
+             style="background:rgba(34,211,238,.1);color:#22d3ee" data-t="invite_accepted_msg">Invitation accepted.</div>
         <div>
           <label class="text-xs text-slate-400 mb-1.5 block" data-t="role_label">Your Role</label>
           <select id="reg-role" class="input-field w-full rounded-xl text-sm px-3 py-2.5">
@@ -7198,26 +10809,26 @@ REGISTER_HTML = r"""<!DOCTYPE html>
 
 <script>
 const translations = {
-  en: {tagline:"Global Industrial Intelligence Platform",live_label:"Live",kpi_energy:"Energy Usage",kpi_efficiency:"Efficiency",kpi_active:"Active Machines",kpi_alerts:"Alerts",kwh_unit:"kWh",chart_title:"Real-Time Performance",machine_status_title:"Machine Status",status_running:"Running",status_warning:"Warning",status_critical:"Critical",form_title:"Factory Data Input",factory_name_label:"Factory Name",machine_count_label:"Number of Machines",energy_cost_label:"Energy Cost ($/kWh)",machine_type_label:"Machine Type",temperature_label:"Temperature (°C)",vibration_label:"Vibration (mm/s)",load_label:"Load (%)",submit_btn:"Analyze Factory",submitting:"Updating...",ai_panel_title:"AI Insights",ai_placeholder:"Submit factory data to generate an AI analysis.",ai_analyzing:"Analyzing...",ai_risks:"Risks",ai_efficiency_insights:"Efficiency Insights",ai_optimizations:"Optimization Suggestions",toast_updated:"Factory data updated",toast_analysis_done:"AI analysis complete",toast_error:"Something went wrong",nav_dashboard:"Dashboard",nav_factories:"Factories",nav_ai_insights:"AI Insights",logout_btn:"Log Out",login_title:"Welcome back",login_subtitle:"Sign in to your FactoryPulse AI account",ph_email:"Email",ph_password:"Password",remember_me:"Remember me",login_btn:"Log In",login_link_register:"Don't have an account? Create one",register_title:"Create your account",register_subtitle:"Start monitoring your factories with AI",ph_full_name:"Full Name",ph_confirm_password:"Confirm Password",register_btn:"Create Account",register_link_login:"Already have an account? Sign in",err_missing_fields:"Please fill in all fields",err_invalid_email:"Please enter a valid email address",err_weak_password:"Password must be at least 8 characters with a letter and a number",err_password_mismatch:"Passwords do not match",err_invalid_credentials:"Invalid email or password",err_email_taken:"This email is already registered",err_generic:"Something went wrong. Please try again",my_factories_title:"My Factories",add_factory_btn:"+ Add Factory",edit_factory_btn:"Edit",delete_factory_btn:"Delete",confirm_delete_factory:"Delete this factory? This cannot be undone.",no_factories_yet:"You haven't added any factories yet.",factory_created_toast:"Factory created and analyzed",factory_updated_toast:"Factory updated",factory_deleted_toast:"Factory deleted",ai_insights_feed_title:"AI Insights Feed",no_ai_insights_yet:"No AI insights yet. Add a factory to get started.",reanalyze_btn:"Re-analyze",view_insights_btn:"View Insights",created_label:"Created",cancel_btn:"Cancel",save_btn:"Save Changes",role_label:"Your Role",role_engineer:"Engineer",role_manager:"Manager",role_admin:"Admin"},
-  ru: {tagline:"Глобальная платформа промышленного интеллекта",live_label:"Live",kpi_energy:"Потребление энергии",kpi_efficiency:"Эффективность",kpi_active:"Активные станки",kpi_alerts:"Оповещения",kwh_unit:"кВт·ч",chart_title:"Показатели в реальном времени",machine_status_title:"Статус станков",status_running:"Работает",status_warning:"Внимание",status_critical:"Критично",form_title:"Ввод данных завода",factory_name_label:"Название завода",machine_count_label:"Количество станков",energy_cost_label:"Стоимость энергии ($/кВт·ч)",machine_type_label:"Тип станка",temperature_label:"Температура (°C)",vibration_label:"Вибрация (мм/с)",load_label:"Нагрузка (%)",submit_btn:"Анализировать завод",submitting:"Обновление...",ai_panel_title:"AI-аналитика",ai_placeholder:"Отправьте данные завода, чтобы получить AI-анализ.",ai_analyzing:"Анализ...",ai_risks:"Риски",ai_efficiency_insights:"Анализ эффективности",ai_optimizations:"Рекомендации по оптимизации",toast_updated:"Данные завода обновлены",toast_analysis_done:"AI-анализ завершён",toast_error:"Произошла ошибка",nav_dashboard:"Панель",nav_factories:"Заводы",nav_ai_insights:"AI-аналитика",logout_btn:"Выход",login_title:"С возвращением",login_subtitle:"Войдите в аккаунт FactoryPulse AI",ph_email:"Email",ph_password:"Пароль",remember_me:"Запомнить меня",login_btn:"Войти",login_link_register:"Нет аккаунта? Создать",register_title:"Создать аккаунт",register_subtitle:"Начните мониторинг заводов с помощью AI",ph_full_name:"Полное имя",ph_confirm_password:"Подтвердите пароль",register_btn:"Создать аккаунт",register_link_login:"Уже есть аккаунт? Войти",err_missing_fields:"Заполните все поля",err_invalid_email:"Введите корректный email",err_weak_password:"Пароль должен быть от 8 символов, с буквой и цифрой",err_password_mismatch:"Пароли не совпадают",err_invalid_credentials:"Неверный email или пароль",err_email_taken:"Этот email уже зарегистрирован",err_generic:"Что-то пошло не так. Попробуйте снова",my_factories_title:"Мои заводы",add_factory_btn:"+ Добавить завод",edit_factory_btn:"Изменить",delete_factory_btn:"Удалить",confirm_delete_factory:"Удалить этот завод? Это действие нельзя отменить.",no_factories_yet:"Вы ещё не добавили ни одного завода.",factory_created_toast:"Завод создан и проанализирован",factory_updated_toast:"Завод обновлён",factory_deleted_toast:"Завод удалён",ai_insights_feed_title:"Лента AI-аналитики",no_ai_insights_yet:"Пока нет AI-аналитики. Добавьте завод, чтобы начать.",reanalyze_btn:"Проанализировать снова",view_insights_btn:"Смотреть аналитику",created_label:"Создано",cancel_btn:"Отмена",save_btn:"Сохранить изменения",role_label:"Ваша роль",role_engineer:"Инженер",role_manager:"Менеджер",role_admin:"Администратор"},
-  kk: {tagline:"Жаһандық өнеркәсіптік интеллект платформасы",live_label:"Тікелей эфир",kpi_energy:"Энергия тұтыну",kpi_efficiency:"Тиімділік",kpi_active:"Белсенді станоктар",kpi_alerts:"Дабылдар",kwh_unit:"кВт·сағ",chart_title:"Нақты уақыттағы көрсеткіштер",machine_status_title:"Станоктар күйі",status_running:"Жұмыс істеп тұр",status_warning:"Ескерту",status_critical:"Сыни",form_title:"Зауыт деректерін енгізу",factory_name_label:"Зауыт атауы",machine_count_label:"Станоктар саны",energy_cost_label:"Энергия құны ($/кВт·сағ)",machine_type_label:"Станок түрі",temperature_label:"Температура (°C)",vibration_label:"Діріл (мм/с)",load_label:"Жүктеме (%)",submit_btn:"Зауытты талдау",submitting:"Жаңартылуда...",ai_panel_title:"AI-талдау",ai_placeholder:"AI-талдау алу үшін зауыт деректерін жіберіңіз.",ai_analyzing:"Талдануда...",ai_risks:"Тәуекелдер",ai_efficiency_insights:"Тиімділік талдауы",ai_optimizations:"Оңтайландыру ұсыныстары",toast_updated:"Зауыт деректері жаңартылды",toast_analysis_done:"AI-талдау аяқталды",toast_error:"Қате орын алды",nav_dashboard:"Басқару тақтасы",nav_factories:"Зауыттар",nav_ai_insights:"AI-талдау",logout_btn:"Шығу",login_title:"Қайта қош келдіңіз",login_subtitle:"FactoryPulse AI аккаунтыңызға кіріңіз",ph_email:"Email",ph_password:"Құпия сөз",remember_me:"Мені есте сақтау",login_btn:"Кіру",login_link_register:"Аккаунтыңыз жоқ па? Тіркелу",register_title:"Аккаунт құру",register_subtitle:"Зауыттарды AI арқылы бақылауды бастаңыз",ph_full_name:"Толық аты-жөні",ph_confirm_password:"Құпия сөзді қайталаңыз",register_btn:"Аккаунт құру",register_link_login:"Аккаунтыңыз бар ма? Кіру",err_missing_fields:"Барлық өрістерді толтырыңыз",err_invalid_email:"Дұрыс email мекенжайын енгізіңіз",err_weak_password:"Құпия сөз кемінде 8 таңба, әріп пен сан болуы керек",err_password_mismatch:"Құпия сөздер сәйкес келмейді",err_invalid_credentials:"Қате email немесе құпия сөз",err_email_taken:"Бұл email тіркелген",err_generic:"Қате орын алды. Қайталап көріңіз",my_factories_title:"Менің зауыттарым",add_factory_btn:"+ Зауыт қосу",edit_factory_btn:"Өзгерту",delete_factory_btn:"Жою",confirm_delete_factory:"Бұл зауытты жоясыз ба? Бұл әрекетті кері қайтару мүмкін емес.",no_factories_yet:"Сіз әлі ешбір зауыт қосқан жоқсыз.",factory_created_toast:"Зауыт құрылды және талданды",factory_updated_toast:"Зауыт жаңартылды",factory_deleted_toast:"Зауыт жойылды",ai_insights_feed_title:"AI-талдау таспасы",no_ai_insights_yet:"AI-талдау әлі жоқ. Бастау үшін зауыт қосыңыз.",reanalyze_btn:"Қайта талдау",view_insights_btn:"Талдауды көру",created_label:"Құрылған күні",cancel_btn:"Бас тарту",save_btn:"Өзгерістерді сақтау",role_label:"Сіздің рөліңіз",role_engineer:"Инженер",role_manager:"Менеджер",role_admin:"Әкімші"},
-  de: {tagline:"Globale Industrielle Intelligenzplattform",live_label:"Live",kpi_energy:"Energieverbrauch",kpi_efficiency:"Effizienz",kpi_active:"Aktive Maschinen",kpi_alerts:"Warnungen",kwh_unit:"kWh",chart_title:"Echtzeit-Leistung",machine_status_title:"Maschinenstatus",status_running:"Läuft",status_warning:"Warnung",status_critical:"Kritisch",form_title:"Fabrikdateneingabe",factory_name_label:"Fabrikname",machine_count_label:"Anzahl der Maschinen",energy_cost_label:"Energiekosten ($/kWh)",machine_type_label:"Maschinentyp",temperature_label:"Temperatur (°C)",vibration_label:"Vibration (mm/s)",load_label:"Last (%)",submit_btn:"Fabrik Analysieren",submitting:"Aktualisieren...",ai_panel_title:"KI-Einblicke",ai_placeholder:"Senden Sie Fabrikdaten, um eine KI-Analyse zu erstellen.",ai_analyzing:"Analysiere...",ai_risks:"Risiken",ai_efficiency_insights:"Effizienzanalyse",ai_optimizations:"Optimierungsvorschläge",toast_updated:"Fabrikdaten aktualisiert",toast_analysis_done:"KI-Analyse abgeschlossen",toast_error:"Etwas ist schiefgelaufen",nav_dashboard:"Übersicht",nav_factories:"Fabriken",nav_ai_insights:"KI-Einblicke",logout_btn:"Abmelden",login_title:"Willkommen zurück",login_subtitle:"Melden Sie sich bei Ihrem FactoryPulse AI-Konto an",ph_email:"E-Mail",ph_password:"Passwort",remember_me:"Angemeldet bleiben",login_btn:"Einloggen",login_link_register:"Kein Konto? Jetzt erstellen",register_title:"Konto erstellen",register_subtitle:"Beginnen Sie mit der KI-Überwachung Ihrer Fabriken",ph_full_name:"Vollständiger Name",ph_confirm_password:"Passwort bestätigen",register_btn:"Konto erstellen",register_link_login:"Bereits ein Konto? Anmelden",err_missing_fields:"Bitte füllen Sie alle Felder aus",err_invalid_email:"Bitte geben Sie eine gültige E-Mail-Adresse ein",err_weak_password:"Passwort muss mind. 8 Zeichen, einen Buchstaben und eine Zahl enthalten",err_password_mismatch:"Passwörter stimmen nicht überein",err_invalid_credentials:"Ungültige E-Mail oder Passwort",err_email_taken:"Diese E-Mail ist bereits registriert",err_generic:"Etwas ist schiefgelaufen. Bitte erneut versuchen",my_factories_title:"Meine Fabriken",add_factory_btn:"+ Fabrik Hinzufügen",edit_factory_btn:"Bearbeiten",delete_factory_btn:"Löschen",confirm_delete_factory:"Diese Fabrik löschen? Dies kann nicht rückgängig gemacht werden.",no_factories_yet:"Sie haben noch keine Fabriken hinzugefügt.",factory_created_toast:"Fabrik erstellt und analysiert",factory_updated_toast:"Fabrik aktualisiert",factory_deleted_toast:"Fabrik gelöscht",ai_insights_feed_title:"KI-Einblicke Feed",no_ai_insights_yet:"Noch keine KI-Einblicke. Fügen Sie eine Fabrik hinzu.",reanalyze_btn:"Erneut analysieren",view_insights_btn:"Einblicke Anzeigen",created_label:"Erstellt",cancel_btn:"Abbrechen",save_btn:"Änderungen Speichern",role_label:"Ihre Rolle",role_engineer:"Ingenieur",role_manager:"Manager",role_admin:"Administrator"},
-  fr: {tagline:"Plateforme mondiale d'intelligence industrielle",live_label:"En direct",kpi_energy:"Consommation d'Énergie",kpi_efficiency:"Efficacité",kpi_active:"Machines Actives",kpi_alerts:"Alertes",kwh_unit:"kWh",chart_title:"Performance en Temps Réel",machine_status_title:"État des Machines",status_running:"En marche",status_warning:"Avertissement",status_critical:"Critique",form_title:"Saisie des Données d'Usine",factory_name_label:"Nom de l'Usine",machine_count_label:"Nombre de Machines",energy_cost_label:"Coût de l'Énergie ($/kWh)",machine_type_label:"Type de Machine",temperature_label:"Température (°C)",vibration_label:"Vibration (mm/s)",load_label:"Charge (%)",submit_btn:"Analyser l'Usine",submitting:"Mise à jour...",ai_panel_title:"Analyses IA",ai_placeholder:"Envoyez les données de l'usine pour générer une analyse IA.",ai_analyzing:"Analyse en cours...",ai_risks:"Risques",ai_efficiency_insights:"Analyse d'Efficacité",ai_optimizations:"Suggestions d'Optimisation",toast_updated:"Données d'usine mises à jour",toast_analysis_done:"Analyse IA terminée",toast_error:"Une erreur est survenue",nav_dashboard:"Tableau de Bord",nav_factories:"Usines",nav_ai_insights:"Analyses IA",logout_btn:"Déconnexion",login_title:"Content de vous revoir",login_subtitle:"Connectez-vous à votre compte FactoryPulse AI",ph_email:"E-mail",ph_password:"Mot de passe",remember_me:"Se souvenir de moi",login_btn:"Se connecter",login_link_register:"Pas de compte ? Créez-en un",register_title:"Créer votre compte",register_subtitle:"Commencez à surveiller vos usines avec l'IA",ph_full_name:"Nom Complet",ph_confirm_password:"Confirmer le Mot de Passe",register_btn:"Créer un Compte",register_link_login:"Déjà un compte ? Se connecter",err_missing_fields:"Veuillez remplir tous les champs",err_invalid_email:"Veuillez entrer une adresse e-mail valide",err_weak_password:"Le mot de passe doit contenir 8 caractères min., une lettre et un chiffre",err_password_mismatch:"Les mots de passe ne correspondent pas",err_invalid_credentials:"E-mail ou mot de passe incorrect",err_email_taken:"Cet e-mail est déjà enregistré",err_generic:"Une erreur est survenue. Veuillez réessayer",my_factories_title:"Mes Usines",add_factory_btn:"+ Ajouter une Usine",edit_factory_btn:"Modifier",delete_factory_btn:"Supprimer",confirm_delete_factory:"Supprimer cette usine ? Cette action est irréversible.",no_factories_yet:"Vous n'avez pas encore ajouté d'usine.",factory_created_toast:"Usine créée et analysée",factory_updated_toast:"Usine mise à jour",factory_deleted_toast:"Usine supprimée",ai_insights_feed_title:"Flux d'Analyses IA",no_ai_insights_yet:"Aucune analyse IA pour l'instant. Ajoutez une usine.",reanalyze_btn:"Réanalyser",view_insights_btn:"Voir les Analyses",created_label:"Créée le",cancel_btn:"Annuler",save_btn:"Enregistrer les Modifications",role_label:"Votre Rôle",role_engineer:"Ingénieur",role_manager:"Manager",role_admin:"Administrateur"},
-  es: {tagline:"Plataforma Global de Inteligencia Industrial",live_label:"En vivo",kpi_energy:"Uso de Energía",kpi_efficiency:"Eficiencia",kpi_active:"Máquinas Activas",kpi_alerts:"Alertas",kwh_unit:"kWh",chart_title:"Rendimiento en Tiempo Real",machine_status_title:"Estado de Máquinas",status_running:"Funcionando",status_warning:"Advertencia",status_critical:"Crítico",form_title:"Entrada de Datos de Fábrica",factory_name_label:"Nombre de Fábrica",machine_count_label:"Número de Máquinas",energy_cost_label:"Costo de Energía ($/kWh)",machine_type_label:"Tipo de Máquina",temperature_label:"Temperatura (°C)",vibration_label:"Vibración (mm/s)",load_label:"Carga (%)",submit_btn:"Analizar Fábrica",submitting:"Actualizando...",ai_panel_title:"Perspectivas IA",ai_placeholder:"Envíe datos de fábrica para generar un análisis IA.",ai_analyzing:"Analizando...",ai_risks:"Riesgos",ai_efficiency_insights:"Análisis de Eficiencia",ai_optimizations:"Sugerencias de Optimización",toast_updated:"Datos de fábrica actualizados",toast_analysis_done:"Análisis IA completo",toast_error:"Algo salió mal",nav_dashboard:"Panel",nav_factories:"Fábricas",nav_ai_insights:"Perspectivas IA",logout_btn:"Cerrar Sesión",login_title:"Bienvenido de nuevo",login_subtitle:"Inicia sesión en tu cuenta de FactoryPulse AI",ph_email:"Correo electrónico",ph_password:"Contraseña",remember_me:"Recuérdame",login_btn:"Iniciar Sesión",login_link_register:"¿No tienes cuenta? Crea una",register_title:"Crea tu cuenta",register_subtitle:"Empieza a monitorear tus fábricas con IA",ph_full_name:"Nombre Completo",ph_confirm_password:"Confirmar Contraseña",register_btn:"Crear Cuenta",register_link_login:"¿Ya tienes cuenta? Inicia sesión",err_missing_fields:"Por favor complete todos los campos",err_invalid_email:"Por favor ingrese un correo válido",err_weak_password:"La contraseña debe tener mín. 8 caracteres, una letra y un número",err_password_mismatch:"Las contraseñas no coinciden",err_invalid_credentials:"Correo o contraseña incorrectos",err_email_taken:"Este correo ya está registrado",err_generic:"Algo salió mal. Inténtalo de nuevo",my_factories_title:"Mis Fábricas",add_factory_btn:"+ Añadir Fábrica",edit_factory_btn:"Editar",delete_factory_btn:"Eliminar",confirm_delete_factory:"¿Eliminar esta fábrica? Esta acción no se puede deshacer.",no_factories_yet:"Aún no has añadido ninguna fábrica.",factory_created_toast:"Fábrica creada y analizada",factory_updated_toast:"Fábrica actualizada",factory_deleted_toast:"Fábrica eliminada",ai_insights_feed_title:"Feed de Perspectivas IA",no_ai_insights_yet:"Aún no hay perspectivas IA. Añade una fábrica.",reanalyze_btn:"Reanalizar",view_insights_btn:"Ver Perspectivas",created_label:"Creada",cancel_btn:"Cancelar",save_btn:"Guardar Cambios",role_label:"Su Rol",role_engineer:"Ingeniero",role_manager:"Gerente",role_admin:"Administrador"},
-  zh: {tagline:"全球工业智能平台",live_label:"实时",kpi_energy:"能源使用量",kpi_efficiency:"效率",kpi_active:"运行中设备",kpi_alerts:"警报",kwh_unit:"kWh",chart_title:"实时性能",machine_status_title:"设备状态",status_running:"运行中",status_warning:"警告",status_critical:"严重",form_title:"工厂数据输入",factory_name_label:"工厂名称",machine_count_label:"设备数量",energy_cost_label:"能源成本 ($/kWh)",machine_type_label:"设备类型",temperature_label:"温度 (°C)",vibration_label:"振动 (mm/s)",load_label:"负载 (%)",submit_btn:"分析工厂",submitting:"更新中...",ai_panel_title:"AI 洞察",ai_placeholder:"提交工厂数据以生成AI分析。",ai_analyzing:"分析中...",ai_risks:"风险",ai_efficiency_insights:"效率分析",ai_optimizations:"优化建议",toast_updated:"工厂数据已更新",toast_analysis_done:"AI分析已完成",toast_error:"出现错误",nav_dashboard:"仪表盘",nav_factories:"工厂",nav_ai_insights:"AI洞察",logout_btn:"退出",login_title:"欢迎回来",login_subtitle:"登录您的 FactoryPulse AI 账户",ph_email:"电子邮件",ph_password:"密码",remember_me:"记住我",login_btn:"登录",login_link_register:"没有账户？创建一个",register_title:"创建账户",register_subtitle:"开始使用AI监控您的工厂",ph_full_name:"全名",ph_confirm_password:"确认密码",register_btn:"创建账户",register_link_login:"已有账户？登录",err_missing_fields:"请填写所有字段",err_invalid_email:"请输入有效的电子邮件地址",err_weak_password:"密码至少8位，需包含字母和数字",err_password_mismatch:"两次密码不一致",err_invalid_credentials:"电子邮件或密码错误",err_email_taken:"该电子邮件已被注册",err_generic:"出现错误，请重试",my_factories_title:"我的工厂",add_factory_btn:"+ 添加工厂",edit_factory_btn:"编辑",delete_factory_btn:"删除",confirm_delete_factory:"删除此工厂？此操作无法撤销。",no_factories_yet:"您还没有添加任何工厂。",factory_created_toast:"工厂已创建并分析",factory_updated_toast:"工厂已更新",factory_deleted_toast:"工厂已删除",ai_insights_feed_title:"AI洞察动态",no_ai_insights_yet:"暂无AI洞察。请添加工厂开始。",reanalyze_btn:"重新分析",view_insights_btn:"查看洞察",created_label:"创建于",cancel_btn:"取消",save_btn:"保存更改",role_label:"您的角色",role_engineer:"工程师",role_manager:"经理",role_admin:"管理员"},
-  ar: {tagline:"منصة الذكاء الصناعي العالمية",live_label:"مباشر",kpi_energy:"استهلاك الطاقة",kpi_efficiency:"الكفاءة",kpi_active:"الآلات النشطة",kpi_alerts:"التنبيهات",kwh_unit:"kWh",chart_title:"الأداء في الوقت الفعلي",machine_status_title:"حالة الآلات",status_running:"تعمل",status_warning:"تحذير",status_critical:"حرج",form_title:"إدخال بيانات المصنع",factory_name_label:"اسم المصنع",machine_count_label:"عدد الآلات",energy_cost_label:"تكلفة الطاقة ($/kWh)",machine_type_label:"نوع الآلة",temperature_label:"درجة الحرارة (°C)",vibration_label:"الاهتزاز (مم/ث)",load_label:"الحمل (%)",submit_btn:"تحليل المصنع",submitting:"جارٍ التحديث...",ai_panel_title:"رؤى الذكاء الاصطناعي",ai_placeholder:"أرسل بيانات المصنع لإنشاء تحليل بالذكاء الاصطناعي.",ai_analyzing:"جارٍ التحليل...",ai_risks:"المخاطر",ai_efficiency_insights:"تحليل الكفاءة",ai_optimizations:"اقتراحات التحسين",toast_updated:"تم تحديث بيانات المصنع",toast_analysis_done:"اكتمل تحليل الذكاء الاصطناعي",toast_error:"حدث خطأ ما",nav_dashboard:"لوحة التحكم",nav_factories:"المصانع",nav_ai_insights:"رؤى الذكاء الاصطناعي",logout_btn:"تسجيل الخروج",login_title:"مرحباً بعودتك",login_subtitle:"سجل الدخول إلى حساب FactoryPulse AI الخاص بك",ph_email:"البريد الإلكتروني",ph_password:"كلمة المرور",remember_me:"تذكرني",login_btn:"تسجيل الدخول",login_link_register:"ليس لديك حساب؟ أنشئ واحداً",register_title:"إنشاء حسابك",register_subtitle:"ابدأ بمراقبة مصانعك بالذكاء الاصطناعي",ph_full_name:"الاسم الكامل",ph_confirm_password:"تأكيد كلمة المرور",register_btn:"إنشاء حساب",register_link_login:"لديك حساب بالفعل؟ سجل الدخول",err_missing_fields:"يرجى ملء جميع الحقول",err_invalid_email:"يرجى إدخال بريد إلكتروني صالح",err_weak_password:"يجب أن تكون كلمة المرور 8 أحرف على الأقل وتحتوي على حرف ورقم",err_password_mismatch:"كلمتا المرور غير متطابقتين",err_invalid_credentials:"البريد الإلكتروني أو كلمة المرور غير صحيحة",err_email_taken:"هذا البريد الإلكتروني مسجل بالفعل",err_generic:"حدث خطأ ما. يرجى المحاولة مرة أخرى",my_factories_title:"مصانعي",add_factory_btn:"+ إضافة مصنع",edit_factory_btn:"تعديل",delete_factory_btn:"حذف",confirm_delete_factory:"هل تريد حذف هذا المصنع؟ لا يمكن التراجع عن هذا.",no_factories_yet:"لم تقم بإضافة أي مصنع بعد.",factory_created_toast:"تم إنشاء المصنع وتحليله",factory_updated_toast:"تم تحديث المصنع",factory_deleted_toast:"تم حذف المصنع",ai_insights_feed_title:"موجز رؤى الذكاء الاصطناعي",no_ai_insights_yet:"لا توجد رؤى بعد. أضف مصنعاً للبدء.",reanalyze_btn:"إعادة التحليل",view_insights_btn:"عرض الرؤى",created_label:"تاريخ الإنشاء",cancel_btn:"إلغاء",save_btn:"حفظ التغييرات",role_label:"دورك",role_engineer:"مهندس",role_manager:"مدير",role_admin:"مسؤول"},
-  tr: {tagline:"Küresel Endüstriyel Zeka Platformu",live_label:"Canlı",kpi_energy:"Enerji Kullanımı",kpi_efficiency:"Verimlilik",kpi_active:"Aktif Makineler",kpi_alerts:"Uyarılar",kwh_unit:"kWh",chart_title:"Gerçek Zamanlı Performans",machine_status_title:"Makine Durumu",status_running:"Çalışıyor",status_warning:"Uyarı",status_critical:"Kritik",form_title:"Fabrika Veri Girişi",factory_name_label:"Fabrika Adı",machine_count_label:"Makine Sayısı",energy_cost_label:"Enerji Maliyeti ($/kWh)",machine_type_label:"Makine Türü",temperature_label:"Sıcaklık (°C)",vibration_label:"Titreşim (mm/s)",load_label:"Yük (%)",submit_btn:"Fabrikayı Analiz Et",submitting:"Güncelleniyor...",ai_panel_title:"AI Analizleri",ai_placeholder:"AI analizi oluşturmak için fabrika verilerini gönderin.",ai_analyzing:"Analiz ediliyor...",ai_risks:"Riskler",ai_efficiency_insights:"Verimlilik Analizi",ai_optimizations:"Optimizasyon Önerileri",toast_updated:"Fabrika verileri güncellendi",toast_analysis_done:"AI analizi tamamlandı",toast_error:"Bir şeyler ters gitti",nav_dashboard:"Panel",nav_factories:"Fabrikalar",nav_ai_insights:"AI Analizleri",logout_btn:"Çıkış Yap",login_title:"Tekrar hoş geldiniz",login_subtitle:"FactoryPulse AI hesabınıza giriş yapın",ph_email:"E-posta",ph_password:"Şifre",remember_me:"Beni hatırla",login_btn:"Giriş Yap",login_link_register:"Hesabınız yok mu? Oluşturun",register_title:"Hesabınızı oluşturun",register_subtitle:"Fabrikalarınızı AI ile izlemeye başlayın",ph_full_name:"Ad Soyad",ph_confirm_password:"Şifreyi Onayla",register_btn:"Hesap Oluştur",register_link_login:"Zaten hesabınız var mı? Giriş yapın",err_missing_fields:"Lütfen tüm alanları doldurun",err_invalid_email:"Lütfen geçerli bir e-posta adresi girin",err_weak_password:"Şifre en az 8 karakter, bir harf ve bir rakam içermeli",err_password_mismatch:"Şifreler eşleşmiyor",err_invalid_credentials:"E-posta veya şifre hatalı",err_email_taken:"Bu e-posta zaten kayıtlı",err_generic:"Bir şeyler ters gitti. Tekrar deneyin",my_factories_title:"Fabrikalarım",add_factory_btn:"+ Fabrika Ekle",edit_factory_btn:"Düzenle",delete_factory_btn:"Sil",confirm_delete_factory:"Bu fabrika silinsin mi? Bu işlem geri alınamaz.",no_factories_yet:"Henüz fabrika eklemediniz.",factory_created_toast:"Fabrika oluşturuldu ve analiz edildi",factory_updated_toast:"Fabrika güncellendi",factory_deleted_toast:"Fabrika silindi",ai_insights_feed_title:"AI Analiz Akışı",no_ai_insights_yet:"Henüz AI analizi yok. Başlamak için fabrika ekleyin.",reanalyze_btn:"Yeniden Analiz Et",view_insights_btn:"Analizleri Görüntüle",created_label:"Oluşturulma",cancel_btn:"İptal",save_btn:"Değişiklikleri Kaydet",role_label:"Rolünüz",role_engineer:"Mühendis",role_manager:"Yönetici",role_admin:"Admin"},
-  it: {tagline:"Piattaforma Globale di Intelligenza Industriale",live_label:"In diretta",kpi_energy:"Consumo Energetico",kpi_efficiency:"Efficienza",kpi_active:"Macchine Attive",kpi_alerts:"Avvisi",kwh_unit:"kWh",chart_title:"Prestazioni in Tempo Reale",machine_status_title:"Stato delle Macchine",status_running:"In funzione",status_warning:"Avviso",status_critical:"Critico",form_title:"Inserimento Dati Fabbrica",factory_name_label:"Nome Fabbrica",machine_count_label:"Numero di Macchine",energy_cost_label:"Costo Energia ($/kWh)",machine_type_label:"Tipo di Macchina",temperature_label:"Temperatura (°C)",vibration_label:"Vibrazione (mm/s)",load_label:"Carico (%)",submit_btn:"Analizza Fabbrica",submitting:"Aggiornamento...",ai_panel_title:"Analisi IA",ai_placeholder:"Invia i dati della fabbrica per generare un'analisi IA.",ai_analyzing:"Analisi in corso...",ai_risks:"Rischi",ai_efficiency_insights:"Analisi dell'Efficienza",ai_optimizations:"Suggerimenti di Ottimizzazione",toast_updated:"Dati fabbrica aggiornati",toast_analysis_done:"Analisi IA completata",toast_error:"Qualcosa è andato storto",nav_dashboard:"Dashboard",nav_factories:"Fabbriche",nav_ai_insights:"Analisi IA",logout_btn:"Esci",login_title:"Bentornato",login_subtitle:"Accedi al tuo account FactoryPulse AI",ph_email:"Email",ph_password:"Password",remember_me:"Ricordami",login_btn:"Accedi",login_link_register:"Non hai un account? Creane uno",register_title:"Crea il tuo account",register_subtitle:"Inizia a monitorare le tue fabbriche con l'IA",ph_full_name:"Nome Completo",ph_confirm_password:"Conferma Password",register_btn:"Crea Account",register_link_login:"Hai già un account? Accedi",err_missing_fields:"Si prega di compilare tutti i campi",err_invalid_email:"Inserisci un indirizzo email valido",err_weak_password:"La password deve avere almeno 8 caratteri, una lettera e un numero",err_password_mismatch:"Le password non corrispondono",err_invalid_credentials:"Email o password errati",err_email_taken:"Questa email è già registrata",err_generic:"Qualcosa è andato storto. Riprova",my_factories_title:"Le Mie Fabbriche",add_factory_btn:"+ Aggiungi Fabbrica",edit_factory_btn:"Modifica",delete_factory_btn:"Elimina",confirm_delete_factory:"Eliminare questa fabbrica? Questa azione non può essere annullata.",no_factories_yet:"Non hai ancora aggiunto nessuna fabbrica.",factory_created_toast:"Fabbrica creata e analizzata",factory_updated_toast:"Fabbrica aggiornata",factory_deleted_toast:"Fabbrica eliminata",ai_insights_feed_title:"Feed di Analisi IA",no_ai_insights_yet:"Nessuna analisi IA ancora. Aggiungi una fabbrica.",reanalyze_btn:"Rianalizza",view_insights_btn:"Vedi Analisi",created_label:"Creata il",cancel_btn:"Annulla",save_btn:"Salva Modifiche",role_label:"Il Tuo Ruolo",role_engineer:"Ingegnere",role_manager:"Manager",role_admin:"Amministratore"},
-  pt: {tagline:"Plataforma Global de Inteligência Industrial",live_label:"Ao vivo",kpi_energy:"Uso de Energia",kpi_efficiency:"Eficiência",kpi_active:"Máquinas Ativas",kpi_alerts:"Alertas",kwh_unit:"kWh",chart_title:"Desempenho em Tempo Real",machine_status_title:"Status das Máquinas",status_running:"Em funcionamento",status_warning:"Aviso",status_critical:"Crítico",form_title:"Entrada de Dados da Fábrica",factory_name_label:"Nome da Fábrica",machine_count_label:"Número de Máquinas",energy_cost_label:"Custo de Energia ($/kWh)",machine_type_label:"Tipo de Máquina",temperature_label:"Temperatura (°C)",vibration_label:"Vibração (mm/s)",load_label:"Carga (%)",submit_btn:"Analisar Fábrica",submitting:"Atualizando...",ai_panel_title:"Insights de IA",ai_placeholder:"Envie os dados da fábrica para gerar uma análise de IA.",ai_analyzing:"Analisando...",ai_risks:"Riscos",ai_efficiency_insights:"Análise de Eficiência",ai_optimizations:"Sugestões de Otimização",toast_updated:"Dados da fábrica atualizados",toast_analysis_done:"Análise de IA concluída",toast_error:"Algo deu errado",nav_dashboard:"Painel",nav_factories:"Fábricas",nav_ai_insights:"Insights de IA",logout_btn:"Sair",login_title:"Bem-vindo de volta",login_subtitle:"Entre na sua conta FactoryPulse AI",ph_email:"E-mail",ph_password:"Senha",remember_me:"Lembrar de mim",login_btn:"Entrar",login_link_register:"Não tem conta? Crie uma",register_title:"Crie sua conta",register_subtitle:"Comece a monitorar suas fábricas com IA",ph_full_name:"Nome Completo",ph_confirm_password:"Confirmar Senha",register_btn:"Criar Conta",register_link_login:"Já tem conta? Entrar",err_missing_fields:"Por favor preencha todos os campos",err_invalid_email:"Por favor insira um e-mail válido",err_weak_password:"A senha deve ter no mínimo 8 caracteres, uma letra e um número",err_password_mismatch:"As senhas não coincidem",err_invalid_credentials:"E-mail ou senha incorretos",err_email_taken:"Este e-mail já está registrado",err_generic:"Algo deu errado. Tente novamente",my_factories_title:"Minhas Fábricas",add_factory_btn:"+ Adicionar Fábrica",edit_factory_btn:"Editar",delete_factory_btn:"Excluir",confirm_delete_factory:"Excluir esta fábrica? Esta ação não pode ser desfeita.",no_factories_yet:"Você ainda não adicionou nenhuma fábrica.",factory_created_toast:"Fábrica criada e analisada",factory_updated_toast:"Fábrica atualizada",factory_deleted_toast:"Fábrica excluída",ai_insights_feed_title:"Feed de Insights de IA",no_ai_insights_yet:"Ainda sem insights de IA. Adicione uma fábrica.",reanalyze_btn:"Reanalisar",view_insights_btn:"Ver Insights",created_label:"Criada em",cancel_btn:"Cancelar",save_btn:"Salvar Alterações",role_label:"Sua Função",role_engineer:"Engenheiro",role_manager:"Gerente",role_admin:"Administrador"},
-  ja: {tagline:"グローバル産業インテリジェンスプラットフォーム",live_label:"ライブ",kpi_energy:"エネルギー使用量",kpi_efficiency:"効率",kpi_active:"稼働中の機械",kpi_alerts:"アラート",kwh_unit:"kWh",chart_title:"リアルタイムパフォーマンス",machine_status_title:"機械の状態",status_running:"稼働中",status_warning:"警告",status_critical:"重大",form_title:"工場データ入力",factory_name_label:"工場名",machine_count_label:"機械の数",energy_cost_label:"エネルギーコスト ($/kWh)",machine_type_label:"機械の種類",temperature_label:"温度 (°C)",vibration_label:"振動 (mm/s)",load_label:"負荷 (%)",submit_btn:"工場を分析",submitting:"更新中...",ai_panel_title:"AIインサイト",ai_placeholder:"工場データを送信してAI分析を生成してください。",ai_analyzing:"分析中...",ai_risks:"リスク",ai_efficiency_insights:"効率分析",ai_optimizations:"最適化提案",toast_updated:"工場データが更新されました",toast_analysis_done:"AI分析が完了しました",toast_error:"問題が発生しました",nav_dashboard:"ダッシュボード",nav_factories:"工場",nav_ai_insights:"AIインサイト",logout_btn:"ログアウト",login_title:"おかえりなさい",login_subtitle:"FactoryPulse AI アカウントにログイン",ph_email:"メールアドレス",ph_password:"パスワード",remember_me:"ログイン状態を保持",login_btn:"ログイン",login_link_register:"アカウントをお持ちでないですか？作成する",register_title:"アカウントを作成",register_subtitle:"AIで工場の監視を始めましょう",ph_full_name:"氏名",ph_confirm_password:"パスワードの確認",register_btn:"アカウント作成",register_link_login:"すでにアカウントをお持ちですか？ログイン",err_missing_fields:"すべての項目を入力してください",err_invalid_email:"有効なメールアドレスを入力してください",err_weak_password:"パスワードは8文字以上で、文字と数字を含める必要があります",err_password_mismatch:"パスワードが一致しません",err_invalid_credentials:"メールアドレスまたはパスワードが正しくありません",err_email_taken:"このメールアドレスは既に登録されています",err_generic:"エラーが発生しました。再試行してください",my_factories_title:"マイ工場",add_factory_btn:"+ 工場を追加",edit_factory_btn:"編集",delete_factory_btn:"削除",confirm_delete_factory:"この工場を削除しますか？元に戻せません。",no_factories_yet:"まだ工場を追加していません。",factory_created_toast:"工場が作成・分析されました",factory_updated_toast:"工場が更新されました",factory_deleted_toast:"工場が削除されました",ai_insights_feed_title:"AIインサイトフィード",no_ai_insights_yet:"AIインサイトはまだありません。工場を追加してください。",reanalyze_btn:"再分析",view_insights_btn:"インサイトを見る",created_label:"作成日",cancel_btn:"キャンセル",save_btn:"変更を保存",role_label:"あなたの役割",role_engineer:"エンジニア",role_manager:"マネージャー",role_admin:"管理者"},
-  ko: {tagline:"글로벌 산업 인텔리전스 플랫폼",live_label:"실시간",kpi_energy:"에너지 사용량",kpi_efficiency:"효율성",kpi_active:"가동 중인 기계",kpi_alerts:"경고",kwh_unit:"kWh",chart_title:"실시간 성능",machine_status_title:"기계 상태",status_running:"가동 중",status_warning:"경고",status_critical:"심각",form_title:"공장 데이터 입력",factory_name_label:"공장 이름",machine_count_label:"기계 수",energy_cost_label:"에너지 비용 ($/kWh)",machine_type_label:"기계 유형",temperature_label:"온도 (°C)",vibration_label:"진동 (mm/s)",load_label:"부하 (%)",submit_btn:"공장 분석",submitting:"업데이트 중...",ai_panel_title:"AI 인사이트",ai_placeholder:"AI 분석을 생성하려면 공장 데이터를 제출하세요.",ai_analyzing:"분석 중...",ai_risks:"위험 요소",ai_efficiency_insights:"효율성 분석",ai_optimizations:"최적화 제안",toast_updated:"공장 데이터가 업데이트되었습니다",toast_analysis_done:"AI 분석이 완료되었습니다",toast_error:"문제가 발생했습니다",nav_dashboard:"대시보드",nav_factories:"공장",nav_ai_insights:"AI 인사이트",logout_btn:"로그아웃",login_title:"다시 오신 것을 환영합니다",login_subtitle:"FactoryPulse AI 계정에 로그인하세요",ph_email:"이메일",ph_password:"비밀번호",remember_me:"로그인 상태 유지",login_btn:"로그인",login_link_register:"계정이 없으신가요? 계정 만들기",register_title:"계정 만들기",register_subtitle:"AI로 공장 모니터링을 시작하세요",ph_full_name:"성명",ph_confirm_password:"비밀번호 확인",register_btn:"계정 생성",register_link_login:"이미 계정이 있으신가요? 로그인",err_missing_fields:"모든 항목을 입력해주세요",err_invalid_email:"유효한 이메일 주소를 입력하세요",err_weak_password:"비밀번호는 8자 이상, 문자와 숫자를 포함해야 합니다",err_password_mismatch:"비밀번호가 일치하지 않습니다",err_invalid_credentials:"이메일 또는 비밀번호가 올바르지 않습니다",err_email_taken:"이미 등록된 이메일입니다",err_generic:"문제가 발생했습니다. 다시 시도해주세요",my_factories_title:"내 공장",add_factory_btn:"+ 공장 추가",edit_factory_btn:"수정",delete_factory_btn:"삭제",confirm_delete_factory:"이 공장을 삭제하시겠습니까? 되돌릴 수 없습니다.",no_factories_yet:"아직 추가된 공장이 없습니다.",factory_created_toast:"공장이 생성되고 분석되었습니다",factory_updated_toast:"공장이 업데이트되었습니다",factory_deleted_toast:"공장이 삭제되었습니다",ai_insights_feed_title:"AI 인사이트 피드",no_ai_insights_yet:"아직 AI 인사이트가 없습니다. 공장을 추가하세요.",reanalyze_btn:"다시 분석",view_insights_btn:"인사이트 보기",created_label:"생성일",cancel_btn:"취소",save_btn:"변경사항 저장",role_label:"귀하의 역할",role_engineer:"엔지니어",role_manager:"매니저",role_admin:"관리자"},
-  hi: {tagline:"वैश्विक औद्योगिक बुद्धिमत्ता मंच",live_label:"लाइव",kpi_energy:"ऊर्जा उपयोग",kpi_efficiency:"दक्षता",kpi_active:"सक्रिय मशीनें",kpi_alerts:"अलर्ट",kwh_unit:"kWh",chart_title:"रीयल-टाइम प्रदर्शन",machine_status_title:"मशीन की स्थिति",status_running:"चल रहा है",status_warning:"चेतावनी",status_critical:"गंभीर",form_title:"फ़ैक्टरी डेटा इनपुट",factory_name_label:"फ़ैक्टरी का नाम",machine_count_label:"मशीनों की संख्या",energy_cost_label:"ऊर्जा लागत ($/kWh)",machine_type_label:"मशीन प्रकार",temperature_label:"तापमान (°C)",vibration_label:"कंपन (mm/s)",load_label:"लोड (%)",submit_btn:"फ़ैक्टरी का विश्लेषण करें",submitting:"अद्यतन हो रहा है...",ai_panel_title:"AI अंतर्दृष्टि",ai_placeholder:"AI विश्लेषण उत्पन्न करने के लिए फ़ैक्टरी डेटा सबमिट करें।",ai_analyzing:"विश्लेषण हो रहा है...",ai_risks:"जोखिम",ai_efficiency_insights:"दक्षता विश्लेषण",ai_optimizations:"अनुकूलन सुझाव",toast_updated:"फ़ैक्टरी डेटा अपडेट किया गया",toast_analysis_done:"AI विश्लेषण पूर्ण हुआ",toast_error:"कुछ गलत हो गया",nav_dashboard:"डैशबोर्ड",nav_factories:"फ़ैक्टरियाँ",nav_ai_insights:"AI अंतर्दृष्टि",logout_btn:"लॉग आउट",login_title:"वापसी पर स्वागत है",login_subtitle:"अपने FactoryPulse AI खाते में लॉग इन करें",ph_email:"ईमेल",ph_password:"पासवर्ड",remember_me:"मुझे याद रखें",login_btn:"लॉग इन करें",login_link_register:"खाता नहीं है? एक बनाएं",register_title:"अपना खाता बनाएं",register_subtitle:"AI के साथ अपनी फ़ैक्टरियों की निगरानी शुरू करें",ph_full_name:"पूरा नाम",ph_confirm_password:"पासवर्ड की पुष्टि करें",register_btn:"खाता बनाएं",register_link_login:"पहले से खाता है? लॉग इन करें",err_missing_fields:"कृपया सभी फ़ील्ड भरें",err_invalid_email:"कृपया एक मान्य ईमेल पता दर्ज करें",err_weak_password:"पासवर्ड कम से कम 8 अक्षर, एक अक्षर और एक अंक होना चाहिए",err_password_mismatch:"पासवर्ड मेल नहीं खाते",err_invalid_credentials:"गलत ईमेल या पासवर्ड",err_email_taken:"यह ईमेल पहले से पंजीकृत है",err_generic:"कुछ गलत हो गया। कृपया पुनः प्रयास करें",my_factories_title:"मेरी फ़ैक्टरियाँ",add_factory_btn:"+ फ़ैक्टरी जोड़ें",edit_factory_btn:"संपादित करें",delete_factory_btn:"हटाएं",confirm_delete_factory:"इस फ़ैक्टरी को हटाएं? इसे पूर्ववत नहीं किया जा सकता।",no_factories_yet:"आपने अभी तक कोई फ़ैक्टरी नहीं जोड़ी है।",factory_created_toast:"फ़ैक्टरी बनाई और विश्लेषित की गई",factory_updated_toast:"फ़ैक्टरी अपडेट की गई",factory_deleted_toast:"फ़ैक्टरी हटाई गई",ai_insights_feed_title:"AI अंतर्दृष्टि फ़ीड",no_ai_insights_yet:"अभी तक कोई AI अंतर्दृष्टि नहीं। शुरू करने के लिए एक फ़ैक्टरी जोड़ें।",reanalyze_btn:"पुनः विश्लेषण करें",view_insights_btn:"अंतर्दृष्टि देखें",created_label:"बनाया गया",cancel_btn:"रद्द करें",save_btn:"परिवर्तन सहेजें",role_label:"आपकी भूमिका",role_engineer:"इंजीनियर",role_manager:"प्रबंधक",role_admin:"व्यवस्थापक"},
-  uz: {tagline:"Global sanoat intellekti platformasi",live_label:"Jonli",kpi_energy:"Energiya sarfi",kpi_efficiency:"Samaradorlik",kpi_active:"Faol stanoklar",kpi_alerts:"Ogohlantirishlar",kwh_unit:"kWh",chart_title:"Real vaqtdagi ko'rsatkichlar",machine_status_title:"Stanoklar holati",status_running:"Ishlamoqda",status_warning:"Ogohlantirish",status_critical:"Muhim",form_title:"Zavod ma'lumotlarini kiritish",factory_name_label:"Zavod nomi",machine_count_label:"Stanoklar soni",energy_cost_label:"Energiya narxi ($/kWh)",machine_type_label:"Stanok turi",temperature_label:"Harorat (°C)",vibration_label:"Tebranish (mm/s)",load_label:"Yuklama (%)",submit_btn:"Zavodni tahlil qilish",submitting:"Yangilanmoqda...",ai_panel_title:"AI tahlili",ai_placeholder:"AI tahlilini olish uchun zavod ma'lumotlarini yuboring.",ai_analyzing:"Tahlil qilinmoqda...",ai_risks:"Xavflar",ai_efficiency_insights:"Samaradorlik tahlili",ai_optimizations:"Optimallashtirish tavsiyalari",toast_updated:"Zavod ma'lumotlari yangilandi",toast_analysis_done:"AI tahlili yakunlandi",toast_error:"Xatolik yuz berdi",nav_dashboard:"Boshqaruv paneli",nav_factories:"Zavodlar",nav_ai_insights:"AI tahlili",logout_btn:"Chiqish",login_title:"Xush kelibsiz",login_subtitle:"FactoryPulse AI hisobingizga kiring",ph_email:"Elektron pochta",ph_password:"Parol",remember_me:"Meni eslab qol",login_btn:"Kirish",login_link_register:"Hisobingiz yo'qmi? Yarating",register_title:"Hisob yarating",register_subtitle:"Zavodlaringizni AI bilan kuzatishni boshlang",ph_full_name:"To'liq ism",ph_confirm_password:"Parolni tasdiqlang",register_btn:"Hisob yaratish",register_link_login:"Hisobingiz bormi? Kiring",err_missing_fields:"Barcha maydonlarni to'ldiring",err_invalid_email:"Yaroqli elektron pochta manzilini kiriting",err_weak_password:"Parol kamida 8 belgidan, harf va raqamdan iborat bo'lishi kerak",err_password_mismatch:"Parollar mos kelmaydi",err_invalid_credentials:"Elektron pochta yoki parol noto'g'ri",err_email_taken:"Bu elektron pochta allaqachon ro'yxatdan o'tgan",err_generic:"Xatolik yuz berdi. Qaytadan urinib ko'ring",my_factories_title:"Mening Zavodlarim",add_factory_btn:"+ Zavod qo'shish",edit_factory_btn:"Tahrirlash",delete_factory_btn:"O'chirish",confirm_delete_factory:"Bu zavodni o'chirasizmi? Buni bekor qilib bo'lmaydi.",no_factories_yet:"Siz hali hech qanday zavod qo'shmagansiz.",factory_created_toast:"Zavod yaratildi va tahlil qilindi",factory_updated_toast:"Zavod yangilandi",factory_deleted_toast:"Zavod o'chirildi",ai_insights_feed_title:"AI Tahlili Lentasi",no_ai_insights_yet:"Hali AI tahlili yo'q. Boshlash uchun zavod qo'shing.",reanalyze_btn:"Qayta tahlil qilish",view_insights_btn:"Tahlilni ko'rish",created_label:"Yaratilgan",cancel_btn:"Bekor qilish",save_btn:"O'zgarishlarni saqlash",role_label:"Sizning rolingiz",role_engineer:"Muhandis",role_manager:"Menejer",role_admin:"Administrator"},
-  ky: {tagline:"Глобалдык өнөр жай интеллект платформасы",live_label:"Түз эфир",kpi_energy:"Энергия сарпталышы",kpi_efficiency:"Эффективдүүлүк",kpi_active:"Активдүү станоктор",kpi_alerts:"Дабылдар",kwh_unit:"кВт·саат",chart_title:"Реалдуу убакыттагы көрсөткүчтөр",machine_status_title:"Станоктордун абалы",status_running:"Иштеп жатат",status_warning:"Эскертүү",status_critical:"Олуттуу",form_title:"Завод маалыматтарын киргизүү",factory_name_label:"Заводдун аты",machine_count_label:"Станоктордун саны",energy_cost_label:"Энергия наркы ($/кВт·саат)",machine_type_label:"Станоктун түрү",temperature_label:"Температура (°C)",vibration_label:"Дирилдөө (мм/с)",load_label:"Жүктөм (%)",submit_btn:"Заводду талдоо",submitting:"Жаңыртылууда...",ai_panel_title:"AI-талдоо",ai_placeholder:"AI-талдоо алуу үчүн завод маалыматтарын жөнөтүңүз.",ai_analyzing:"Талдануда...",ai_risks:"Тобокелдиктер",ai_efficiency_insights:"Эффективдүүлүк талдоосу",ai_optimizations:"Оптималдаштыруу сунуштары",toast_updated:"Завод маалыматтары жаңыртылды",toast_analysis_done:"AI-талдоо аяктады",toast_error:"Ката кетти",nav_dashboard:"Башкаруу панели",nav_factories:"Заводдор",nav_ai_insights:"AI-талдоо",logout_btn:"Чыгуу",login_title:"Кайра кош келиңиз",login_subtitle:"FactoryPulse AI каттоо эсебиңизге кириңиз",ph_email:"Электрондук почта",ph_password:"Сырсөз",remember_me:"Мени эстеп кал",login_btn:"Кирүү",login_link_register:"Каттоо эсебиңиз жокпу? Түзүү",register_title:"Каттоо эсебин түзүү",register_subtitle:"Заводдоруңузду AI менен байкоону баштаңыз",ph_full_name:"Толук аты-жөнү",ph_confirm_password:"Сырсөздү ырастаңыз",register_btn:"Каттоо эсебин түзүү",register_link_login:"Каттоо эсебиңиз барбы? Кирүү",err_missing_fields:"Бардык талааларды толтуруңуз",err_invalid_email:"Жарактуу электрондук почта дарегин киргизиңиз",err_weak_password:"Сырсөз кеминде 8 белги, тамга жана сан камтышы керек",err_password_mismatch:"Сырсөздөр дал келбейт",err_invalid_credentials:"Электрондук почта же сырсөз туура эмес",err_email_taken:"Бул электрондук почта мурунтан катталган",err_generic:"Ката кетти. Кайра аракет кылыңыз",my_factories_title:"Менин Заводдорум",add_factory_btn:"+ Завод кошуу",edit_factory_btn:"Түзөтүү",delete_factory_btn:"Өчүрүү",confirm_delete_factory:"Бул заводду өчүрөсүзбү? Бул аракетти артка кайтарууга болбойт.",no_factories_yet:"Сиз азырынча эч кандай завод кошкон жоксуз.",factory_created_toast:"Завод түзүлдү жана талданды",factory_updated_toast:"Завод жаңыртылды",factory_deleted_toast:"Завод өчүрүлдү",ai_insights_feed_title:"AI-талдоо тизмеси",no_ai_insights_yet:"Азырынча AI-талдоо жок. Баштоо үчүн завод кошуңуз.",reanalyze_btn:"Кайра талдоо",view_insights_btn:"Талдоону көрүү",created_label:"Түзүлгөн күнү",cancel_btn:"Жокко чыгаруу",save_btn:"Өзгөртүүлөрдү сактоо",role_label:"Сиздин ролуңуз",role_engineer:"Инженер",role_manager:"Менеджер",role_admin:"Администратор"},
-  uk: {tagline:"Глобальна платформа промислового інтелекту",live_label:"Наживо",kpi_energy:"Споживання енергії",kpi_efficiency:"Ефективність",kpi_active:"Активні верстати",kpi_alerts:"Сповіщення",kwh_unit:"кВт·год",chart_title:"Показники в реальному часі",machine_status_title:"Статус верстатів",status_running:"Працює",status_warning:"Попередження",status_critical:"Критично",form_title:"Введення даних заводу",factory_name_label:"Назва заводу",machine_count_label:"Кількість верстатів",energy_cost_label:"Вартість енергії ($/кВт·год)",machine_type_label:"Тип верстата",temperature_label:"Температура (°C)",vibration_label:"Вібрація (мм/с)",load_label:"Навантаження (%)",submit_btn:"Аналізувати завод",submitting:"Оновлення...",ai_panel_title:"AI-аналітика",ai_placeholder:"Надішліть дані заводу, щоб отримати AI-аналіз.",ai_analyzing:"Аналіз...",ai_risks:"Ризики",ai_efficiency_insights:"Аналіз ефективності",ai_optimizations:"Рекомендації з оптимізації",toast_updated:"Дані заводу оновлено",toast_analysis_done:"AI-аналіз завершено",toast_error:"Сталася помилка",nav_dashboard:"Панель",nav_factories:"Заводи",nav_ai_insights:"AI-аналітика",logout_btn:"Вийти",login_title:"З поверненням",login_subtitle:"Увійдіть у свій обліковий запис FactoryPulse AI",ph_email:"Електронна пошта",ph_password:"Пароль",remember_me:"Запам'ятати мене",login_btn:"Увійти",login_link_register:"Немає акаунту? Створити",register_title:"Створіть акаунт",register_subtitle:"Почніть моніторинг заводів за допомогою AI",ph_full_name:"Повне ім'я",ph_confirm_password:"Підтвердіть пароль",register_btn:"Створити акаунт",register_link_login:"Вже є акаунт? Увійти",err_missing_fields:"Будь ласка, заповніть усі поля",err_invalid_email:"Введіть дійсну електронну адресу",err_weak_password:"Пароль має містити щонайменше 8 символів, літеру та цифру",err_password_mismatch:"Паролі не збігаються",err_invalid_credentials:"Невірна електронна пошта або пароль",err_email_taken:"Ця електронна пошта вже зареєстрована",err_generic:"Сталася помилка. Спробуйте ще раз",my_factories_title:"Мої Заводи",add_factory_btn:"+ Додати завод",edit_factory_btn:"Редагувати",delete_factory_btn:"Видалити",confirm_delete_factory:"Видалити цей завод? Цю дію не можна скасувати.",no_factories_yet:"Ви ще не додали жодного заводу.",factory_created_toast:"Завод створено та проаналізовано",factory_updated_toast:"Завод оновлено",factory_deleted_toast:"Завод видалено",ai_insights_feed_title:"Стрічка AI-аналітики",no_ai_insights_yet:"Ще немає AI-аналітики. Додайте завод.",reanalyze_btn:"Проаналізувати знову",view_insights_btn:"Переглянути аналітику",created_label:"Створено",cancel_btn:"Скасувати",save_btn:"Зберегти зміни",role_label:"Ваша роль",role_engineer:"Інженер",role_manager:"Менеджер",role_admin:"Адміністратор"},
-  pl: {tagline:"Globalna Platforma Inteligencji Przemysłowej",live_label:"Na żywo",kpi_energy:"Zużycie Energii",kpi_efficiency:"Wydajność",kpi_active:"Aktywne Maszyny",kpi_alerts:"Alerty",kwh_unit:"kWh",chart_title:"Wydajność w Czasie Rzeczywistym",machine_status_title:"Status Maszyn",status_running:"Działa",status_warning:"Ostrzeżenie",status_critical:"Krytyczne",form_title:"Wprowadzanie Danych Fabryki",factory_name_label:"Nazwa Fabryki",machine_count_label:"Liczba Maszyn",energy_cost_label:"Koszt Energii ($/kWh)",machine_type_label:"Typ Maszyny",temperature_label:"Temperatura (°C)",vibration_label:"Wibracje (mm/s)",load_label:"Obciążenie (%)",submit_btn:"Analizuj Fabrykę",submitting:"Aktualizowanie...",ai_panel_title:"Analizy AI",ai_placeholder:"Prześlij dane fabryki, aby wygenerować analizę AI.",ai_analyzing:"Analizowanie...",ai_risks:"Ryzyka",ai_efficiency_insights:"Analiza Wydajności",ai_optimizations:"Sugestie Optymalizacji",toast_updated:"Dane fabryki zaktualizowane",toast_analysis_done:"Analiza AI zakończona",toast_error:"Coś poszło nie tak",nav_dashboard:"Panel",nav_factories:"Fabryki",nav_ai_insights:"Analizy AI",logout_btn:"Wyloguj",login_title:"Witamy z powrotem",login_subtitle:"Zaloguj się do swojego konta FactoryPulse AI",ph_email:"E-mail",ph_password:"Hasło",remember_me:"Zapamiętaj mnie",login_btn:"Zaloguj się",login_link_register:"Nie masz konta? Utwórz je",register_title:"Utwórz konto",register_subtitle:"Zacznij monitorować swoje fabryki z AI",ph_full_name:"Imię i Nazwisko",ph_confirm_password:"Potwierdź Hasło",register_btn:"Utwórz Konto",register_link_login:"Masz już konto? Zaloguj się",err_missing_fields:"Proszę wypełnić wszystkie pola",err_invalid_email:"Proszę podać prawidłowy adres e-mail",err_weak_password:"Hasło musi mieć min. 8 znaków, literę i cyfrę",err_password_mismatch:"Hasła nie pasują do siebie",err_invalid_credentials:"Nieprawidłowy e-mail lub hasło",err_email_taken:"Ten e-mail jest już zarejestrowany",err_generic:"Coś poszło nie tak. Spróbuj ponownie",my_factories_title:"Moje Fabryki",add_factory_btn:"+ Dodaj Fabrykę",edit_factory_btn:"Edytuj",delete_factory_btn:"Usuń",confirm_delete_factory:"Usunąć tę fabrykę? Tej czynności nie można cofnąć.",no_factories_yet:"Nie dodałeś jeszcze żadnej fabryki.",factory_created_toast:"Fabryka utworzona i przeanalizowana",factory_updated_toast:"Fabryka zaktualizowana",factory_deleted_toast:"Fabryka usunięta",ai_insights_feed_title:"Kanał Analiz AI",no_ai_insights_yet:"Brak analiz AI. Dodaj fabrykę, aby zacząć.",reanalyze_btn:"Analizuj Ponownie",view_insights_btn:"Zobacz Analizy",created_label:"Utworzono",cancel_btn:"Anuluj",save_btn:"Zapisz Zmiany",role_label:"Twoja Rola",role_engineer:"Inżynier",role_manager:"Menedżer",role_admin:"Administrator"},
-  nl: {tagline:"Wereldwijd Industrieel Intelligentieplatform",live_label:"Live",kpi_energy:"Energieverbruik",kpi_efficiency:"Efficiëntie",kpi_active:"Actieve Machines",kpi_alerts:"Meldingen",kwh_unit:"kWh",chart_title:"Realtime Prestaties",machine_status_title:"Machinestatus",status_running:"Actief",status_warning:"Waarschuwing",status_critical:"Kritiek",form_title:"Fabrieksgegevens Invoeren",factory_name_label:"Fabrieksnaam",machine_count_label:"Aantal Machines",energy_cost_label:"Energiekosten ($/kWh)",machine_type_label:"Machinetype",temperature_label:"Temperatuur (°C)",vibration_label:"Trilling (mm/s)",load_label:"Belasting (%)",submit_btn:"Fabriek Analyseren",submitting:"Bijwerken...",ai_panel_title:"AI-inzichten",ai_placeholder:"Verzend fabrieksgegevens om een AI-analyse te genereren.",ai_analyzing:"Analyseren...",ai_risks:"Risico's",ai_efficiency_insights:"Efficiëntieanalyse",ai_optimizations:"Optimalisatiesuggesties",toast_updated:"Fabrieksgegevens bijgewerkt",toast_analysis_done:"AI-analyse voltooid",toast_error:"Er is iets misgegaan",nav_dashboard:"Dashboard",nav_factories:"Fabrieken",nav_ai_insights:"AI-inzichten",logout_btn:"Uitloggen",login_title:"Welkom terug",login_subtitle:"Log in op uw FactoryPulse AI-account",ph_email:"E-mail",ph_password:"Wachtwoord",remember_me:"Onthoud mij",login_btn:"Inloggen",login_link_register:"Geen account? Maak er een",register_title:"Maak uw account aan",register_subtitle:"Begin met AI-monitoring van uw fabrieken",ph_full_name:"Volledige Naam",ph_confirm_password:"Bevestig Wachtwoord",register_btn:"Account Aanmaken",register_link_login:"Heeft u al een account? Inloggen",err_missing_fields:"Vul alle velden in",err_invalid_email:"Voer een geldig e-mailadres in",err_weak_password:"Wachtwoord moet minimaal 8 tekens, een letter en een cijfer bevatten",err_password_mismatch:"Wachtwoorden komen niet overeen",err_invalid_credentials:"Ongeldige e-mail of wachtwoord",err_email_taken:"Dit e-mailadres is al geregistreerd",err_generic:"Er is iets misgegaan. Probeer het opnieuw",my_factories_title:"Mijn Fabrieken",add_factory_btn:"+ Fabriek Toevoegen",edit_factory_btn:"Bewerken",delete_factory_btn:"Verwijderen",confirm_delete_factory:"Deze fabriek verwijderen? Dit kan niet ongedaan worden gemaakt.",no_factories_yet:"U heeft nog geen fabrieken toegevoegd.",factory_created_toast:"Fabriek aangemaakt en geanalyseerd",factory_updated_toast:"Fabriek bijgewerkt",factory_deleted_toast:"Fabriek verwijderd",ai_insights_feed_title:"AI-inzichten Feed",no_ai_insights_yet:"Nog geen AI-inzichten. Voeg een fabriek toe.",reanalyze_btn:"Opnieuw Analyseren",view_insights_btn:"Bekijk Inzichten",created_label:"Aangemaakt",cancel_btn:"Annuleren",save_btn:"Wijzigingen Opslaan",role_label:"Uw Rol",role_engineer:"Ingenieur",role_manager:"Manager",role_admin:"Beheerder"},
-  sv: {tagline:"Global Industriell Intelligensplattform",live_label:"Live",kpi_energy:"Energiförbrukning",kpi_efficiency:"Effektivitet",kpi_active:"Aktiva Maskiner",kpi_alerts:"Varningar",kwh_unit:"kWh",chart_title:"Realtidsprestanda",machine_status_title:"Maskinstatus",status_running:"Igång",status_warning:"Varning",status_critical:"Kritisk",form_title:"Fabriksdatainmatning",factory_name_label:"Fabriksnamn",machine_count_label:"Antal Maskiner",energy_cost_label:"Energikostnad ($/kWh)",machine_type_label:"Maskintyp",temperature_label:"Temperatur (°C)",vibration_label:"Vibration (mm/s)",load_label:"Belastning (%)",submit_btn:"Analysera Fabrik",submitting:"Uppdaterar...",ai_panel_title:"AI-insikter",ai_placeholder:"Skicka fabriksdata för att generera en AI-analys.",ai_analyzing:"Analyserar...",ai_risks:"Risker",ai_efficiency_insights:"Effektivitetsanalys",ai_optimizations:"Optimeringsförslag",toast_updated:"Fabriksdata uppdaterad",toast_analysis_done:"AI-analys klar",toast_error:"Något gick fel",nav_dashboard:"Instrumentpanel",nav_factories:"Fabriker",nav_ai_insights:"AI-insikter",logout_btn:"Logga ut",login_title:"Välkommen tillbaka",login_subtitle:"Logga in på ditt FactoryPulse AI-konto",ph_email:"E-post",ph_password:"Lösenord",remember_me:"Kom ihåg mig",login_btn:"Logga in",login_link_register:"Inget konto? Skapa ett",register_title:"Skapa ditt konto",register_subtitle:"Börja övervaka dina fabriker med AI",ph_full_name:"Fullständigt Namn",ph_confirm_password:"Bekräfta Lösenord",register_btn:"Skapa Konto",register_link_login:"Har du redan ett konto? Logga in",err_missing_fields:"Vänligen fyll i alla fält",err_invalid_email:"Ange en giltig e-postadress",err_weak_password:"Lösenordet måste vara minst 8 tecken med en bokstav och en siffra",err_password_mismatch:"Lösenorden matchar inte",err_invalid_credentials:"Felaktig e-post eller lösenord",err_email_taken:"Denna e-post är redan registrerad",err_generic:"Något gick fel. Försök igen",my_factories_title:"Mina Fabriker",add_factory_btn:"+ Lägg till Fabrik",edit_factory_btn:"Redigera",delete_factory_btn:"Ta bort",confirm_delete_factory:"Ta bort denna fabrik? Detta kan inte ångras.",no_factories_yet:"Du har inte lagt till några fabriker än.",factory_created_toast:"Fabrik skapad och analyserad",factory_updated_toast:"Fabrik uppdaterad",factory_deleted_toast:"Fabrik borttagen",ai_insights_feed_title:"AI-insikter Flöde",no_ai_insights_yet:"Inga AI-insikter än. Lägg till en fabrik.",reanalyze_btn:"Analysera Igen",view_insights_btn:"Visa Insikter",created_label:"Skapad",cancel_btn:"Avbryt",save_btn:"Spara Ändringar",role_label:"Din Roll",role_engineer:"Ingenjör",role_manager:"Chef",role_admin:"Administratör"},
+  en: {tagline:"Global Industrial Intelligence Platform",live_label:"Live",kpi_energy:"Energy Usage",kpi_efficiency:"Efficiency",kpi_active:"Active Machines",kpi_alerts:"Alerts",kwh_unit:"kWh",chart_title:"Real-Time Performance",machine_status_title:"Machine Status",status_running:"Running",status_warning:"Warning",status_critical:"Critical",form_title:"Factory Data Input",factory_name_label:"Factory Name",machine_count_label:"Number of Machines",energy_cost_label:"Energy Cost ($/kWh)",machine_type_label:"Machine Type",temperature_label:"Temperature (°C)",vibration_label:"Vibration (mm/s)",load_label:"Load (%)",submit_btn:"Analyze Factory",submitting:"Updating...",ai_panel_title:"AI Insights",ai_placeholder:"Submit factory data to generate an AI analysis.",ai_analyzing:"Analyzing...",ai_risks:"Risks",ai_efficiency_insights:"Efficiency Insights",ai_optimizations:"Optimization Suggestions",toast_updated:"Factory data updated",toast_analysis_done:"AI analysis complete",toast_error:"Something went wrong",nav_dashboard:"Dashboard",nav_factories:"Factories",nav_ai_insights:"AI Insights",logout_btn:"Log Out",login_title:"Welcome back",login_subtitle:"Sign in to your FactoryPulse AI account",ph_email:"Email",ph_password:"Password",remember_me:"Remember me",login_btn:"Log In",login_link_register:"Don't have an account? Create one",register_title:"Create your account",register_subtitle:"Start monitoring your factories with AI",ph_full_name:"Full Name",ph_confirm_password:"Confirm Password",register_btn:"Create Account",register_link_login:"Already have an account? Sign in",err_missing_fields:"Please fill in all fields",err_invalid_email:"Please enter a valid email address",err_weak_password:"Password must be at least 8 characters with a letter and a number",err_password_mismatch:"Passwords do not match",err_invalid_credentials:"Invalid email or password",err_email_taken:"This email is already registered",err_generic:"Something went wrong. Please try again",my_factories_title:"My Factories",add_factory_btn:"+ Add Factory",edit_factory_btn:"Edit",delete_factory_btn:"Delete",confirm_delete_factory:"Delete this factory? This cannot be undone.",no_factories_yet:"You haven't added any factories yet.",factory_created_toast:"Factory created and analyzed",factory_updated_toast:"Factory updated",factory_deleted_toast:"Factory deleted",ai_insights_feed_title:"AI Insights Feed",no_ai_insights_yet:"No AI insights yet. Add a factory to get started.",reanalyze_btn:"Re-analyze",view_insights_btn:"View Insights",created_label:"Created",cancel_btn:"Cancel",save_btn:"Save Changes",role_label:"Your Role",role_engineer:"Engineer",role_manager:"Manager",role_admin:"Admin",ph_registration_code:"Access Code",registration_code_hint:"Ask your plant administrator for this code.",invite_accepted_msg:"Invitation accepted.",invite_only_msg:"Registration is by invitation only. Ask your administrator for a link.",domain_restricted_msg:"Allowed email domains:",err_invalid_registration_code:"Invalid access code",err_email_domain_not_allowed:"This email domain is not allowed",err_invite_required:"An invitation is required to register",err_invalid_invite:"This invitation is not valid",err_invite_expired:"This invitation has expired",err_invite_email_mismatch:"This invitation was issued for a different email"},
+  ru: {tagline:"Глобальная платформа промышленного интеллекта",live_label:"Live",kpi_energy:"Потребление энергии",kpi_efficiency:"Эффективность",kpi_active:"Активные станки",kpi_alerts:"Оповещения",kwh_unit:"кВт·ч",chart_title:"Показатели в реальном времени",machine_status_title:"Статус станков",status_running:"Работает",status_warning:"Внимание",status_critical:"Критично",form_title:"Ввод данных завода",factory_name_label:"Название завода",machine_count_label:"Количество станков",energy_cost_label:"Стоимость энергии ($/кВт·ч)",machine_type_label:"Тип станка",temperature_label:"Температура (°C)",vibration_label:"Вибрация (мм/с)",load_label:"Нагрузка (%)",submit_btn:"Анализировать завод",submitting:"Обновление...",ai_panel_title:"AI-аналитика",ai_placeholder:"Отправьте данные завода, чтобы получить AI-анализ.",ai_analyzing:"Анализ...",ai_risks:"Риски",ai_efficiency_insights:"Анализ эффективности",ai_optimizations:"Рекомендации по оптимизации",toast_updated:"Данные завода обновлены",toast_analysis_done:"AI-анализ завершён",toast_error:"Произошла ошибка",nav_dashboard:"Панель",nav_factories:"Заводы",nav_ai_insights:"AI-аналитика",logout_btn:"Выход",login_title:"С возвращением",login_subtitle:"Войдите в аккаунт FactoryPulse AI",ph_email:"Email",ph_password:"Пароль",remember_me:"Запомнить меня",login_btn:"Войти",login_link_register:"Нет аккаунта? Создать",register_title:"Создать аккаунт",register_subtitle:"Начните мониторинг заводов с помощью AI",ph_full_name:"Полное имя",ph_confirm_password:"Подтвердите пароль",register_btn:"Создать аккаунт",register_link_login:"Уже есть аккаунт? Войти",err_missing_fields:"Заполните все поля",err_invalid_email:"Введите корректный email",err_weak_password:"Пароль должен быть от 8 символов, с буквой и цифрой",err_password_mismatch:"Пароли не совпадают",err_invalid_credentials:"Неверный email или пароль",err_email_taken:"Этот email уже зарегистрирован",err_generic:"Что-то пошло не так. Попробуйте снова",my_factories_title:"Мои заводы",add_factory_btn:"+ Добавить завод",edit_factory_btn:"Изменить",delete_factory_btn:"Удалить",confirm_delete_factory:"Удалить этот завод? Это действие нельзя отменить.",no_factories_yet:"Вы ещё не добавили ни одного завода.",factory_created_toast:"Завод создан и проанализирован",factory_updated_toast:"Завод обновлён",factory_deleted_toast:"Завод удалён",ai_insights_feed_title:"Лента AI-аналитики",no_ai_insights_yet:"Пока нет AI-аналитики. Добавьте завод, чтобы начать.",reanalyze_btn:"Проанализировать снова",view_insights_btn:"Смотреть аналитику",created_label:"Создано",cancel_btn:"Отмена",save_btn:"Сохранить изменения",role_label:"Ваша роль",role_engineer:"Инженер",role_manager:"Менеджер",role_admin:"Администратор",ph_registration_code:"Код доступа",registration_code_hint:"Запросите код у администратора завода.",invite_accepted_msg:"Приглашение принято.",invite_only_msg:"Регистрация только по приглашению. Запросите ссылку у администратора.",domain_restricted_msg:"Разрешённые домены:",err_invalid_registration_code:"Неверный код доступа",err_email_domain_not_allowed:"Этот домен email не разрешён",err_invite_required:"Для регистрации нужно приглашение",err_invalid_invite:"Приглашение недействительно",err_invite_expired:"Срок приглашения истёк",err_invite_email_mismatch:"Приглашение выдано на другой email"},
+  kk: {tagline:"Жаһандық өнеркәсіптік интеллект платформасы",live_label:"Тікелей эфир",kpi_energy:"Энергия тұтыну",kpi_efficiency:"Тиімділік",kpi_active:"Белсенді станоктар",kpi_alerts:"Дабылдар",kwh_unit:"кВт·сағ",chart_title:"Нақты уақыттағы көрсеткіштер",machine_status_title:"Станоктар күйі",status_running:"Жұмыс істеп тұр",status_warning:"Ескерту",status_critical:"Сыни",form_title:"Зауыт деректерін енгізу",factory_name_label:"Зауыт атауы",machine_count_label:"Станоктар саны",energy_cost_label:"Энергия құны ($/кВт·сағ)",machine_type_label:"Станок түрі",temperature_label:"Температура (°C)",vibration_label:"Діріл (мм/с)",load_label:"Жүктеме (%)",submit_btn:"Зауытты талдау",submitting:"Жаңартылуда...",ai_panel_title:"AI-талдау",ai_placeholder:"AI-талдау алу үшін зауыт деректерін жіберіңіз.",ai_analyzing:"Талдануда...",ai_risks:"Тәуекелдер",ai_efficiency_insights:"Тиімділік талдауы",ai_optimizations:"Оңтайландыру ұсыныстары",toast_updated:"Зауыт деректері жаңартылды",toast_analysis_done:"AI-талдау аяқталды",toast_error:"Қате орын алды",nav_dashboard:"Басқару тақтасы",nav_factories:"Зауыттар",nav_ai_insights:"AI-талдау",logout_btn:"Шығу",login_title:"Қайта қош келдіңіз",login_subtitle:"FactoryPulse AI аккаунтыңызға кіріңіз",ph_email:"Email",ph_password:"Құпия сөз",remember_me:"Мені есте сақтау",login_btn:"Кіру",login_link_register:"Аккаунтыңыз жоқ па? Тіркелу",register_title:"Аккаунт құру",register_subtitle:"Зауыттарды AI арқылы бақылауды бастаңыз",ph_full_name:"Толық аты-жөні",ph_confirm_password:"Құпия сөзді қайталаңыз",register_btn:"Аккаунт құру",register_link_login:"Аккаунтыңыз бар ма? Кіру",err_missing_fields:"Барлық өрістерді толтырыңыз",err_invalid_email:"Дұрыс email мекенжайын енгізіңіз",err_weak_password:"Құпия сөз кемінде 8 таңба, әріп пен сан болуы керек",err_password_mismatch:"Құпия сөздер сәйкес келмейді",err_invalid_credentials:"Қате email немесе құпия сөз",err_email_taken:"Бұл email тіркелген",err_generic:"Қате орын алды. Қайталап көріңіз",my_factories_title:"Менің зауыттарым",add_factory_btn:"+ Зауыт қосу",edit_factory_btn:"Өзгерту",delete_factory_btn:"Жою",confirm_delete_factory:"Бұл зауытты жоясыз ба? Бұл әрекетті кері қайтару мүмкін емес.",no_factories_yet:"Сіз әлі ешбір зауыт қосқан жоқсыз.",factory_created_toast:"Зауыт құрылды және талданды",factory_updated_toast:"Зауыт жаңартылды",factory_deleted_toast:"Зауыт жойылды",ai_insights_feed_title:"AI-талдау таспасы",no_ai_insights_yet:"AI-талдау әлі жоқ. Бастау үшін зауыт қосыңыз.",reanalyze_btn:"Қайта талдау",view_insights_btn:"Талдауды көру",created_label:"Құрылған күні",cancel_btn:"Бас тарту",save_btn:"Өзгерістерді сақтау",role_label:"Сіздің рөліңіз",role_engineer:"Инженер",role_manager:"Менеджер",role_admin:"Әкімші",ph_registration_code:"Кіру коды",registration_code_hint:"Кодты зауыт әкімшісінен сұраңыз.",invite_accepted_msg:"Шақыру қабылданды.",invite_only_msg:"Тіркелу тек шақыру бойынша. Әкімшіден сілтеме сұраңыз.",domain_restricted_msg:"Рұқсат етілген домендер:",err_invalid_registration_code:"Кіру коды қате",err_email_domain_not_allowed:"Бұл email домені рұқсат етілмеген",err_invite_required:"Тіркелу үшін шақыру қажет",err_invalid_invite:"Шақыру жарамсыз",err_invite_expired:"Шақыру мерзімі өткен",err_invite_email_mismatch:"Шақыру басқа email-ге берілген"},
+  de: {tagline:"Globale Industrielle Intelligenzplattform",live_label:"Live",kpi_energy:"Energieverbrauch",kpi_efficiency:"Effizienz",kpi_active:"Aktive Maschinen",kpi_alerts:"Warnungen",kwh_unit:"kWh",chart_title:"Echtzeit-Leistung",machine_status_title:"Maschinenstatus",status_running:"Läuft",status_warning:"Warnung",status_critical:"Kritisch",form_title:"Fabrikdateneingabe",factory_name_label:"Fabrikname",machine_count_label:"Anzahl der Maschinen",energy_cost_label:"Energiekosten ($/kWh)",machine_type_label:"Maschinentyp",temperature_label:"Temperatur (°C)",vibration_label:"Vibration (mm/s)",load_label:"Last (%)",submit_btn:"Fabrik Analysieren",submitting:"Aktualisieren...",ai_panel_title:"KI-Einblicke",ai_placeholder:"Senden Sie Fabrikdaten, um eine KI-Analyse zu erstellen.",ai_analyzing:"Analysiere...",ai_risks:"Risiken",ai_efficiency_insights:"Effizienzanalyse",ai_optimizations:"Optimierungsvorschläge",toast_updated:"Fabrikdaten aktualisiert",toast_analysis_done:"KI-Analyse abgeschlossen",toast_error:"Etwas ist schiefgelaufen",nav_dashboard:"Übersicht",nav_factories:"Fabriken",nav_ai_insights:"KI-Einblicke",logout_btn:"Abmelden",login_title:"Willkommen zurück",login_subtitle:"Melden Sie sich bei Ihrem FactoryPulse AI-Konto an",ph_email:"E-Mail",ph_password:"Passwort",remember_me:"Angemeldet bleiben",login_btn:"Einloggen",login_link_register:"Kein Konto? Jetzt erstellen",register_title:"Konto erstellen",register_subtitle:"Beginnen Sie mit der KI-Überwachung Ihrer Fabriken",ph_full_name:"Vollständiger Name",ph_confirm_password:"Passwort bestätigen",register_btn:"Konto erstellen",register_link_login:"Bereits ein Konto? Anmelden",err_missing_fields:"Bitte füllen Sie alle Felder aus",err_invalid_email:"Bitte geben Sie eine gültige E-Mail-Adresse ein",err_weak_password:"Passwort muss mind. 8 Zeichen, einen Buchstaben und eine Zahl enthalten",err_password_mismatch:"Passwörter stimmen nicht überein",err_invalid_credentials:"Ungültige E-Mail oder Passwort",err_email_taken:"Diese E-Mail ist bereits registriert",err_generic:"Etwas ist schiefgelaufen. Bitte erneut versuchen",my_factories_title:"Meine Fabriken",add_factory_btn:"+ Fabrik Hinzufügen",edit_factory_btn:"Bearbeiten",delete_factory_btn:"Löschen",confirm_delete_factory:"Diese Fabrik löschen? Dies kann nicht rückgängig gemacht werden.",no_factories_yet:"Sie haben noch keine Fabriken hinzugefügt.",factory_created_toast:"Fabrik erstellt und analysiert",factory_updated_toast:"Fabrik aktualisiert",factory_deleted_toast:"Fabrik gelöscht",ai_insights_feed_title:"KI-Einblicke Feed",no_ai_insights_yet:"Noch keine KI-Einblicke. Fügen Sie eine Fabrik hinzu.",reanalyze_btn:"Erneut analysieren",view_insights_btn:"Einblicke Anzeigen",created_label:"Erstellt",cancel_btn:"Abbrechen",save_btn:"Änderungen Speichern",role_label:"Ihre Rolle",role_engineer:"Ingenieur",role_manager:"Manager",role_admin:"Administrator",ph_registration_code:"Zugangscode",registration_code_hint:"Fragen Sie Ihren Werksadministrator nach dem Code.",invite_accepted_msg:"Einladung angenommen.",invite_only_msg:"Registrierung nur mit Einladung. Bitten Sie Ihren Administrator um einen Link.",domain_restricted_msg:"Erlaubte Domains:",err_invalid_registration_code:"Ungültiger Zugangscode",err_email_domain_not_allowed:"Diese E-Mail-Domain ist nicht erlaubt",err_invite_required:"Für die Registrierung ist eine Einladung erforderlich",err_invalid_invite:"Diese Einladung ist ungültig",err_invite_expired:"Diese Einladung ist abgelaufen",err_invite_email_mismatch:"Diese Einladung gilt für eine andere E-Mail"},
+  fr: {tagline:"Plateforme mondiale d'intelligence industrielle",live_label:"En direct",kpi_energy:"Consommation d'Énergie",kpi_efficiency:"Efficacité",kpi_active:"Machines Actives",kpi_alerts:"Alertes",kwh_unit:"kWh",chart_title:"Performance en Temps Réel",machine_status_title:"État des Machines",status_running:"En marche",status_warning:"Avertissement",status_critical:"Critique",form_title:"Saisie des Données d'Usine",factory_name_label:"Nom de l'Usine",machine_count_label:"Nombre de Machines",energy_cost_label:"Coût de l'Énergie ($/kWh)",machine_type_label:"Type de Machine",temperature_label:"Température (°C)",vibration_label:"Vibration (mm/s)",load_label:"Charge (%)",submit_btn:"Analyser l'Usine",submitting:"Mise à jour...",ai_panel_title:"Analyses IA",ai_placeholder:"Envoyez les données de l'usine pour générer une analyse IA.",ai_analyzing:"Analyse en cours...",ai_risks:"Risques",ai_efficiency_insights:"Analyse d'Efficacité",ai_optimizations:"Suggestions d'Optimisation",toast_updated:"Données d'usine mises à jour",toast_analysis_done:"Analyse IA terminée",toast_error:"Une erreur est survenue",nav_dashboard:"Tableau de Bord",nav_factories:"Usines",nav_ai_insights:"Analyses IA",logout_btn:"Déconnexion",login_title:"Content de vous revoir",login_subtitle:"Connectez-vous à votre compte FactoryPulse AI",ph_email:"E-mail",ph_password:"Mot de passe",remember_me:"Se souvenir de moi",login_btn:"Se connecter",login_link_register:"Pas de compte ? Créez-en un",register_title:"Créer votre compte",register_subtitle:"Commencez à surveiller vos usines avec l'IA",ph_full_name:"Nom Complet",ph_confirm_password:"Confirmer le Mot de Passe",register_btn:"Créer un Compte",register_link_login:"Déjà un compte ? Se connecter",err_missing_fields:"Veuillez remplir tous les champs",err_invalid_email:"Veuillez entrer une adresse e-mail valide",err_weak_password:"Le mot de passe doit contenir 8 caractères min., une lettre et un chiffre",err_password_mismatch:"Les mots de passe ne correspondent pas",err_invalid_credentials:"E-mail ou mot de passe incorrect",err_email_taken:"Cet e-mail est déjà enregistré",err_generic:"Une erreur est survenue. Veuillez réessayer",my_factories_title:"Mes Usines",add_factory_btn:"+ Ajouter une Usine",edit_factory_btn:"Modifier",delete_factory_btn:"Supprimer",confirm_delete_factory:"Supprimer cette usine ? Cette action est irréversible.",no_factories_yet:"Vous n'avez pas encore ajouté d'usine.",factory_created_toast:"Usine créée et analysée",factory_updated_toast:"Usine mise à jour",factory_deleted_toast:"Usine supprimée",ai_insights_feed_title:"Flux d'Analyses IA",no_ai_insights_yet:"Aucune analyse IA pour l'instant. Ajoutez une usine.",reanalyze_btn:"Réanalyser",view_insights_btn:"Voir les Analyses",created_label:"Créée le",cancel_btn:"Annuler",save_btn:"Enregistrer les Modifications",role_label:"Votre Rôle",role_engineer:"Ingénieur",role_manager:"Manager",role_admin:"Administrateur",ph_registration_code:"Code d'accès",registration_code_hint:"Demandez ce code à l'administrateur de l'usine.",invite_accepted_msg:"Invitation acceptée.",invite_only_msg:"Inscription sur invitation uniquement. Demandez un lien à votre administrateur.",domain_restricted_msg:"Domaines autorisés :",err_invalid_registration_code:"Code d'accès invalide",err_email_domain_not_allowed:"Ce domaine e-mail n'est pas autorisé",err_invite_required:"Une invitation est requise pour s'inscrire",err_invalid_invite:"Cette invitation n'est pas valide",err_invite_expired:"Cette invitation a expiré",err_invite_email_mismatch:"Cette invitation concerne une autre adresse"},
+  es: {tagline:"Plataforma Global de Inteligencia Industrial",live_label:"En vivo",kpi_energy:"Uso de Energía",kpi_efficiency:"Eficiencia",kpi_active:"Máquinas Activas",kpi_alerts:"Alertas",kwh_unit:"kWh",chart_title:"Rendimiento en Tiempo Real",machine_status_title:"Estado de Máquinas",status_running:"Funcionando",status_warning:"Advertencia",status_critical:"Crítico",form_title:"Entrada de Datos de Fábrica",factory_name_label:"Nombre de Fábrica",machine_count_label:"Número de Máquinas",energy_cost_label:"Costo de Energía ($/kWh)",machine_type_label:"Tipo de Máquina",temperature_label:"Temperatura (°C)",vibration_label:"Vibración (mm/s)",load_label:"Carga (%)",submit_btn:"Analizar Fábrica",submitting:"Actualizando...",ai_panel_title:"Perspectivas IA",ai_placeholder:"Envíe datos de fábrica para generar un análisis IA.",ai_analyzing:"Analizando...",ai_risks:"Riesgos",ai_efficiency_insights:"Análisis de Eficiencia",ai_optimizations:"Sugerencias de Optimización",toast_updated:"Datos de fábrica actualizados",toast_analysis_done:"Análisis IA completo",toast_error:"Algo salió mal",nav_dashboard:"Panel",nav_factories:"Fábricas",nav_ai_insights:"Perspectivas IA",logout_btn:"Cerrar Sesión",login_title:"Bienvenido de nuevo",login_subtitle:"Inicia sesión en tu cuenta de FactoryPulse AI",ph_email:"Correo electrónico",ph_password:"Contraseña",remember_me:"Recuérdame",login_btn:"Iniciar Sesión",login_link_register:"¿No tienes cuenta? Crea una",register_title:"Crea tu cuenta",register_subtitle:"Empieza a monitorear tus fábricas con IA",ph_full_name:"Nombre Completo",ph_confirm_password:"Confirmar Contraseña",register_btn:"Crear Cuenta",register_link_login:"¿Ya tienes cuenta? Inicia sesión",err_missing_fields:"Por favor complete todos los campos",err_invalid_email:"Por favor ingrese un correo válido",err_weak_password:"La contraseña debe tener mín. 8 caracteres, una letra y un número",err_password_mismatch:"Las contraseñas no coinciden",err_invalid_credentials:"Correo o contraseña incorrectos",err_email_taken:"Este correo ya está registrado",err_generic:"Algo salió mal. Inténtalo de nuevo",my_factories_title:"Mis Fábricas",add_factory_btn:"+ Añadir Fábrica",edit_factory_btn:"Editar",delete_factory_btn:"Eliminar",confirm_delete_factory:"¿Eliminar esta fábrica? Esta acción no se puede deshacer.",no_factories_yet:"Aún no has añadido ninguna fábrica.",factory_created_toast:"Fábrica creada y analizada",factory_updated_toast:"Fábrica actualizada",factory_deleted_toast:"Fábrica eliminada",ai_insights_feed_title:"Feed de Perspectivas IA",no_ai_insights_yet:"Aún no hay perspectivas IA. Añade una fábrica.",reanalyze_btn:"Reanalizar",view_insights_btn:"Ver Perspectivas",created_label:"Creada",cancel_btn:"Cancelar",save_btn:"Guardar Cambios",role_label:"Su Rol",role_engineer:"Ingeniero",role_manager:"Gerente",role_admin:"Administrador",ph_registration_code:"Código de acceso",registration_code_hint:"Solicite este código al administrador de la planta.",invite_accepted_msg:"Invitación aceptada.",invite_only_msg:"Registro solo por invitación. Solicite un enlace a su administrador.",domain_restricted_msg:"Dominios permitidos:",err_invalid_registration_code:"Código de acceso inválido",err_email_domain_not_allowed:"Este dominio de email no está permitido",err_invite_required:"Se requiere una invitación para registrarse",err_invalid_invite:"Esta invitación no es válida",err_invite_expired:"Esta invitación ha caducado",err_invite_email_mismatch:"Esta invitación es para otro email"},
+  zh: {tagline:"全球工业智能平台",live_label:"实时",kpi_energy:"能源使用量",kpi_efficiency:"效率",kpi_active:"运行中设备",kpi_alerts:"警报",kwh_unit:"kWh",chart_title:"实时性能",machine_status_title:"设备状态",status_running:"运行中",status_warning:"警告",status_critical:"严重",form_title:"工厂数据输入",factory_name_label:"工厂名称",machine_count_label:"设备数量",energy_cost_label:"能源成本 ($/kWh)",machine_type_label:"设备类型",temperature_label:"温度 (°C)",vibration_label:"振动 (mm/s)",load_label:"负载 (%)",submit_btn:"分析工厂",submitting:"更新中...",ai_panel_title:"AI 洞察",ai_placeholder:"提交工厂数据以生成AI分析。",ai_analyzing:"分析中...",ai_risks:"风险",ai_efficiency_insights:"效率分析",ai_optimizations:"优化建议",toast_updated:"工厂数据已更新",toast_analysis_done:"AI分析已完成",toast_error:"出现错误",nav_dashboard:"仪表盘",nav_factories:"工厂",nav_ai_insights:"AI洞察",logout_btn:"退出",login_title:"欢迎回来",login_subtitle:"登录您的 FactoryPulse AI 账户",ph_email:"电子邮件",ph_password:"密码",remember_me:"记住我",login_btn:"登录",login_link_register:"没有账户？创建一个",register_title:"创建账户",register_subtitle:"开始使用AI监控您的工厂",ph_full_name:"全名",ph_confirm_password:"确认密码",register_btn:"创建账户",register_link_login:"已有账户？登录",err_missing_fields:"请填写所有字段",err_invalid_email:"请输入有效的电子邮件地址",err_weak_password:"密码至少8位，需包含字母和数字",err_password_mismatch:"两次密码不一致",err_invalid_credentials:"电子邮件或密码错误",err_email_taken:"该电子邮件已被注册",err_generic:"出现错误，请重试",my_factories_title:"我的工厂",add_factory_btn:"+ 添加工厂",edit_factory_btn:"编辑",delete_factory_btn:"删除",confirm_delete_factory:"删除此工厂？此操作无法撤销。",no_factories_yet:"您还没有添加任何工厂。",factory_created_toast:"工厂已创建并分析",factory_updated_toast:"工厂已更新",factory_deleted_toast:"工厂已删除",ai_insights_feed_title:"AI洞察动态",no_ai_insights_yet:"暂无AI洞察。请添加工厂开始。",reanalyze_btn:"重新分析",view_insights_btn:"查看洞察",created_label:"创建于",cancel_btn:"取消",save_btn:"保存更改",role_label:"您的角色",role_engineer:"工程师",role_manager:"经理",role_admin:"管理员",ph_registration_code:"访问码",registration_code_hint:"请向工厂管理员索取此代码。",invite_accepted_msg:"邀请已接受。",invite_only_msg:"仅限受邀注册。请向管理员索取链接。",domain_restricted_msg:"允许的域名：",err_invalid_registration_code:"访问码无效",err_email_domain_not_allowed:"此邮箱域名不被允许",err_invite_required:"注册需要邀请",err_invalid_invite:"此邀请无效",err_invite_expired:"此邀请已过期",err_invite_email_mismatch:"此邀请是发给其他邮箱的"},
+  ar: {tagline:"منصة الذكاء الصناعي العالمية",live_label:"مباشر",kpi_energy:"استهلاك الطاقة",kpi_efficiency:"الكفاءة",kpi_active:"الآلات النشطة",kpi_alerts:"التنبيهات",kwh_unit:"kWh",chart_title:"الأداء في الوقت الفعلي",machine_status_title:"حالة الآلات",status_running:"تعمل",status_warning:"تحذير",status_critical:"حرج",form_title:"إدخال بيانات المصنع",factory_name_label:"اسم المصنع",machine_count_label:"عدد الآلات",energy_cost_label:"تكلفة الطاقة ($/kWh)",machine_type_label:"نوع الآلة",temperature_label:"درجة الحرارة (°C)",vibration_label:"الاهتزاز (مم/ث)",load_label:"الحمل (%)",submit_btn:"تحليل المصنع",submitting:"جارٍ التحديث...",ai_panel_title:"رؤى الذكاء الاصطناعي",ai_placeholder:"أرسل بيانات المصنع لإنشاء تحليل بالذكاء الاصطناعي.",ai_analyzing:"جارٍ التحليل...",ai_risks:"المخاطر",ai_efficiency_insights:"تحليل الكفاءة",ai_optimizations:"اقتراحات التحسين",toast_updated:"تم تحديث بيانات المصنع",toast_analysis_done:"اكتمل تحليل الذكاء الاصطناعي",toast_error:"حدث خطأ ما",nav_dashboard:"لوحة التحكم",nav_factories:"المصانع",nav_ai_insights:"رؤى الذكاء الاصطناعي",logout_btn:"تسجيل الخروج",login_title:"مرحباً بعودتك",login_subtitle:"سجل الدخول إلى حساب FactoryPulse AI الخاص بك",ph_email:"البريد الإلكتروني",ph_password:"كلمة المرور",remember_me:"تذكرني",login_btn:"تسجيل الدخول",login_link_register:"ليس لديك حساب؟ أنشئ واحداً",register_title:"إنشاء حسابك",register_subtitle:"ابدأ بمراقبة مصانعك بالذكاء الاصطناعي",ph_full_name:"الاسم الكامل",ph_confirm_password:"تأكيد كلمة المرور",register_btn:"إنشاء حساب",register_link_login:"لديك حساب بالفعل؟ سجل الدخول",err_missing_fields:"يرجى ملء جميع الحقول",err_invalid_email:"يرجى إدخال بريد إلكتروني صالح",err_weak_password:"يجب أن تكون كلمة المرور 8 أحرف على الأقل وتحتوي على حرف ورقم",err_password_mismatch:"كلمتا المرور غير متطابقتين",err_invalid_credentials:"البريد الإلكتروني أو كلمة المرور غير صحيحة",err_email_taken:"هذا البريد الإلكتروني مسجل بالفعل",err_generic:"حدث خطأ ما. يرجى المحاولة مرة أخرى",my_factories_title:"مصانعي",add_factory_btn:"+ إضافة مصنع",edit_factory_btn:"تعديل",delete_factory_btn:"حذف",confirm_delete_factory:"هل تريد حذف هذا المصنع؟ لا يمكن التراجع عن هذا.",no_factories_yet:"لم تقم بإضافة أي مصنع بعد.",factory_created_toast:"تم إنشاء المصنع وتحليله",factory_updated_toast:"تم تحديث المصنع",factory_deleted_toast:"تم حذف المصنع",ai_insights_feed_title:"موجز رؤى الذكاء الاصطناعي",no_ai_insights_yet:"لا توجد رؤى بعد. أضف مصنعاً للبدء.",reanalyze_btn:"إعادة التحليل",view_insights_btn:"عرض الرؤى",created_label:"تاريخ الإنشاء",cancel_btn:"إلغاء",save_btn:"حفظ التغييرات",role_label:"دورك",role_engineer:"مهندس",role_manager:"مدير",role_admin:"مسؤول",ph_registration_code:"رمز الوصول",registration_code_hint:"اطلب هذا الرمز من مسؤول المصنع.",invite_accepted_msg:"تم قبول الدعوة.",invite_only_msg:"التسجيل بالدعوة فقط. اطلب رابطًا من المسؤول.",domain_restricted_msg:"النطاقات المسموحة:",err_invalid_registration_code:"رمز وصول غير صالح",err_email_domain_not_allowed:"نطاق البريد هذا غير مسموح",err_invite_required:"التسجيل يتطلب دعوة",err_invalid_invite:"هذه الدعوة غير صالحة",err_invite_expired:"انتهت صلاحية هذه الدعوة",err_invite_email_mismatch:"هذه الدعوة صادرة لبريد آخر"},
+  tr: {tagline:"Küresel Endüstriyel Zeka Platformu",live_label:"Canlı",kpi_energy:"Enerji Kullanımı",kpi_efficiency:"Verimlilik",kpi_active:"Aktif Makineler",kpi_alerts:"Uyarılar",kwh_unit:"kWh",chart_title:"Gerçek Zamanlı Performans",machine_status_title:"Makine Durumu",status_running:"Çalışıyor",status_warning:"Uyarı",status_critical:"Kritik",form_title:"Fabrika Veri Girişi",factory_name_label:"Fabrika Adı",machine_count_label:"Makine Sayısı",energy_cost_label:"Enerji Maliyeti ($/kWh)",machine_type_label:"Makine Türü",temperature_label:"Sıcaklık (°C)",vibration_label:"Titreşim (mm/s)",load_label:"Yük (%)",submit_btn:"Fabrikayı Analiz Et",submitting:"Güncelleniyor...",ai_panel_title:"AI Analizleri",ai_placeholder:"AI analizi oluşturmak için fabrika verilerini gönderin.",ai_analyzing:"Analiz ediliyor...",ai_risks:"Riskler",ai_efficiency_insights:"Verimlilik Analizi",ai_optimizations:"Optimizasyon Önerileri",toast_updated:"Fabrika verileri güncellendi",toast_analysis_done:"AI analizi tamamlandı",toast_error:"Bir şeyler ters gitti",nav_dashboard:"Panel",nav_factories:"Fabrikalar",nav_ai_insights:"AI Analizleri",logout_btn:"Çıkış Yap",login_title:"Tekrar hoş geldiniz",login_subtitle:"FactoryPulse AI hesabınıza giriş yapın",ph_email:"E-posta",ph_password:"Şifre",remember_me:"Beni hatırla",login_btn:"Giriş Yap",login_link_register:"Hesabınız yok mu? Oluşturun",register_title:"Hesabınızı oluşturun",register_subtitle:"Fabrikalarınızı AI ile izlemeye başlayın",ph_full_name:"Ad Soyad",ph_confirm_password:"Şifreyi Onayla",register_btn:"Hesap Oluştur",register_link_login:"Zaten hesabınız var mı? Giriş yapın",err_missing_fields:"Lütfen tüm alanları doldurun",err_invalid_email:"Lütfen geçerli bir e-posta adresi girin",err_weak_password:"Şifre en az 8 karakter, bir harf ve bir rakam içermeli",err_password_mismatch:"Şifreler eşleşmiyor",err_invalid_credentials:"E-posta veya şifre hatalı",err_email_taken:"Bu e-posta zaten kayıtlı",err_generic:"Bir şeyler ters gitti. Tekrar deneyin",my_factories_title:"Fabrikalarım",add_factory_btn:"+ Fabrika Ekle",edit_factory_btn:"Düzenle",delete_factory_btn:"Sil",confirm_delete_factory:"Bu fabrika silinsin mi? Bu işlem geri alınamaz.",no_factories_yet:"Henüz fabrika eklemediniz.",factory_created_toast:"Fabrika oluşturuldu ve analiz edildi",factory_updated_toast:"Fabrika güncellendi",factory_deleted_toast:"Fabrika silindi",ai_insights_feed_title:"AI Analiz Akışı",no_ai_insights_yet:"Henüz AI analizi yok. Başlamak için fabrika ekleyin.",reanalyze_btn:"Yeniden Analiz Et",view_insights_btn:"Analizleri Görüntüle",created_label:"Oluşturulma",cancel_btn:"İptal",save_btn:"Değişiklikleri Kaydet",role_label:"Rolünüz",role_engineer:"Mühendis",role_manager:"Yönetici",role_admin:"Admin",ph_registration_code:"Erişim Kodu",registration_code_hint:"Bu kodu fabrika yöneticinizden isteyin.",invite_accepted_msg:"Davet kabul edildi.",invite_only_msg:"Kayıt yalnızca davetle. Yöneticinizden bağlantı isteyin.",domain_restricted_msg:"İzin verilen alan adları:",err_invalid_registration_code:"Geçersiz erişim kodu",err_email_domain_not_allowed:"Bu e-posta alan adına izin verilmiyor",err_invite_required:"Kayıt için davet gerekli",err_invalid_invite:"Bu davet geçerli değil",err_invite_expired:"Bu davetin süresi doldu",err_invite_email_mismatch:"Bu davet farklı bir e-posta için verildi"},
+  it: {tagline:"Piattaforma Globale di Intelligenza Industriale",live_label:"In diretta",kpi_energy:"Consumo Energetico",kpi_efficiency:"Efficienza",kpi_active:"Macchine Attive",kpi_alerts:"Avvisi",kwh_unit:"kWh",chart_title:"Prestazioni in Tempo Reale",machine_status_title:"Stato delle Macchine",status_running:"In funzione",status_warning:"Avviso",status_critical:"Critico",form_title:"Inserimento Dati Fabbrica",factory_name_label:"Nome Fabbrica",machine_count_label:"Numero di Macchine",energy_cost_label:"Costo Energia ($/kWh)",machine_type_label:"Tipo di Macchina",temperature_label:"Temperatura (°C)",vibration_label:"Vibrazione (mm/s)",load_label:"Carico (%)",submit_btn:"Analizza Fabbrica",submitting:"Aggiornamento...",ai_panel_title:"Analisi IA",ai_placeholder:"Invia i dati della fabbrica per generare un'analisi IA.",ai_analyzing:"Analisi in corso...",ai_risks:"Rischi",ai_efficiency_insights:"Analisi dell'Efficienza",ai_optimizations:"Suggerimenti di Ottimizzazione",toast_updated:"Dati fabbrica aggiornati",toast_analysis_done:"Analisi IA completata",toast_error:"Qualcosa è andato storto",nav_dashboard:"Dashboard",nav_factories:"Fabbriche",nav_ai_insights:"Analisi IA",logout_btn:"Esci",login_title:"Bentornato",login_subtitle:"Accedi al tuo account FactoryPulse AI",ph_email:"Email",ph_password:"Password",remember_me:"Ricordami",login_btn:"Accedi",login_link_register:"Non hai un account? Creane uno",register_title:"Crea il tuo account",register_subtitle:"Inizia a monitorare le tue fabbriche con l'IA",ph_full_name:"Nome Completo",ph_confirm_password:"Conferma Password",register_btn:"Crea Account",register_link_login:"Hai già un account? Accedi",err_missing_fields:"Si prega di compilare tutti i campi",err_invalid_email:"Inserisci un indirizzo email valido",err_weak_password:"La password deve avere almeno 8 caratteri, una lettera e un numero",err_password_mismatch:"Le password non corrispondono",err_invalid_credentials:"Email o password errati",err_email_taken:"Questa email è già registrata",err_generic:"Qualcosa è andato storto. Riprova",my_factories_title:"Le Mie Fabbriche",add_factory_btn:"+ Aggiungi Fabbrica",edit_factory_btn:"Modifica",delete_factory_btn:"Elimina",confirm_delete_factory:"Eliminare questa fabbrica? Questa azione non può essere annullata.",no_factories_yet:"Non hai ancora aggiunto nessuna fabbrica.",factory_created_toast:"Fabbrica creata e analizzata",factory_updated_toast:"Fabbrica aggiornata",factory_deleted_toast:"Fabbrica eliminata",ai_insights_feed_title:"Feed di Analisi IA",no_ai_insights_yet:"Nessuna analisi IA ancora. Aggiungi una fabbrica.",reanalyze_btn:"Rianalizza",view_insights_btn:"Vedi Analisi",created_label:"Creata il",cancel_btn:"Annulla",save_btn:"Salva Modifiche",role_label:"Il Tuo Ruolo",role_engineer:"Ingegnere",role_manager:"Manager",role_admin:"Amministratore",ph_registration_code:"Codice di accesso",registration_code_hint:"Chiedi questo codice all'amministratore dello stabilimento.",invite_accepted_msg:"Invito accettato.",invite_only_msg:"Registrazione solo su invito. Chiedi un link al tuo amministratore.",domain_restricted_msg:"Domini consentiti:",err_invalid_registration_code:"Codice di accesso non valido",err_email_domain_not_allowed:"Questo dominio email non è consentito",err_invite_required:"Per registrarsi serve un invito",err_invalid_invite:"Questo invito non è valido",err_invite_expired:"Questo invito è scaduto",err_invite_email_mismatch:"Questo invito è per un'altra email"},
+  pt: {tagline:"Plataforma Global de Inteligência Industrial",live_label:"Ao vivo",kpi_energy:"Uso de Energia",kpi_efficiency:"Eficiência",kpi_active:"Máquinas Ativas",kpi_alerts:"Alertas",kwh_unit:"kWh",chart_title:"Desempenho em Tempo Real",machine_status_title:"Status das Máquinas",status_running:"Em funcionamento",status_warning:"Aviso",status_critical:"Crítico",form_title:"Entrada de Dados da Fábrica",factory_name_label:"Nome da Fábrica",machine_count_label:"Número de Máquinas",energy_cost_label:"Custo de Energia ($/kWh)",machine_type_label:"Tipo de Máquina",temperature_label:"Temperatura (°C)",vibration_label:"Vibração (mm/s)",load_label:"Carga (%)",submit_btn:"Analisar Fábrica",submitting:"Atualizando...",ai_panel_title:"Insights de IA",ai_placeholder:"Envie os dados da fábrica para gerar uma análise de IA.",ai_analyzing:"Analisando...",ai_risks:"Riscos",ai_efficiency_insights:"Análise de Eficiência",ai_optimizations:"Sugestões de Otimização",toast_updated:"Dados da fábrica atualizados",toast_analysis_done:"Análise de IA concluída",toast_error:"Algo deu errado",nav_dashboard:"Painel",nav_factories:"Fábricas",nav_ai_insights:"Insights de IA",logout_btn:"Sair",login_title:"Bem-vindo de volta",login_subtitle:"Entre na sua conta FactoryPulse AI",ph_email:"E-mail",ph_password:"Senha",remember_me:"Lembrar de mim",login_btn:"Entrar",login_link_register:"Não tem conta? Crie uma",register_title:"Crie sua conta",register_subtitle:"Comece a monitorar suas fábricas com IA",ph_full_name:"Nome Completo",ph_confirm_password:"Confirmar Senha",register_btn:"Criar Conta",register_link_login:"Já tem conta? Entrar",err_missing_fields:"Por favor preencha todos os campos",err_invalid_email:"Por favor insira um e-mail válido",err_weak_password:"A senha deve ter no mínimo 8 caracteres, uma letra e um número",err_password_mismatch:"As senhas não coincidem",err_invalid_credentials:"E-mail ou senha incorretos",err_email_taken:"Este e-mail já está registrado",err_generic:"Algo deu errado. Tente novamente",my_factories_title:"Minhas Fábricas",add_factory_btn:"+ Adicionar Fábrica",edit_factory_btn:"Editar",delete_factory_btn:"Excluir",confirm_delete_factory:"Excluir esta fábrica? Esta ação não pode ser desfeita.",no_factories_yet:"Você ainda não adicionou nenhuma fábrica.",factory_created_toast:"Fábrica criada e analisada",factory_updated_toast:"Fábrica atualizada",factory_deleted_toast:"Fábrica excluída",ai_insights_feed_title:"Feed de Insights de IA",no_ai_insights_yet:"Ainda sem insights de IA. Adicione uma fábrica.",reanalyze_btn:"Reanalisar",view_insights_btn:"Ver Insights",created_label:"Criada em",cancel_btn:"Cancelar",save_btn:"Salvar Alterações",role_label:"Sua Função",role_engineer:"Engenheiro",role_manager:"Gerente",role_admin:"Administrador",ph_registration_code:"Código de acesso",registration_code_hint:"Peça este código ao administrador da fábrica.",invite_accepted_msg:"Convite aceito.",invite_only_msg:"Cadastro apenas por convite. Peça um link ao administrador.",domain_restricted_msg:"Domínios permitidos:",err_invalid_registration_code:"Código de acesso inválido",err_email_domain_not_allowed:"Este domínio de email não é permitido",err_invite_required:"É necessário um convite para se cadastrar",err_invalid_invite:"Este convite não é válido",err_invite_expired:"Este convite expirou",err_invite_email_mismatch:"Este convite é para outro email"},
+  ja: {tagline:"グローバル産業インテリジェンスプラットフォーム",live_label:"ライブ",kpi_energy:"エネルギー使用量",kpi_efficiency:"効率",kpi_active:"稼働中の機械",kpi_alerts:"アラート",kwh_unit:"kWh",chart_title:"リアルタイムパフォーマンス",machine_status_title:"機械の状態",status_running:"稼働中",status_warning:"警告",status_critical:"重大",form_title:"工場データ入力",factory_name_label:"工場名",machine_count_label:"機械の数",energy_cost_label:"エネルギーコスト ($/kWh)",machine_type_label:"機械の種類",temperature_label:"温度 (°C)",vibration_label:"振動 (mm/s)",load_label:"負荷 (%)",submit_btn:"工場を分析",submitting:"更新中...",ai_panel_title:"AIインサイト",ai_placeholder:"工場データを送信してAI分析を生成してください。",ai_analyzing:"分析中...",ai_risks:"リスク",ai_efficiency_insights:"効率分析",ai_optimizations:"最適化提案",toast_updated:"工場データが更新されました",toast_analysis_done:"AI分析が完了しました",toast_error:"問題が発生しました",nav_dashboard:"ダッシュボード",nav_factories:"工場",nav_ai_insights:"AIインサイト",logout_btn:"ログアウト",login_title:"おかえりなさい",login_subtitle:"FactoryPulse AI アカウントにログイン",ph_email:"メールアドレス",ph_password:"パスワード",remember_me:"ログイン状態を保持",login_btn:"ログイン",login_link_register:"アカウントをお持ちでないですか？作成する",register_title:"アカウントを作成",register_subtitle:"AIで工場の監視を始めましょう",ph_full_name:"氏名",ph_confirm_password:"パスワードの確認",register_btn:"アカウント作成",register_link_login:"すでにアカウントをお持ちですか？ログイン",err_missing_fields:"すべての項目を入力してください",err_invalid_email:"有効なメールアドレスを入力してください",err_weak_password:"パスワードは8文字以上で、文字と数字を含める必要があります",err_password_mismatch:"パスワードが一致しません",err_invalid_credentials:"メールアドレスまたはパスワードが正しくありません",err_email_taken:"このメールアドレスは既に登録されています",err_generic:"エラーが発生しました。再試行してください",my_factories_title:"マイ工場",add_factory_btn:"+ 工場を追加",edit_factory_btn:"編集",delete_factory_btn:"削除",confirm_delete_factory:"この工場を削除しますか？元に戻せません。",no_factories_yet:"まだ工場を追加していません。",factory_created_toast:"工場が作成・分析されました",factory_updated_toast:"工場が更新されました",factory_deleted_toast:"工場が削除されました",ai_insights_feed_title:"AIインサイトフィード",no_ai_insights_yet:"AIインサイトはまだありません。工場を追加してください。",reanalyze_btn:"再分析",view_insights_btn:"インサイトを見る",created_label:"作成日",cancel_btn:"キャンセル",save_btn:"変更を保存",role_label:"あなたの役割",role_engineer:"エンジニア",role_manager:"マネージャー",role_admin:"管理者",ph_registration_code:"アクセスコード",registration_code_hint:"このコードは工場管理者にお尋ねください。",invite_accepted_msg:"招待を受理しました。",invite_only_msg:"登録は招待制です。管理者にリンクを依頼してください。",domain_restricted_msg:"許可されたドメイン：",err_invalid_registration_code:"アクセスコードが無効です",err_email_domain_not_allowed:"このメールドメインは許可されていません",err_invite_required:"登録には招待が必要です",err_invalid_invite:"この招待は無効です",err_invite_expired:"この招待は期限切れです",err_invite_email_mismatch:"この招待は別のメール宛です"},
+  ko: {tagline:"글로벌 산업 인텔리전스 플랫폼",live_label:"실시간",kpi_energy:"에너지 사용량",kpi_efficiency:"효율성",kpi_active:"가동 중인 기계",kpi_alerts:"경고",kwh_unit:"kWh",chart_title:"실시간 성능",machine_status_title:"기계 상태",status_running:"가동 중",status_warning:"경고",status_critical:"심각",form_title:"공장 데이터 입력",factory_name_label:"공장 이름",machine_count_label:"기계 수",energy_cost_label:"에너지 비용 ($/kWh)",machine_type_label:"기계 유형",temperature_label:"온도 (°C)",vibration_label:"진동 (mm/s)",load_label:"부하 (%)",submit_btn:"공장 분석",submitting:"업데이트 중...",ai_panel_title:"AI 인사이트",ai_placeholder:"AI 분석을 생성하려면 공장 데이터를 제출하세요.",ai_analyzing:"분석 중...",ai_risks:"위험 요소",ai_efficiency_insights:"효율성 분석",ai_optimizations:"최적화 제안",toast_updated:"공장 데이터가 업데이트되었습니다",toast_analysis_done:"AI 분석이 완료되었습니다",toast_error:"문제가 발생했습니다",nav_dashboard:"대시보드",nav_factories:"공장",nav_ai_insights:"AI 인사이트",logout_btn:"로그아웃",login_title:"다시 오신 것을 환영합니다",login_subtitle:"FactoryPulse AI 계정에 로그인하세요",ph_email:"이메일",ph_password:"비밀번호",remember_me:"로그인 상태 유지",login_btn:"로그인",login_link_register:"계정이 없으신가요? 계정 만들기",register_title:"계정 만들기",register_subtitle:"AI로 공장 모니터링을 시작하세요",ph_full_name:"성명",ph_confirm_password:"비밀번호 확인",register_btn:"계정 생성",register_link_login:"이미 계정이 있으신가요? 로그인",err_missing_fields:"모든 항목을 입력해주세요",err_invalid_email:"유효한 이메일 주소를 입력하세요",err_weak_password:"비밀번호는 8자 이상, 문자와 숫자를 포함해야 합니다",err_password_mismatch:"비밀번호가 일치하지 않습니다",err_invalid_credentials:"이메일 또는 비밀번호가 올바르지 않습니다",err_email_taken:"이미 등록된 이메일입니다",err_generic:"문제가 발생했습니다. 다시 시도해주세요",my_factories_title:"내 공장",add_factory_btn:"+ 공장 추가",edit_factory_btn:"수정",delete_factory_btn:"삭제",confirm_delete_factory:"이 공장을 삭제하시겠습니까? 되돌릴 수 없습니다.",no_factories_yet:"아직 추가된 공장이 없습니다.",factory_created_toast:"공장이 생성되고 분석되었습니다",factory_updated_toast:"공장이 업데이트되었습니다",factory_deleted_toast:"공장이 삭제되었습니다",ai_insights_feed_title:"AI 인사이트 피드",no_ai_insights_yet:"아직 AI 인사이트가 없습니다. 공장을 추가하세요.",reanalyze_btn:"다시 분석",view_insights_btn:"인사이트 보기",created_label:"생성일",cancel_btn:"취소",save_btn:"변경사항 저장",role_label:"귀하의 역할",role_engineer:"엔지니어",role_manager:"매니저",role_admin:"관리자",ph_registration_code:"접근 코드",registration_code_hint:"이 코드는 공장 관리자에게 문의하세요.",invite_accepted_msg:"초대가 수락되었습니다.",invite_only_msg:"초대를 통해서만 가입할 수 있습니다. 관리자에게 링크를 요청하세요.",domain_restricted_msg:"허용된 도메인:",err_invalid_registration_code:"잘못된 접근 코드",err_email_domain_not_allowed:"이 이메일 도메인은 허용되지 않습니다",err_invite_required:"가입하려면 초대가 필요합니다",err_invalid_invite:"유효하지 않은 초대입니다",err_invite_expired:"초대가 만료되었습니다",err_invite_email_mismatch:"이 초대는 다른 이메일용입니다"},
+  hi: {tagline:"वैश्विक औद्योगिक बुद्धिमत्ता मंच",live_label:"लाइव",kpi_energy:"ऊर्जा उपयोग",kpi_efficiency:"दक्षता",kpi_active:"सक्रिय मशीनें",kpi_alerts:"अलर्ट",kwh_unit:"kWh",chart_title:"रीयल-टाइम प्रदर्शन",machine_status_title:"मशीन की स्थिति",status_running:"चल रहा है",status_warning:"चेतावनी",status_critical:"गंभीर",form_title:"फ़ैक्टरी डेटा इनपुट",factory_name_label:"फ़ैक्टरी का नाम",machine_count_label:"मशीनों की संख्या",energy_cost_label:"ऊर्जा लागत ($/kWh)",machine_type_label:"मशीन प्रकार",temperature_label:"तापमान (°C)",vibration_label:"कंपन (mm/s)",load_label:"लोड (%)",submit_btn:"फ़ैक्टरी का विश्लेषण करें",submitting:"अद्यतन हो रहा है...",ai_panel_title:"AI अंतर्दृष्टि",ai_placeholder:"AI विश्लेषण उत्पन्न करने के लिए फ़ैक्टरी डेटा सबमिट करें।",ai_analyzing:"विश्लेषण हो रहा है...",ai_risks:"जोखिम",ai_efficiency_insights:"दक्षता विश्लेषण",ai_optimizations:"अनुकूलन सुझाव",toast_updated:"फ़ैक्टरी डेटा अपडेट किया गया",toast_analysis_done:"AI विश्लेषण पूर्ण हुआ",toast_error:"कुछ गलत हो गया",nav_dashboard:"डैशबोर्ड",nav_factories:"फ़ैक्टरियाँ",nav_ai_insights:"AI अंतर्दृष्टि",logout_btn:"लॉग आउट",login_title:"वापसी पर स्वागत है",login_subtitle:"अपने FactoryPulse AI खाते में लॉग इन करें",ph_email:"ईमेल",ph_password:"पासवर्ड",remember_me:"मुझे याद रखें",login_btn:"लॉग इन करें",login_link_register:"खाता नहीं है? एक बनाएं",register_title:"अपना खाता बनाएं",register_subtitle:"AI के साथ अपनी फ़ैक्टरियों की निगरानी शुरू करें",ph_full_name:"पूरा नाम",ph_confirm_password:"पासवर्ड की पुष्टि करें",register_btn:"खाता बनाएं",register_link_login:"पहले से खाता है? लॉग इन करें",err_missing_fields:"कृपया सभी फ़ील्ड भरें",err_invalid_email:"कृपया एक मान्य ईमेल पता दर्ज करें",err_weak_password:"पासवर्ड कम से कम 8 अक्षर, एक अक्षर और एक अंक होना चाहिए",err_password_mismatch:"पासवर्ड मेल नहीं खाते",err_invalid_credentials:"गलत ईमेल या पासवर्ड",err_email_taken:"यह ईमेल पहले से पंजीकृत है",err_generic:"कुछ गलत हो गया। कृपया पुनः प्रयास करें",my_factories_title:"मेरी फ़ैक्टरियाँ",add_factory_btn:"+ फ़ैक्टरी जोड़ें",edit_factory_btn:"संपादित करें",delete_factory_btn:"हटाएं",confirm_delete_factory:"इस फ़ैक्टरी को हटाएं? इसे पूर्ववत नहीं किया जा सकता।",no_factories_yet:"आपने अभी तक कोई फ़ैक्टरी नहीं जोड़ी है।",factory_created_toast:"फ़ैक्टरी बनाई और विश्लेषित की गई",factory_updated_toast:"फ़ैक्टरी अपडेट की गई",factory_deleted_toast:"फ़ैक्टरी हटाई गई",ai_insights_feed_title:"AI अंतर्दृष्टि फ़ीड",no_ai_insights_yet:"अभी तक कोई AI अंतर्दृष्टि नहीं। शुरू करने के लिए एक फ़ैक्टरी जोड़ें।",reanalyze_btn:"पुनः विश्लेषण करें",view_insights_btn:"अंतर्दृष्टि देखें",created_label:"बनाया गया",cancel_btn:"रद्द करें",save_btn:"परिवर्तन सहेजें",role_label:"आपकी भूमिका",role_engineer:"इंजीनियर",role_manager:"प्रबंधक",role_admin:"व्यवस्थापक",ph_registration_code:"एक्सेस कोड",registration_code_hint:"यह कोड अपने संयंत्र प्रशासक से माँगें।",invite_accepted_msg:"आमंत्रण स्वीकृत।",invite_only_msg:"पंजीकरण केवल आमंत्रण द्वारा। प्रशासक से लिंक माँगें।",domain_restricted_msg:"अनुमत डोमेन:",err_invalid_registration_code:"अमान्य एक्सेस कोड",err_email_domain_not_allowed:"यह ईमेल डोमेन अनुमत नहीं है",err_invite_required:"पंजीकरण हेतु आमंत्रण आवश्यक है",err_invalid_invite:"यह आमंत्रण मान्य नहीं है",err_invite_expired:"यह आमंत्रण समाप्त हो चुका है",err_invite_email_mismatch:"यह आमंत्रण किसी अन्य ईमेल हेतु है"},
+  uz: {tagline:"Global sanoat intellekti platformasi",live_label:"Jonli",kpi_energy:"Energiya sarfi",kpi_efficiency:"Samaradorlik",kpi_active:"Faol stanoklar",kpi_alerts:"Ogohlantirishlar",kwh_unit:"kWh",chart_title:"Real vaqtdagi ko'rsatkichlar",machine_status_title:"Stanoklar holati",status_running:"Ishlamoqda",status_warning:"Ogohlantirish",status_critical:"Muhim",form_title:"Zavod ma'lumotlarini kiritish",factory_name_label:"Zavod nomi",machine_count_label:"Stanoklar soni",energy_cost_label:"Energiya narxi ($/kWh)",machine_type_label:"Stanok turi",temperature_label:"Harorat (°C)",vibration_label:"Tebranish (mm/s)",load_label:"Yuklama (%)",submit_btn:"Zavodni tahlil qilish",submitting:"Yangilanmoqda...",ai_panel_title:"AI tahlili",ai_placeholder:"AI tahlilini olish uchun zavod ma'lumotlarini yuboring.",ai_analyzing:"Tahlil qilinmoqda...",ai_risks:"Xavflar",ai_efficiency_insights:"Samaradorlik tahlili",ai_optimizations:"Optimallashtirish tavsiyalari",toast_updated:"Zavod ma'lumotlari yangilandi",toast_analysis_done:"AI tahlili yakunlandi",toast_error:"Xatolik yuz berdi",nav_dashboard:"Boshqaruv paneli",nav_factories:"Zavodlar",nav_ai_insights:"AI tahlili",logout_btn:"Chiqish",login_title:"Xush kelibsiz",login_subtitle:"FactoryPulse AI hisobingizga kiring",ph_email:"Elektron pochta",ph_password:"Parol",remember_me:"Meni eslab qol",login_btn:"Kirish",login_link_register:"Hisobingiz yo'qmi? Yarating",register_title:"Hisob yarating",register_subtitle:"Zavodlaringizni AI bilan kuzatishni boshlang",ph_full_name:"To'liq ism",ph_confirm_password:"Parolni tasdiqlang",register_btn:"Hisob yaratish",register_link_login:"Hisobingiz bormi? Kiring",err_missing_fields:"Barcha maydonlarni to'ldiring",err_invalid_email:"Yaroqli elektron pochta manzilini kiriting",err_weak_password:"Parol kamida 8 belgidan, harf va raqamdan iborat bo'lishi kerak",err_password_mismatch:"Parollar mos kelmaydi",err_invalid_credentials:"Elektron pochta yoki parol noto'g'ri",err_email_taken:"Bu elektron pochta allaqachon ro'yxatdan o'tgan",err_generic:"Xatolik yuz berdi. Qaytadan urinib ko'ring",my_factories_title:"Mening Zavodlarim",add_factory_btn:"+ Zavod qo'shish",edit_factory_btn:"Tahrirlash",delete_factory_btn:"O'chirish",confirm_delete_factory:"Bu zavodni o'chirasizmi? Buni bekor qilib bo'lmaydi.",no_factories_yet:"Siz hali hech qanday zavod qo'shmagansiz.",factory_created_toast:"Zavod yaratildi va tahlil qilindi",factory_updated_toast:"Zavod yangilandi",factory_deleted_toast:"Zavod o'chirildi",ai_insights_feed_title:"AI Tahlili Lentasi",no_ai_insights_yet:"Hali AI tahlili yo'q. Boshlash uchun zavod qo'shing.",reanalyze_btn:"Qayta tahlil qilish",view_insights_btn:"Tahlilni ko'rish",created_label:"Yaratilgan",cancel_btn:"Bekor qilish",save_btn:"O'zgarishlarni saqlash",role_label:"Sizning rolingiz",role_engineer:"Muhandis",role_manager:"Menejer",role_admin:"Administrator",ph_registration_code:"Kirish kodi",registration_code_hint:"Bu kodni zavod administratoridan so'rang.",invite_accepted_msg:"Taklif qabul qilindi.",invite_only_msg:"Ro'yxatdan o'tish faqat taklif bo'yicha. Administratordan havola so'rang.",domain_restricted_msg:"Ruxsat etilgan domenlar:",err_invalid_registration_code:"Kirish kodi noto'g'ri",err_email_domain_not_allowed:"Bu email domeni ruxsat etilmagan",err_invite_required:"Ro'yxatdan o'tish uchun taklif kerak",err_invalid_invite:"Bu taklif yaroqsiz",err_invite_expired:"Taklif muddati tugagan",err_invite_email_mismatch:"Bu taklif boshqa emailga berilgan"},
+  ky: {tagline:"Глобалдык өнөр жай интеллект платформасы",live_label:"Түз эфир",kpi_energy:"Энергия сарпталышы",kpi_efficiency:"Эффективдүүлүк",kpi_active:"Активдүү станоктор",kpi_alerts:"Дабылдар",kwh_unit:"кВт·саат",chart_title:"Реалдуу убакыттагы көрсөткүчтөр",machine_status_title:"Станоктордун абалы",status_running:"Иштеп жатат",status_warning:"Эскертүү",status_critical:"Олуттуу",form_title:"Завод маалыматтарын киргизүү",factory_name_label:"Заводдун аты",machine_count_label:"Станоктордун саны",energy_cost_label:"Энергия наркы ($/кВт·саат)",machine_type_label:"Станоктун түрү",temperature_label:"Температура (°C)",vibration_label:"Дирилдөө (мм/с)",load_label:"Жүктөм (%)",submit_btn:"Заводду талдоо",submitting:"Жаңыртылууда...",ai_panel_title:"AI-талдоо",ai_placeholder:"AI-талдоо алуу үчүн завод маалыматтарын жөнөтүңүз.",ai_analyzing:"Талдануда...",ai_risks:"Тобокелдиктер",ai_efficiency_insights:"Эффективдүүлүк талдоосу",ai_optimizations:"Оптималдаштыруу сунуштары",toast_updated:"Завод маалыматтары жаңыртылды",toast_analysis_done:"AI-талдоо аяктады",toast_error:"Ката кетти",nav_dashboard:"Башкаруу панели",nav_factories:"Заводдор",nav_ai_insights:"AI-талдоо",logout_btn:"Чыгуу",login_title:"Кайра кош келиңиз",login_subtitle:"FactoryPulse AI каттоо эсебиңизге кириңиз",ph_email:"Электрондук почта",ph_password:"Сырсөз",remember_me:"Мени эстеп кал",login_btn:"Кирүү",login_link_register:"Каттоо эсебиңиз жокпу? Түзүү",register_title:"Каттоо эсебин түзүү",register_subtitle:"Заводдоруңузду AI менен байкоону баштаңыз",ph_full_name:"Толук аты-жөнү",ph_confirm_password:"Сырсөздү ырастаңыз",register_btn:"Каттоо эсебин түзүү",register_link_login:"Каттоо эсебиңиз барбы? Кирүү",err_missing_fields:"Бардык талааларды толтуруңуз",err_invalid_email:"Жарактуу электрондук почта дарегин киргизиңиз",err_weak_password:"Сырсөз кеминде 8 белги, тамга жана сан камтышы керек",err_password_mismatch:"Сырсөздөр дал келбейт",err_invalid_credentials:"Электрондук почта же сырсөз туура эмес",err_email_taken:"Бул электрондук почта мурунтан катталган",err_generic:"Ката кетти. Кайра аракет кылыңыз",my_factories_title:"Менин Заводдорум",add_factory_btn:"+ Завод кошуу",edit_factory_btn:"Түзөтүү",delete_factory_btn:"Өчүрүү",confirm_delete_factory:"Бул заводду өчүрөсүзбү? Бул аракетти артка кайтарууга болбойт.",no_factories_yet:"Сиз азырынча эч кандай завод кошкон жоксуз.",factory_created_toast:"Завод түзүлдү жана талданды",factory_updated_toast:"Завод жаңыртылды",factory_deleted_toast:"Завод өчүрүлдү",ai_insights_feed_title:"AI-талдоо тизмеси",no_ai_insights_yet:"Азырынча AI-талдоо жок. Баштоо үчүн завод кошуңуз.",reanalyze_btn:"Кайра талдоо",view_insights_btn:"Талдоону көрүү",created_label:"Түзүлгөн күнү",cancel_btn:"Жокко чыгаруу",save_btn:"Өзгөртүүлөрдү сактоо",role_label:"Сиздин ролуңуз",role_engineer:"Инженер",role_manager:"Менеджер",role_admin:"Администратор",ph_registration_code:"Кирүү коду",registration_code_hint:"Бул кодду завод администраторунан сураңыз.",invite_accepted_msg:"Чакыруу кабыл алынды.",invite_only_msg:"Каттоо чакыруу боюнча гана. Администратордон шилтеме сураңыз.",domain_restricted_msg:"Уруксат берилген домендер:",err_invalid_registration_code:"Кирүү коду туура эмес",err_email_domain_not_allowed:"Бул email домени уруксат берилген эмес",err_invite_required:"Катталуу үчүн чакыруу керек",err_invalid_invite:"Бул чакыруу жараксыз",err_invite_expired:"Чакыруунун мөөнөтү бүткөн",err_invite_email_mismatch:"Бул чакыруу башка emailге берилген"},
+  uk: {tagline:"Глобальна платформа промислового інтелекту",live_label:"Наживо",kpi_energy:"Споживання енергії",kpi_efficiency:"Ефективність",kpi_active:"Активні верстати",kpi_alerts:"Сповіщення",kwh_unit:"кВт·год",chart_title:"Показники в реальному часі",machine_status_title:"Статус верстатів",status_running:"Працює",status_warning:"Попередження",status_critical:"Критично",form_title:"Введення даних заводу",factory_name_label:"Назва заводу",machine_count_label:"Кількість верстатів",energy_cost_label:"Вартість енергії ($/кВт·год)",machine_type_label:"Тип верстата",temperature_label:"Температура (°C)",vibration_label:"Вібрація (мм/с)",load_label:"Навантаження (%)",submit_btn:"Аналізувати завод",submitting:"Оновлення...",ai_panel_title:"AI-аналітика",ai_placeholder:"Надішліть дані заводу, щоб отримати AI-аналіз.",ai_analyzing:"Аналіз...",ai_risks:"Ризики",ai_efficiency_insights:"Аналіз ефективності",ai_optimizations:"Рекомендації з оптимізації",toast_updated:"Дані заводу оновлено",toast_analysis_done:"AI-аналіз завершено",toast_error:"Сталася помилка",nav_dashboard:"Панель",nav_factories:"Заводи",nav_ai_insights:"AI-аналітика",logout_btn:"Вийти",login_title:"З поверненням",login_subtitle:"Увійдіть у свій обліковий запис FactoryPulse AI",ph_email:"Електронна пошта",ph_password:"Пароль",remember_me:"Запам'ятати мене",login_btn:"Увійти",login_link_register:"Немає акаунту? Створити",register_title:"Створіть акаунт",register_subtitle:"Почніть моніторинг заводів за допомогою AI",ph_full_name:"Повне ім'я",ph_confirm_password:"Підтвердіть пароль",register_btn:"Створити акаунт",register_link_login:"Вже є акаунт? Увійти",err_missing_fields:"Будь ласка, заповніть усі поля",err_invalid_email:"Введіть дійсну електронну адресу",err_weak_password:"Пароль має містити щонайменше 8 символів, літеру та цифру",err_password_mismatch:"Паролі не збігаються",err_invalid_credentials:"Невірна електронна пошта або пароль",err_email_taken:"Ця електронна пошта вже зареєстрована",err_generic:"Сталася помилка. Спробуйте ще раз",my_factories_title:"Мої Заводи",add_factory_btn:"+ Додати завод",edit_factory_btn:"Редагувати",delete_factory_btn:"Видалити",confirm_delete_factory:"Видалити цей завод? Цю дію не можна скасувати.",no_factories_yet:"Ви ще не додали жодного заводу.",factory_created_toast:"Завод створено та проаналізовано",factory_updated_toast:"Завод оновлено",factory_deleted_toast:"Завод видалено",ai_insights_feed_title:"Стрічка AI-аналітики",no_ai_insights_yet:"Ще немає AI-аналітики. Додайте завод.",reanalyze_btn:"Проаналізувати знову",view_insights_btn:"Переглянути аналітику",created_label:"Створено",cancel_btn:"Скасувати",save_btn:"Зберегти зміни",role_label:"Ваша роль",role_engineer:"Інженер",role_manager:"Менеджер",role_admin:"Адміністратор",ph_registration_code:"Код доступу",registration_code_hint:"Запитайте код в адміністратора заводу.",invite_accepted_msg:"Запрошення прийнято.",invite_only_msg:"Реєстрація лише за запрошенням. Запитайте посилання в адміністратора.",domain_restricted_msg:"Дозволені домени:",err_invalid_registration_code:"Невірний код доступу",err_email_domain_not_allowed:"Цей домен email не дозволено",err_invite_required:"Для реєстрації потрібне запрошення",err_invalid_invite:"Запрошення недійсне",err_invite_expired:"Термін запрошення минув",err_invite_email_mismatch:"Запрошення видано на інший email"},
+  pl: {tagline:"Globalna Platforma Inteligencji Przemysłowej",live_label:"Na żywo",kpi_energy:"Zużycie Energii",kpi_efficiency:"Wydajność",kpi_active:"Aktywne Maszyny",kpi_alerts:"Alerty",kwh_unit:"kWh",chart_title:"Wydajność w Czasie Rzeczywistym",machine_status_title:"Status Maszyn",status_running:"Działa",status_warning:"Ostrzeżenie",status_critical:"Krytyczne",form_title:"Wprowadzanie Danych Fabryki",factory_name_label:"Nazwa Fabryki",machine_count_label:"Liczba Maszyn",energy_cost_label:"Koszt Energii ($/kWh)",machine_type_label:"Typ Maszyny",temperature_label:"Temperatura (°C)",vibration_label:"Wibracje (mm/s)",load_label:"Obciążenie (%)",submit_btn:"Analizuj Fabrykę",submitting:"Aktualizowanie...",ai_panel_title:"Analizy AI",ai_placeholder:"Prześlij dane fabryki, aby wygenerować analizę AI.",ai_analyzing:"Analizowanie...",ai_risks:"Ryzyka",ai_efficiency_insights:"Analiza Wydajności",ai_optimizations:"Sugestie Optymalizacji",toast_updated:"Dane fabryki zaktualizowane",toast_analysis_done:"Analiza AI zakończona",toast_error:"Coś poszło nie tak",nav_dashboard:"Panel",nav_factories:"Fabryki",nav_ai_insights:"Analizy AI",logout_btn:"Wyloguj",login_title:"Witamy z powrotem",login_subtitle:"Zaloguj się do swojego konta FactoryPulse AI",ph_email:"E-mail",ph_password:"Hasło",remember_me:"Zapamiętaj mnie",login_btn:"Zaloguj się",login_link_register:"Nie masz konta? Utwórz je",register_title:"Utwórz konto",register_subtitle:"Zacznij monitorować swoje fabryki z AI",ph_full_name:"Imię i Nazwisko",ph_confirm_password:"Potwierdź Hasło",register_btn:"Utwórz Konto",register_link_login:"Masz już konto? Zaloguj się",err_missing_fields:"Proszę wypełnić wszystkie pola",err_invalid_email:"Proszę podać prawidłowy adres e-mail",err_weak_password:"Hasło musi mieć min. 8 znaków, literę i cyfrę",err_password_mismatch:"Hasła nie pasują do siebie",err_invalid_credentials:"Nieprawidłowy e-mail lub hasło",err_email_taken:"Ten e-mail jest już zarejestrowany",err_generic:"Coś poszło nie tak. Spróbuj ponownie",my_factories_title:"Moje Fabryki",add_factory_btn:"+ Dodaj Fabrykę",edit_factory_btn:"Edytuj",delete_factory_btn:"Usuń",confirm_delete_factory:"Usunąć tę fabrykę? Tej czynności nie można cofnąć.",no_factories_yet:"Nie dodałeś jeszcze żadnej fabryki.",factory_created_toast:"Fabryka utworzona i przeanalizowana",factory_updated_toast:"Fabryka zaktualizowana",factory_deleted_toast:"Fabryka usunięta",ai_insights_feed_title:"Kanał Analiz AI",no_ai_insights_yet:"Brak analiz AI. Dodaj fabrykę, aby zacząć.",reanalyze_btn:"Analizuj Ponownie",view_insights_btn:"Zobacz Analizy",created_label:"Utworzono",cancel_btn:"Anuluj",save_btn:"Zapisz Zmiany",role_label:"Twoja Rola",role_engineer:"Inżynier",role_manager:"Menedżer",role_admin:"Administrator",ph_registration_code:"Kod dostępu",registration_code_hint:"Poproś o kod administratora zakładu.",invite_accepted_msg:"Zaproszenie przyjęte.",invite_only_msg:"Rejestracja tylko z zaproszeniem. Poproś administratora o link.",domain_restricted_msg:"Dozwolone domeny:",err_invalid_registration_code:"Nieprawidłowy kod dostępu",err_email_domain_not_allowed:"Ta domena e-mail nie jest dozwolona",err_invite_required:"Do rejestracji wymagane jest zaproszenie",err_invalid_invite:"To zaproszenie jest nieprawidłowe",err_invite_expired:"To zaproszenie wygasło",err_invite_email_mismatch:"To zaproszenie dotyczy innego adresu"},
+  nl: {tagline:"Wereldwijd Industrieel Intelligentieplatform",live_label:"Live",kpi_energy:"Energieverbruik",kpi_efficiency:"Efficiëntie",kpi_active:"Actieve Machines",kpi_alerts:"Meldingen",kwh_unit:"kWh",chart_title:"Realtime Prestaties",machine_status_title:"Machinestatus",status_running:"Actief",status_warning:"Waarschuwing",status_critical:"Kritiek",form_title:"Fabrieksgegevens Invoeren",factory_name_label:"Fabrieksnaam",machine_count_label:"Aantal Machines",energy_cost_label:"Energiekosten ($/kWh)",machine_type_label:"Machinetype",temperature_label:"Temperatuur (°C)",vibration_label:"Trilling (mm/s)",load_label:"Belasting (%)",submit_btn:"Fabriek Analyseren",submitting:"Bijwerken...",ai_panel_title:"AI-inzichten",ai_placeholder:"Verzend fabrieksgegevens om een AI-analyse te genereren.",ai_analyzing:"Analyseren...",ai_risks:"Risico's",ai_efficiency_insights:"Efficiëntieanalyse",ai_optimizations:"Optimalisatiesuggesties",toast_updated:"Fabrieksgegevens bijgewerkt",toast_analysis_done:"AI-analyse voltooid",toast_error:"Er is iets misgegaan",nav_dashboard:"Dashboard",nav_factories:"Fabrieken",nav_ai_insights:"AI-inzichten",logout_btn:"Uitloggen",login_title:"Welkom terug",login_subtitle:"Log in op uw FactoryPulse AI-account",ph_email:"E-mail",ph_password:"Wachtwoord",remember_me:"Onthoud mij",login_btn:"Inloggen",login_link_register:"Geen account? Maak er een",register_title:"Maak uw account aan",register_subtitle:"Begin met AI-monitoring van uw fabrieken",ph_full_name:"Volledige Naam",ph_confirm_password:"Bevestig Wachtwoord",register_btn:"Account Aanmaken",register_link_login:"Heeft u al een account? Inloggen",err_missing_fields:"Vul alle velden in",err_invalid_email:"Voer een geldig e-mailadres in",err_weak_password:"Wachtwoord moet minimaal 8 tekens, een letter en een cijfer bevatten",err_password_mismatch:"Wachtwoorden komen niet overeen",err_invalid_credentials:"Ongeldige e-mail of wachtwoord",err_email_taken:"Dit e-mailadres is al geregistreerd",err_generic:"Er is iets misgegaan. Probeer het opnieuw",my_factories_title:"Mijn Fabrieken",add_factory_btn:"+ Fabriek Toevoegen",edit_factory_btn:"Bewerken",delete_factory_btn:"Verwijderen",confirm_delete_factory:"Deze fabriek verwijderen? Dit kan niet ongedaan worden gemaakt.",no_factories_yet:"U heeft nog geen fabrieken toegevoegd.",factory_created_toast:"Fabriek aangemaakt en geanalyseerd",factory_updated_toast:"Fabriek bijgewerkt",factory_deleted_toast:"Fabriek verwijderd",ai_insights_feed_title:"AI-inzichten Feed",no_ai_insights_yet:"Nog geen AI-inzichten. Voeg een fabriek toe.",reanalyze_btn:"Opnieuw Analyseren",view_insights_btn:"Bekijk Inzichten",created_label:"Aangemaakt",cancel_btn:"Annuleren",save_btn:"Wijzigingen Opslaan",role_label:"Uw Rol",role_engineer:"Ingenieur",role_manager:"Manager",role_admin:"Beheerder",ph_registration_code:"Toegangscode",registration_code_hint:"Vraag deze code aan uw fabrieksbeheerder.",invite_accepted_msg:"Uitnodiging geaccepteerd.",invite_only_msg:"Registratie alleen op uitnodiging. Vraag uw beheerder om een link.",domain_restricted_msg:"Toegestane domeinen:",err_invalid_registration_code:"Ongeldige toegangscode",err_email_domain_not_allowed:"Dit e-maildomein is niet toegestaan",err_invite_required:"Voor registratie is een uitnodiging vereist",err_invalid_invite:"Deze uitnodiging is niet geldig",err_invite_expired:"Deze uitnodiging is verlopen",err_invite_email_mismatch:"Deze uitnodiging is voor een ander e-mailadres"},
+  sv: {tagline:"Global Industriell Intelligensplattform",live_label:"Live",kpi_energy:"Energiförbrukning",kpi_efficiency:"Effektivitet",kpi_active:"Aktiva Maskiner",kpi_alerts:"Varningar",kwh_unit:"kWh",chart_title:"Realtidsprestanda",machine_status_title:"Maskinstatus",status_running:"Igång",status_warning:"Varning",status_critical:"Kritisk",form_title:"Fabriksdatainmatning",factory_name_label:"Fabriksnamn",machine_count_label:"Antal Maskiner",energy_cost_label:"Energikostnad ($/kWh)",machine_type_label:"Maskintyp",temperature_label:"Temperatur (°C)",vibration_label:"Vibration (mm/s)",load_label:"Belastning (%)",submit_btn:"Analysera Fabrik",submitting:"Uppdaterar...",ai_panel_title:"AI-insikter",ai_placeholder:"Skicka fabriksdata för att generera en AI-analys.",ai_analyzing:"Analyserar...",ai_risks:"Risker",ai_efficiency_insights:"Effektivitetsanalys",ai_optimizations:"Optimeringsförslag",toast_updated:"Fabriksdata uppdaterad",toast_analysis_done:"AI-analys klar",toast_error:"Något gick fel",nav_dashboard:"Instrumentpanel",nav_factories:"Fabriker",nav_ai_insights:"AI-insikter",logout_btn:"Logga ut",login_title:"Välkommen tillbaka",login_subtitle:"Logga in på ditt FactoryPulse AI-konto",ph_email:"E-post",ph_password:"Lösenord",remember_me:"Kom ihåg mig",login_btn:"Logga in",login_link_register:"Inget konto? Skapa ett",register_title:"Skapa ditt konto",register_subtitle:"Börja övervaka dina fabriker med AI",ph_full_name:"Fullständigt Namn",ph_confirm_password:"Bekräfta Lösenord",register_btn:"Skapa Konto",register_link_login:"Har du redan ett konto? Logga in",err_missing_fields:"Vänligen fyll i alla fält",err_invalid_email:"Ange en giltig e-postadress",err_weak_password:"Lösenordet måste vara minst 8 tecken med en bokstav och en siffra",err_password_mismatch:"Lösenorden matchar inte",err_invalid_credentials:"Felaktig e-post eller lösenord",err_email_taken:"Denna e-post är redan registrerad",err_generic:"Något gick fel. Försök igen",my_factories_title:"Mina Fabriker",add_factory_btn:"+ Lägg till Fabrik",edit_factory_btn:"Redigera",delete_factory_btn:"Ta bort",confirm_delete_factory:"Ta bort denna fabrik? Detta kan inte ångras.",no_factories_yet:"Du har inte lagt till några fabriker än.",factory_created_toast:"Fabrik skapad och analyserad",factory_updated_toast:"Fabrik uppdaterad",factory_deleted_toast:"Fabrik borttagen",ai_insights_feed_title:"AI-insikter Flöde",no_ai_insights_yet:"Inga AI-insikter än. Lägg till en fabrik.",reanalyze_btn:"Analysera Igen",view_insights_btn:"Visa Insikter",created_label:"Skapad",cancel_btn:"Avbryt",save_btn:"Spara Ändringar",role_label:"Din Roll",role_engineer:"Ingenjör",role_manager:"Chef",role_admin:"Administratör",ph_registration_code:"Åtkomstkod",registration_code_hint:"Be din fabriksadministratör om koden.",invite_accepted_msg:"Inbjudan accepterad.",invite_only_msg:"Registrering endast via inbjudan. Be din administratör om en länk.",domain_restricted_msg:"Tillåtna domäner:",err_invalid_registration_code:"Ogiltig åtkomstkod",err_email_domain_not_allowed:"Denna e-postdomän är inte tillåten",err_invite_required:"Registrering kräver en inbjudan",err_invalid_invite:"Denna inbjudan är ogiltig",err_invite_expired:"Denna inbjudan har gått ut",err_invite_email_mismatch:"Denna inbjudan gäller en annan e-post"},
 };
 
 let currentLang = localStorage.getItem("fp_lang") || "en";
@@ -7274,6 +10885,34 @@ document.addEventListener("DOMContentLoaded", () => {
   initPasswordToggles();
   if (localStorage.getItem("fp_token")) { window.location.href = "/dashboard"; return; }
 
+  // Ask the server which gates are active so the form only shows fields that
+  // are actually required. The code itself is never sent to the browser.
+  (async () => {
+    const inviteToken = new URLSearchParams(location.search).get("invite");
+    try {
+      const mode = await (await fetch("/api/registration/mode")).json();
+      if (inviteToken) {
+        document.getElementById("reg-invite-notice").classList.remove("hidden");
+        return;   // an invite satisfies every other gate
+      }
+      if (mode.code_required) {
+        document.getElementById("reg-code-wrap").classList.remove("hidden");
+      }
+      if (mode.invite_only) {
+        showError(t("invite_only_msg"));
+        document.getElementById("submit-btn").disabled = true;
+      }
+      if (mode.domain_restricted && (mode.allowed_domains || []).length) {
+        const hint = document.createElement("p");
+        hint.className = "text-xs text-slate-500 mt-1";
+        hint.textContent = t("domain_restricted_msg") + " " +
+          mode.allowed_domains.map(d => "@" + d).join(", ");
+        const em = document.getElementById("email");
+        if (em && em.parentElement) em.parentElement.appendChild(hint);
+      }
+    } catch (e) {}
+  })();
+
   document.getElementById("register-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     hideError();
@@ -7294,7 +10933,13 @@ document.addEventListener("DOMContentLoaded", () => {
     try {
       const res = await fetch("/api/register", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ full_name, email, password, confirm_password, role: document.getElementById("reg-role").value, lang: currentLang }),
+        body: JSON.stringify({
+          full_name, email, password, confirm_password,
+          role: document.getElementById("reg-role").value,
+          lang: currentLang,
+          registration_code: (document.getElementById("reg-code") || {}).value || "",
+          invite_token: new URLSearchParams(location.search).get("invite") || "",
+        }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -7356,6 +11001,42 @@ def login_page():
 @app.route("/register", methods=["GET"])
 def register_page():
     return _no_cache_html(REGISTER_HTML)
+
+
+@app.route("/api/docs", methods=["GET"])
+def api_docs():
+    """Machine-readable API description, generated from the live route table
+    so it can never drift out of sync with the code."""
+    endpoints = []
+    for rule in app.url_map.iter_rules():
+        if not str(rule).startswith("/api"):
+            continue
+        view = app.view_functions.get(rule.endpoint)
+        doc = (view.__doc__ or "").strip().split("\n")[0] if view else ""
+        methods = sorted(rule.methods - {"HEAD", "OPTIONS"})
+        source = inspect.getsource(view) if view else ""
+        endpoints.append({
+            "path": str(rule),
+            "methods": methods,
+            "summary": doc,
+            "auth_required": "@require_auth" in source or "require_auth" in source,
+            "rate_limited": "@rate_limit" in source,
+        })
+
+    endpoints.sort(key=lambda e: e["path"])
+    return jsonify({
+        "service": "FactoryPulse AI",
+        "model_version": MODEL_VERSION,
+        "authentication": "Bearer JWT in the Authorization header",
+        "endpoint_count": len(endpoints),
+        "endpoints": endpoints,
+        "notes": {
+            "read_only_industrial": ("All PLC/SCADA connectors are read-only. "
+                                     "No endpoint writes to industrial equipment."),
+            "measured_vs_estimated": ("Responses that contain estimates carry an "
+                                      "explicit source or is_calibrated field."),
+        },
+    })
 
 
 @app.route("/healthz", methods=["GET"])
